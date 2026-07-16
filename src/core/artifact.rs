@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, Metadata, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::{GeneratorError, GeneratorErrorKind, RelativePath, Result, RunScope, Sha256Digest};
@@ -12,12 +12,145 @@ struct PlannedArtifact {
     digest: Sha256Digest,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObjectIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    length: u64,
+    #[cfg(not(unix))]
+    modified: Option<std::time::SystemTime>,
+}
+
+impl ObjectIdentity {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                length: metadata.len(),
+                modified: metadata.modified().ok(),
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FileSnapshot {
+    bytes: Vec<u8>,
+    permissions: fs::Permissions,
+}
+
+#[derive(Debug, Default)]
+struct TransactionSnapshot {
+    files: BTreeMap<PathBuf, FileSnapshot>,
+    directories: BTreeSet<PathBuf>,
+}
+
+impl TransactionSnapshot {
+    fn capture<'a>(
+        root: &Path,
+        root_identity: &ObjectIdentity,
+        kind: &PlanKind,
+        paths: impl IntoIterator<Item = &'a RelativePath>,
+    ) -> Result<Self> {
+        let mut snapshot = Self::default();
+        for path in paths {
+            let target = path.join(root);
+            validate_root_identity(root, root_identity)?;
+            validate_components(root, &target, false)?;
+            if target_exists_as_file(&target)? {
+                let mut file = File::open(&target).map_err(|source| {
+                    transaction_source("snapshot artifact", target.display(), source)
+                })?;
+                validate_opened_file(&file, &target)?;
+                let metadata = file.metadata().map_err(|source| {
+                    transaction_source("snapshot artifact", target.display(), source)
+                })?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).map_err(|source| {
+                    transaction_source("snapshot artifact", target.display(), source)
+                })?;
+                validate_opened_file(&file, &target)?;
+                snapshot.files.insert(
+                    target,
+                    FileSnapshot {
+                        bytes,
+                        permissions: metadata.permissions(),
+                    },
+                );
+            }
+        }
+        if let PlanKind::Generated { generated_root, .. } = kind {
+            let directory = generated_root.join(root);
+            if directory.exists() {
+                capture_directories(root, root_identity, &directory, &mut snapshot.directories)?;
+            }
+        }
+        Ok(snapshot)
+    }
+}
+
+fn capture_directories(
+    root: &Path,
+    root_identity: &ObjectIdentity,
+    directory: &Path,
+    directories: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    revalidate_mutation_parent(root, root_identity, &directory.join(".inventory"))?;
+    let metadata = fs::symlink_metadata(directory).map_err(|source| {
+        transaction_source("snapshot artifact directory", directory.display(), source)
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(GeneratorError::new(
+            GeneratorErrorKind::InvalidPath,
+            "snapshot artifact directory",
+            format!("not a real directory: {}", directory.display()),
+        ));
+    }
+    directories.insert(directory.to_path_buf());
+    for entry in fs::read_dir(directory).map_err(|source| {
+        transaction_source("snapshot artifact directory", directory.display(), source)
+    })? {
+        let entry = entry.map_err(|source| {
+            transaction_source("snapshot artifact directory", directory.display(), source)
+        })?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|source| {
+            transaction_source(
+                "snapshot artifact directory",
+                entry.path().display(),
+                source,
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(GeneratorError::new(
+                GeneratorErrorKind::InvalidPath,
+                "snapshot artifact directory",
+                format!("symlink is not allowed: {}", entry.path().display()),
+            ));
+        }
+        if metadata.is_dir() {
+            capture_directories(root, root_identity, &entry.path(), directories)?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 enum PlanKind {
     Generated {
         generated_root: RelativePath,
         extension: String,
-        stale: Vec<RelativePath>,
+        retained: Option<BTreeSet<RelativePath>>,
     },
     Report,
 }
@@ -26,6 +159,7 @@ enum PlanKind {
 #[derive(Debug)]
 pub struct ArtifactPlan {
     output_root: PathBuf,
+    output_root_identity: ObjectIdentity,
     artifacts: BTreeMap<RelativePath, PlannedArtifact>,
     kind: PlanKind,
 }
@@ -43,7 +177,7 @@ impl ArtifactPlan {
         artifacts: Vec<(RelativePath, Vec<u8>)>,
         retained_inventory: Option<Vec<RelativePath>>,
     ) -> Result<Self> {
-        let output_root = canonical_output_root(output_root.as_ref())?;
+        let (output_root, output_root_identity) = canonical_output_root(output_root.as_ref())?;
         let extension = generated_extension.into();
         validate_extension(&extension)?;
         validate_generated_root(&output_root, &generated_root)?;
@@ -53,7 +187,7 @@ impl ArtifactPlan {
             artifacts,
             Some((&generated_root, extension.as_str())),
         )?;
-        let stale = match scope {
+        let retained = match scope {
             RunScope::Full => {
                 let retained = retained_inventory.ok_or_else(|| {
                     transaction_error(
@@ -71,7 +205,10 @@ impl ArtifactPlan {
                         ),
                     ));
                 }
-                collect_stale(&output_root, &generated_root, &extension, &retained)?
+                let stale =
+                    collect_stale(&output_root, None, &generated_root, &extension, &retained)?;
+                validate_temporary_paths(&output_root, &artifacts, &stale)?;
+                Some(retained)
             }
             RunScope::Filtered(_) => {
                 if retained_inventory.is_some() {
@@ -80,18 +217,21 @@ impl ArtifactPlan {
                         "filtered scope cannot provide or prune a retained inventory",
                     ));
                 }
-                Vec::new()
+                None
             }
         };
-        validate_temporary_paths(&output_root, &artifacts, &stale)?;
+        if matches!(scope, RunScope::Filtered(_)) {
+            validate_temporary_paths(&output_root, &artifacts, &[])?;
+        }
 
         Ok(Self {
             output_root,
+            output_root_identity,
             artifacts,
             kind: PlanKind::Generated {
                 generated_root,
                 extension,
-                stale,
+                retained,
             },
         })
     }
@@ -109,11 +249,12 @@ impl ArtifactPlan {
                 "filtered scope cannot publish a report",
             ));
         }
-        let output_root = canonical_output_root(output_root.as_ref())?;
+        let (output_root, output_root_identity) = canonical_output_root(output_root.as_ref())?;
         let artifacts = collect_artifacts(&output_root, vec![(report_path, bytes)], None)?;
         validate_temporary_paths(&output_root, &artifacts, &[])?;
         Ok(Self {
             output_root,
+            output_root_identity,
             artifacts,
             kind: PlanKind::Report,
         })
@@ -121,7 +262,7 @@ impl ArtifactPlan {
 
     /// Installs this checked plan with staged replacement and rollback.
     pub fn install(&self) -> Result<()> {
-        self.install_inner(None, None)
+        self.install_inner(None, None, None)
     }
 
     /// Returns the digest computed during checked plan construction.
@@ -132,57 +273,118 @@ impl ArtifactPlan {
 
     #[cfg(test)]
     fn install_with_failure(&self, install_index: Option<usize>) -> Result<()> {
-        self.install_inner(None, install_index)
+        self.install_inner(None, install_index, None)
     }
 
     #[cfg(test)]
     fn install_with_stage_failure(&self, stage_index: usize) -> Result<()> {
-        self.install_inner(Some(stage_index), None)
+        self.install_inner(Some(stage_index), None, None)
+    }
+
+    #[cfg(test)]
+    fn install_with_cleanup_failure(&self, cleanup_index: usize) -> Result<()> {
+        self.install_inner(None, None, Some(cleanup_index))
     }
 
     fn install_inner(
         &self,
         fail_stage_at: Option<usize>,
         fail_install_at: Option<usize>,
+        fail_cleanup_at: Option<usize>,
     ) -> Result<()> {
+        validate_root_identity(&self.output_root, &self.output_root_identity)?;
         let stale = match &self.kind {
-            PlanKind::Generated { stale, .. } => stale.as_slice(),
-            PlanKind::Report => &[],
+            PlanKind::Generated {
+                generated_root,
+                extension,
+                retained,
+            } => match retained {
+                Some(retained) => collect_stale(
+                    &self.output_root,
+                    Some(&self.output_root_identity),
+                    generated_root,
+                    extension,
+                    retained,
+                )?,
+                None => Vec::new(),
+            },
+            PlanKind::Report => Vec::new(),
         };
-        validate_temporary_paths(&self.output_root, &self.artifacts, stale)?;
+        validate_temporary_paths(&self.output_root, &self.artifacts, &stale)?;
+        let snapshot = TransactionSnapshot::capture(
+            &self.output_root,
+            &self.output_root_identity,
+            &self.kind,
+            self.artifacts.keys().chain(stale.iter()),
+        )?;
 
         let mut created_directories = Vec::new();
         let mut stages = BTreeMap::new();
         for (index, (path, artifact)) in self.artifacts.iter().enumerate() {
             let target = path.join(&self.output_root);
-            let staged =
-                ensure_parent_directories(&self.output_root, &target, &mut created_directories)
-                    .and_then(|()| {
-                        if fail_stage_at == Some(index) {
-                            Err(transaction_error(
-                                "stage artifact",
-                                format!("injected staging failure for {}", path.as_str()),
-                            ))
-                        } else {
-                            stage_artifact(&target, &artifact.bytes)
-                        }
-                    });
-            if let Err(error) = staged {
-                return rollback(error, &[], &[], stages.values(), &created_directories);
-            }
             stages.insert(path.clone(), temporary_sibling(&target, "stage")?);
+            let staged = ensure_parent_directories(
+                &self.output_root,
+                &self.output_root_identity,
+                &target,
+                &mut created_directories,
+            )
+            .and_then(|()| {
+                if fail_stage_at == Some(index) {
+                    Err(transaction_error(
+                        "stage artifact",
+                        format!("injected staging failure for {}", path.as_str()),
+                    ))
+                } else {
+                    stage_artifact(
+                        &self.output_root,
+                        &self.output_root_identity,
+                        &target,
+                        &artifact.bytes,
+                    )
+                }
+            });
+            if let Err(error) = staged {
+                return self.rollback_transaction(
+                    error,
+                    &[],
+                    &[],
+                    stages.values(),
+                    &created_directories,
+                    &snapshot,
+                );
+            }
         }
 
         let mut backup_paths = BTreeSet::new();
         for path in self.artifacts.keys().chain(stale.iter()) {
             let target = path.join(&self.output_root);
+            if let Err(error) =
+                revalidate_mutation_parent(&self.output_root, &self.output_root_identity, &target)
+            {
+                return self.rollback_transaction(
+                    error,
+                    &[],
+                    &[],
+                    stages.values(),
+                    &created_directories,
+                    &snapshot,
+                );
+            }
             match target_exists_as_file(&target) {
                 Ok(true) => {
                     backup_paths.insert(path.clone());
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    return rollback(error, &[], &[], stages.values(), &created_directories);
+                    return self.rollback_transaction(
+                        error,
+                        &[],
+                        &[],
+                        stages.values(),
+                        &created_directories,
+                        &snapshot,
+                    );
                 }
             }
         }
@@ -191,15 +393,55 @@ impl ArtifactPlan {
         for path in backup_paths {
             let target = path.join(&self.output_root);
             let backup = temporary_sibling(&target, "backup")?;
+            if let Err(error) =
+                revalidate_mutation_parent(&self.output_root, &self.output_root_identity, &target)
+            {
+                return self.rollback_transaction(
+                    error,
+                    &[],
+                    &backups,
+                    stages.values(),
+                    &created_directories,
+                    &snapshot,
+                );
+            }
             if let Err(error) = require_absent(&backup, "validate artifact backup") {
-                return rollback(error, &[], &backups, stages.values(), &created_directories);
+                return self.rollback_transaction(
+                    error,
+                    &[],
+                    &backups,
+                    stages.values(),
+                    &created_directories,
+                    &snapshot,
+                );
             }
             if let Err(error) = fs::rename(&target, &backup)
                 .map_err(|source| transaction_source("backup artifact", target.display(), source))
             {
-                return rollback(error, &[], &backups, stages.values(), &created_directories);
+                return self.rollback_transaction(
+                    error,
+                    &[],
+                    &backups,
+                    stages.values(),
+                    &created_directories,
+                    &snapshot,
+                );
             }
             backups.push((target, backup));
+            if let Err(error) = revalidate_existing_file(
+                &self.output_root,
+                &self.output_root_identity,
+                &backups.last().expect("backup was just recorded").1,
+            ) {
+                return self.rollback_transaction(
+                    error,
+                    &[],
+                    &backups,
+                    stages.values(),
+                    &created_directories,
+                    &snapshot,
+                );
+            }
         }
 
         let mut installed = Vec::new();
@@ -209,41 +451,105 @@ impl ArtifactPlan {
                     "install artifact",
                     format!("injected installation failure for {}", path.as_str()),
                 );
-                return rollback(
+                return self.rollback_transaction(
                     error,
                     &installed,
                     &backups,
                     stages.values(),
                     &created_directories,
+                    &snapshot,
                 );
             }
             let target = path.join(&self.output_root);
-            if let Err(error) = require_absent(&target, "validate artifact install target") {
-                return rollback(
+            if let Err(error) =
+                revalidate_existing_file(&self.output_root, &self.output_root_identity, stage)
+            {
+                return self.rollback_transaction(
                     error,
                     &installed,
                     &backups,
                     stages.values(),
                     &created_directories,
+                    &snapshot,
+                );
+            }
+            if let Err(error) = require_absent(&target, "validate artifact install target") {
+                return self.rollback_transaction(
+                    error,
+                    &installed,
+                    &backups,
+                    stages.values(),
+                    &created_directories,
+                    &snapshot,
                 );
             }
             if let Err(source) = fs::rename(stage, &target) {
                 let error = transaction_source("install artifact", target.display(), source);
-                return rollback(
+                return self.rollback_transaction(
                     error,
                     &installed,
                     &backups,
                     stages.values(),
                     &created_directories,
+                    &snapshot,
                 );
             }
-            installed.push(target);
+            installed.push(target.clone());
+            if let Err(error) =
+                revalidate_existing_file(&self.output_root, &self.output_root_identity, &target)
+            {
+                return self.rollback_transaction(
+                    error,
+                    &installed,
+                    &backups,
+                    stages.values(),
+                    &created_directories,
+                    &snapshot,
+                );
+            }
         }
 
-        for (_, backup) in &backups {
-            fs::remove_file(backup).map_err(|source| {
-                transaction_source("remove artifact backup", backup.display(), source)
-            })?;
+        for (cleanup_index, (_, backup)) in backups.iter().enumerate() {
+            if fail_cleanup_at == Some(cleanup_index) {
+                let error = transaction_error(
+                    "remove artifact backup",
+                    format!("injected cleanup failure for {}", backup.display()),
+                );
+                return self.rollback_transaction(
+                    error,
+                    &installed,
+                    &backups,
+                    stages.values(),
+                    &created_directories,
+                    &snapshot,
+                );
+            }
+            if let Err(error) =
+                revalidate_mutation_parent(&self.output_root, &self.output_root_identity, backup)
+            {
+                return self.rollback_transaction(
+                    error,
+                    &installed,
+                    &backups,
+                    stages.values(),
+                    &created_directories,
+                    &snapshot,
+                );
+            }
+            fs::remove_file(backup)
+                .map_err(|source| {
+                    transaction_source("remove artifact backup", backup.display(), source)
+                })
+                .or_else(|error| {
+                    self.rollback_transaction(
+                        error,
+                        &installed,
+                        &backups,
+                        stages.values(),
+                        &created_directories,
+                        &snapshot,
+                    )
+                })?;
         }
         if let PlanKind::Generated {
             generated_root,
@@ -252,18 +558,67 @@ impl ArtifactPlan {
         } = &self.kind
         {
             let _ = extension;
-            remove_empty_directories(&generated_root.join(&self.output_root), &self.output_root)?;
+            if let Err(error) = remove_empty_directories(
+                &generated_root.join(&self.output_root),
+                &self.output_root,
+                &self.output_root_identity,
+            ) {
+                return self.rollback_transaction(
+                    error,
+                    &installed,
+                    &backups,
+                    stages.values(),
+                    &created_directories,
+                    &snapshot,
+                );
+            }
         }
         Ok(())
     }
+
+    fn rollback_transaction<'a>(
+        &self,
+        cause: GeneratorError,
+        installed: &[PathBuf],
+        backups: &[(PathBuf, PathBuf)],
+        stages: impl IntoIterator<Item = &'a PathBuf>,
+        created_directories: &[PathBuf],
+        snapshot: &TransactionSnapshot,
+    ) -> Result<()> {
+        rollback_snapshot(
+            cause,
+            &self.output_root,
+            &self.output_root_identity,
+            installed,
+            backups,
+            stages,
+            created_directories,
+            snapshot,
+        )
+    }
 }
 
-fn canonical_output_root(path: &Path) -> Result<PathBuf> {
+fn canonical_output_root(path: &Path) -> Result<(PathBuf, ObjectIdentity)> {
     if path.to_str().is_none() {
         return Err(GeneratorError::new(
             GeneratorErrorKind::InvalidPath,
             "validate artifact output root",
             "non-UTF-8 output root",
+        ));
+    }
+    let supplied_metadata = fs::symlink_metadata(path).map_err(|source| {
+        GeneratorError::with_source(
+            GeneratorErrorKind::InvalidPath,
+            "inspect artifact output root",
+            path.display().to_string(),
+            source,
+        )
+    })?;
+    if supplied_metadata.file_type().is_symlink() || !supplied_metadata.is_dir() {
+        return Err(GeneratorError::new(
+            GeneratorErrorKind::InvalidPath,
+            "validate artifact output root",
+            format!("not a real directory: {}", path.display()),
         ));
     }
     let canonical = fs::canonicalize(path).map_err(|source| {
@@ -289,7 +644,15 @@ fn canonical_output_root(path: &Path) -> Result<PathBuf> {
             format!("not a directory: {}", path.display()),
         ));
     }
-    Ok(canonical)
+    let metadata = fs::symlink_metadata(&canonical).map_err(|source| {
+        GeneratorError::with_source(
+            GeneratorErrorKind::Io,
+            "inspect canonical artifact output root",
+            canonical.display().to_string(),
+            source,
+        )
+    })?;
+    Ok((canonical, ObjectIdentity::from_metadata(&metadata)))
 }
 
 fn validate_extension(extension: &str) -> Result<()> {
@@ -434,27 +797,59 @@ fn validate_components(root: &Path, target: &Path, final_directory: bool) -> Res
 
 fn collect_stale(
     root: &Path,
+    root_identity: Option<&ObjectIdentity>,
     generated_root: &RelativePath,
     extension: &str,
     retained: &BTreeSet<RelativePath>,
 ) -> Result<Vec<RelativePath>> {
     let directory = generated_root.join(root);
-    if !directory.exists() {
-        return Ok(Vec::new());
+    if let Some(identity) = root_identity {
+        validate_root_identity(root, identity)?;
+        validate_components(root, &directory, true)?;
+    }
+    match fs::symlink_metadata(&directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(GeneratorError::new(
+                GeneratorErrorKind::InvalidPath,
+                "inventory generated artifacts",
+                format!("not a real directory: {}", directory.display()),
+            ));
+        }
+        Err(source) => {
+            return Err(GeneratorError::with_source(
+                GeneratorErrorKind::Io,
+                "inventory generated artifacts",
+                directory.display().to_string(),
+                source,
+            ));
+        }
     }
     let mut stale = Vec::new();
-    collect_stale_directory(root, &directory, extension, retained, &mut stale)?;
+    collect_stale_directory(
+        root,
+        root_identity,
+        &directory,
+        extension,
+        retained,
+        &mut stale,
+    )?;
     stale.sort();
     Ok(stale)
 }
 
 fn collect_stale_directory(
     root: &Path,
+    root_identity: Option<&ObjectIdentity>,
     directory: &Path,
     extension: &str,
     retained: &BTreeSet<RelativePath>,
     stale: &mut Vec<RelativePath>,
 ) -> Result<()> {
+    if let Some(identity) = root_identity {
+        revalidate_mutation_parent(root, identity, &directory.join(".inventory"))?;
+    }
     let entries = fs::read_dir(directory).map_err(|source| {
         GeneratorError::with_source(
             GeneratorErrorKind::Io,
@@ -488,7 +883,14 @@ fn collect_stale_directory(
             ));
         }
         if metadata.is_dir() {
-            collect_stale_directory(root, &entry.path(), extension, retained, stale)?;
+            collect_stale_directory(
+                root,
+                root_identity,
+                &entry.path(),
+                extension,
+                retained,
+                stale,
+            )?;
         } else if metadata.is_file() {
             if entry.path().extension() == Some(std::ffi::OsStr::new(extension)) {
                 let entry_path = entry.path();
@@ -576,7 +978,121 @@ fn temporary_sibling(target: &Path, suffix: &str) -> Result<PathBuf> {
     Ok(target.with_file_name(temporary_name))
 }
 
-fn ensure_parent_directories(root: &Path, target: &Path, created: &mut Vec<PathBuf>) -> Result<()> {
+fn validate_root_identity(root: &Path, expected: &ObjectIdentity) -> Result<()> {
+    let metadata = fs::symlink_metadata(root).map_err(|source| {
+        GeneratorError::with_source(
+            GeneratorErrorKind::InvalidPath,
+            "revalidate artifact output root",
+            root.display().to_string(),
+            source,
+        )
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || ObjectIdentity::from_metadata(&metadata) != *expected
+    {
+        return Err(GeneratorError::new(
+            GeneratorErrorKind::InvalidPath,
+            "revalidate artifact output root",
+            format!("output root identity changed: {}", root.display()),
+        ));
+    }
+    let canonical = fs::canonicalize(root).map_err(|source| {
+        GeneratorError::with_source(
+            GeneratorErrorKind::InvalidPath,
+            "revalidate artifact output root",
+            root.display().to_string(),
+            source,
+        )
+    })?;
+    if canonical != root {
+        return Err(GeneratorError::new(
+            GeneratorErrorKind::InvalidPath,
+            "revalidate artifact output root",
+            format!("output root path changed: {}", root.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn revalidate_mutation_parent(
+    root: &Path,
+    root_identity: &ObjectIdentity,
+    target: &Path,
+) -> Result<()> {
+    validate_root_identity(root, root_identity)?;
+    let parent = target.parent().ok_or_else(|| {
+        transaction_error("revalidate artifact mutation", target.display().to_string())
+    })?;
+    validate_components(root, parent, true)?;
+    let canonical = fs::canonicalize(parent).map_err(|source| {
+        GeneratorError::with_source(
+            GeneratorErrorKind::InvalidPath,
+            "revalidate artifact mutation parent",
+            parent.display().to_string(),
+            source,
+        )
+    })?;
+    if !canonical.starts_with(root) {
+        return Err(GeneratorError::new(
+            GeneratorErrorKind::InvalidPath,
+            "revalidate artifact mutation parent",
+            format!("parent escaped output root: {}", parent.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn revalidate_existing_file(
+    root: &Path,
+    root_identity: &ObjectIdentity,
+    path: &Path,
+) -> Result<()> {
+    revalidate_mutation_parent(root, root_identity, path)?;
+    let metadata = fs::symlink_metadata(path).map_err(|source| {
+        GeneratorError::with_source(
+            GeneratorErrorKind::InvalidPath,
+            "revalidate artifact file",
+            path.display().to_string(),
+            source,
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(GeneratorError::new(
+            GeneratorErrorKind::InvalidPath,
+            "revalidate artifact file",
+            format!("not a real file: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_opened_file(file: &File, path: &Path) -> Result<()> {
+    let handle = file.metadata().map_err(|source| {
+        transaction_source("inspect opened artifact file", path.display(), source)
+    })?;
+    let path_metadata = fs::symlink_metadata(path).map_err(|source| {
+        transaction_source("inspect opened artifact path", path.display(), source)
+    })?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.is_file()
+        || ObjectIdentity::from_metadata(&handle) != ObjectIdentity::from_metadata(&path_metadata)
+    {
+        return Err(GeneratorError::new(
+            GeneratorErrorKind::InvalidPath,
+            "validate opened artifact path",
+            format!("opened file identity changed: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_parent_directories(
+    root: &Path,
+    root_identity: &ObjectIdentity,
+    target: &Path,
+    created: &mut Vec<PathBuf>,
+) -> Result<()> {
     let parent = target.parent().ok_or_else(|| {
         transaction_error("create artifact parents", target.display().to_string())
     })?;
@@ -590,8 +1106,12 @@ fn ensure_parent_directories(root: &Path, target: &Path, created: &mut Vec<PathB
     let mut current = root.to_path_buf();
     for component in relative.components() {
         current.push(component.as_os_str());
+        validate_root_identity(root, root_identity)?;
         match fs::create_dir(&current) {
-            Ok(()) => created.push(current.clone()),
+            Ok(()) => {
+                validate_components(root, &current, true)?;
+                created.push(current.clone());
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 validate_components(root, &current, true)?;
             }
@@ -607,25 +1127,42 @@ fn ensure_parent_directories(root: &Path, target: &Path, created: &mut Vec<PathB
     Ok(())
 }
 
-fn stage_artifact(target: &Path, bytes: &[u8]) -> Result<()> {
+fn stage_artifact(
+    root: &Path,
+    root_identity: &ObjectIdentity,
+    target: &Path,
+    bytes: &[u8],
+) -> Result<()> {
     let stage = temporary_sibling(target, "stage")?;
+    revalidate_mutation_parent(root, root_identity, &stage)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&stage)
         .map_err(|source| transaction_source("create artifact stage", stage.display(), source))?;
+    if let Err(error) = validate_opened_file(&file, &stage) {
+        drop(file);
+        if revalidate_mutation_parent(root, root_identity, &stage).is_ok() {
+            let _ = fs::remove_file(&stage);
+        }
+        return Err(error);
+    }
     if let Err(source) = file
         .write_all(bytes)
         .and_then(|()| file.flush())
         .and_then(|()| file.sync_all())
     {
-        let _ = fs::remove_file(&stage);
+        drop(file);
+        if revalidate_mutation_parent(root, root_identity, &stage).is_ok() {
+            let _ = fs::remove_file(&stage);
+        }
         return Err(transaction_source(
             "write artifact stage",
             stage.display(),
             source,
         ));
     }
+    validate_opened_file(&file, &stage)?;
     Ok(())
 }
 
@@ -651,39 +1188,109 @@ fn target_exists_as_file(target: &Path) -> Result<bool> {
     }
 }
 
-fn rollback<'a>(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "rollback must receive every live transaction collection explicitly"
+)]
+fn rollback_snapshot<'a>(
     cause: GeneratorError,
+    root: &Path,
+    root_identity: &ObjectIdentity,
     installed: &[PathBuf],
     backups: &[(PathBuf, PathBuf)],
     stages: impl IntoIterator<Item = &'a PathBuf>,
     created_directories: &[PathBuf],
+    snapshot: &TransactionSnapshot,
 ) -> Result<()> {
     let mut failures = Vec::new();
     for target in installed.iter().rev() {
-        if let Err(error) = fs::remove_file(target)
+        if let Err(error) = revalidate_mutation_parent(root, root_identity, target) {
+            failures.push(format!("revalidate {}: {error}", target.display()));
+        } else if let Err(error) = fs::remove_file(target)
             && error.kind() != std::io::ErrorKind::NotFound
         {
             failures.push(format!("remove {}: {error}", target.display()));
         }
     }
-    for (target, backup) in backups.iter().rev() {
-        if let Err(error) = fs::rename(backup, target) {
-            failures.push(format!(
-                "restore {} from {}: {error}",
-                target.display(),
-                backup.display()
-            ));
+    for (_, backup) in backups.iter().rev() {
+        if let Err(error) = revalidate_mutation_parent(root, root_identity, backup) {
+            failures.push(format!("revalidate {}: {error}", backup.display()));
+        } else if let Err(error) = fs::remove_file(backup)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            failures.push(format!("remove {}: {error}", backup.display()));
         }
     }
     for stage in stages {
-        if let Err(error) = fs::remove_file(stage)
+        if let Err(error) = revalidate_mutation_parent(root, root_identity, stage) {
+            failures.push(format!("revalidate {}: {error}", stage.display()));
+        } else if let Err(error) = fs::remove_file(stage)
             && error.kind() != std::io::ErrorKind::NotFound
         {
             failures.push(format!("remove {}: {error}", stage.display()));
         }
     }
+    let mut directories = snapshot.directories.iter().collect::<Vec<_>>();
+    directories.sort_by_key(|path| path.components().count());
+    for directory in directories {
+        if directory.exists() {
+            continue;
+        }
+        if let Some(parent) = directory.parent()
+            && let Err(error) =
+                revalidate_mutation_parent(root, root_identity, &parent.join(".restore"))
+        {
+            failures.push(format!("revalidate {}: {error}", directory.display()));
+            continue;
+        }
+        if let Err(error) = fs::create_dir(directory) {
+            failures.push(format!(
+                "restore directory {}: {error}",
+                directory.display()
+            ));
+        }
+    }
+    for (target, original) in &snapshot.files {
+        if let Err(error) = revalidate_mutation_parent(root, root_identity, target) {
+            failures.push(format!("revalidate {}: {error}", target.display()));
+            continue;
+        }
+        match OpenOptions::new().write(true).create_new(true).open(target) {
+            Ok(mut file) => {
+                let restored = validate_opened_file(&file, target)
+                    .and_then(|()| {
+                        file.write_all(&original.bytes)
+                            .and_then(|()| file.flush())
+                            .and_then(|()| file.sync_all())
+                            .map_err(|source| {
+                                transaction_source("restore artifact", target.display(), source)
+                            })
+                    })
+                    .and_then(|()| {
+                        revalidate_mutation_parent(root, root_identity, target)?;
+                        fs::set_permissions(target, original.permissions.clone()).map_err(
+                            |source| {
+                                transaction_source(
+                                    "restore artifact permissions",
+                                    target.display(),
+                                    source,
+                                )
+                            },
+                        )
+                    });
+                if let Err(error) = restored {
+                    failures.push(format!("restore {}: {error}", target.display()));
+                }
+            }
+            Err(error) => failures.push(format!("restore {}: {error}", target.display())),
+        }
+    }
     for directory in created_directories.iter().rev() {
-        if let Err(error) = fs::remove_dir(directory)
+        if let Err(error) =
+            revalidate_mutation_parent(root, root_identity, &directory.join(".remove"))
+        {
+            failures.push(format!("revalidate {}: {error}", directory.display()));
+        } else if let Err(error) = fs::remove_dir(directory)
             && error.kind() != std::io::ErrorKind::NotFound
         {
             failures.push(format!("remove directory {}: {error}", directory.display()));
@@ -699,7 +1306,12 @@ fn rollback<'a>(
     }
 }
 
-fn remove_empty_directories(directory: &Path, output_root: &Path) -> Result<bool> {
+fn remove_empty_directories(
+    directory: &Path,
+    output_root: &Path,
+    root_identity: &ObjectIdentity,
+) -> Result<bool> {
+    revalidate_mutation_parent(output_root, root_identity, &directory.join(".inspect"))?;
     match fs::symlink_metadata(directory) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
@@ -732,11 +1344,19 @@ fn remove_empty_directories(directory: &Path, output_root: &Path) -> Result<bool
                 source,
             )
         })?;
-        if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            remove_empty_directories(&entry.path(), output_root)?;
+        if metadata.file_type().is_symlink() {
+            return Err(GeneratorError::new(
+                GeneratorErrorKind::InvalidPath,
+                "remove empty generated directory",
+                format!("symlink is not allowed: {}", entry.path().display()),
+            ));
+        }
+        if metadata.is_dir() {
+            remove_empty_directories(&entry.path(), output_root, root_identity)?;
         }
     }
     if directory != output_root {
+        revalidate_mutation_parent(output_root, root_identity, &directory.join(".remove"))?;
         match fs::remove_dir(directory) {
             Ok(()) => return Ok(true),
             Err(error)
@@ -775,6 +1395,7 @@ fn transaction_source(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -810,6 +1431,34 @@ mod tests {
 
     fn relative(value: &str) -> RelativePath {
         RelativePath::new(value).expect("valid test path")
+    }
+
+    fn snapshot_tree(root: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
+        fn visit(root: &Path, directory: &Path, snapshot: &mut BTreeMap<String, Option<Vec<u8>>>) {
+            let mut entries = fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if entry.file_type().unwrap().is_dir() {
+                    snapshot.insert(format!("{relative}/"), None);
+                    visit(root, &path, snapshot);
+                } else {
+                    snapshot.insert(relative, Some(fs::read(path).unwrap()));
+                }
+            }
+        }
+
+        let mut snapshot = BTreeMap::new();
+        visit(root, root, &mut snapshot);
+        snapshot
     }
 
     #[test]
@@ -1143,5 +1792,139 @@ mod tests {
             special_error.kind(),
             GeneratorErrorKind::ArtifactTransaction
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_install_rejects_root_and_component_swaps() {
+        use std::os::unix::fs::symlink;
+
+        let supplied = TestDirectory::new("artifact-root-supplied");
+        let outside = TestDirectory::new("artifact-root-outside");
+        let root_link = supplied.path().join("root-link");
+        symlink(outside.path(), &root_link).unwrap();
+        let root_error = ArtifactPlan::new(
+            &root_link,
+            relative("generated"),
+            "xml",
+            RunScope::Filtered(relative("source/a.html")),
+            vec![(relative("generated/a.xml"), b"new".to_vec())],
+            None,
+        )
+        .expect_err("a supplied output-root symlink must be rejected");
+        assert_eq!(root_error.kind(), GeneratorErrorKind::InvalidPath);
+
+        let replace_parent = TestDirectory::new("artifact-root-replacement");
+        let replace_root = replace_parent.path().join("output");
+        fs::create_dir(&replace_root).unwrap();
+        let replace_plan = ArtifactPlan::new(
+            &replace_root,
+            relative("generated"),
+            "xml",
+            RunScope::Filtered(relative("source/a.html")),
+            vec![(relative("generated/a.xml"), b"new".to_vec())],
+            None,
+        )
+        .unwrap();
+        fs::rename(&replace_root, replace_parent.path().join("output-original")).unwrap();
+        symlink(outside.path(), &replace_root).unwrap();
+        let replace_error = replace_plan
+            .install()
+            .expect_err("a replaced output root must be rejected at install time");
+        assert_eq!(replace_error.kind(), GeneratorErrorKind::InvalidPath);
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+
+        let directory = TestDirectory::new("artifact-component-swap");
+        let outside = TestDirectory::new("artifact-component-swap-outside");
+        fs::create_dir(directory.path().join("generated")).unwrap();
+        let plan = ArtifactPlan::new(
+            directory.path(),
+            relative("generated"),
+            "xml",
+            RunScope::Filtered(relative("source/a.html")),
+            vec![(relative("generated/a.xml"), b"new".to_vec())],
+            None,
+        )
+        .unwrap();
+        fs::rename(
+            directory.path().join("generated"),
+            directory.path().join("generated-original"),
+        )
+        .unwrap();
+        symlink(outside.path(), directory.path().join("generated")).unwrap();
+
+        let error = plan
+            .install()
+            .expect_err("an install-time component swap must be rejected");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
+        assert!(!outside.path().join("a.xml").exists());
+
+        let late_stale_root = TestDirectory::new("artifact-late-stale");
+        fs::create_dir(late_stale_root.path().join("generated")).unwrap();
+        let late_stale_plan = ArtifactPlan::new(
+            late_stale_root.path(),
+            relative("generated"),
+            "xml",
+            RunScope::Full,
+            vec![(relative("generated/a.xml"), b"new".to_vec())],
+            Some(vec![relative("generated/a.xml")]),
+        )
+        .unwrap();
+        fs::write(
+            late_stale_root
+                .path()
+                .join("generated/created-after-plan.xml"),
+            b"late stale",
+        )
+        .unwrap();
+        late_stale_plan.install().unwrap();
+        assert!(
+            !late_stale_root
+                .path()
+                .join("generated/created-after-plan.xml")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn artifact_cleanup_failure_restores_prior_tree() {
+        let directory = TestDirectory::new("artifact-cleanup-rollback");
+        fs::create_dir_all(directory.path().join("generated/empty")).unwrap();
+        fs::write(directory.path().join("generated/a.xml"), b"old-a").unwrap();
+        fs::write(directory.path().join("generated/stale.xml"), b"stale").unwrap();
+        let prior_tree = snapshot_tree(directory.path());
+        let plan = ArtifactPlan::new(
+            directory.path(),
+            relative("generated"),
+            "xml",
+            RunScope::Full,
+            vec![(relative("generated/a.xml"), b"new-a".to_vec())],
+            Some(vec![relative("generated/a.xml")]),
+        )
+        .unwrap();
+
+        let error = plan
+            .install_with_cleanup_failure(1)
+            .expect_err("injected cleanup failure must report rollback");
+        assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+        assert_eq!(
+            fs::read(directory.path().join("generated/a.xml")).unwrap(),
+            b"old-a"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("generated/stale.xml")).unwrap(),
+            b"stale"
+        );
+        assert!(directory.path().join("generated/empty").is_dir());
+        assert!(
+            fs::read_dir(directory.path().join("generated"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".surgeist-"))
+        );
+        assert_eq!(snapshot_tree(directory.path()), prior_tree);
     }
 }
