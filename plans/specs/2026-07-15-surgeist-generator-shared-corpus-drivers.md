@@ -1097,8 +1097,8 @@ without following a link and admits this closed inventory:
 | block/character device, whiteout, mount crossing, foreign owner, unknown type/mode, or changed identity | never admissible | preserve the entire remaining profile and return `ArtifactTransaction` |
 
 Once the group is terminal, the cleaner takes a complete normalized inventory
-with relative path, type, permission bits, owner, device/inode/fsid, and link
-count, rechecks that no name/identity changed, and durably publishes
+with relative path, type, permission bits, owner, device/inode/fsid, and a link
+count only for nondirectories, rechecks that no name/identity changed, and durably publishes
 `profile-inventory.json` in the run intent before the first unlink. It then
 removes entries in reverse depth/byte order. At each step, an absent recorded
 name means an earlier cleanup attempt completed that step; a present name must
@@ -1110,7 +1110,10 @@ remaining recorded names. Cleanup therefore accounts for its own link-count
 decrements while never opening or changing any outside name. Any unrecorded new
 name, replacement, mount change,
 or inconclusive lookup preserves the remaining tree. Each removal and parent
-sync precedes the next. After the root disappears, an identity-bound
+sync precedes the next. Directory link count is deliberately neither serialized
+nor compared: removing a recorded child directory legitimately changes its
+parent's count, while parent identity/type/mode/owner/mount and exact remaining
+child names remain mandatory. After the root disappears, an identity-bound
 `profile-root-absent` marker permits `profile-cleaned` even if the process dies
 between root removal and marker publication. A crash at any subset resumes from
 the sidecar; no recursive path API, content mutation, symlink traversal, or
@@ -1546,19 +1549,38 @@ error, and contained panic all drive the same terminal sequence below; no child,
 pipe, or process-slot handle is dropped as cleanup. Abrupt generator-process
 death is handled only by the durable recovery states.
 
+The child uses piped stdout/stderr. After the `Child` is stored, each taken pipe
+is moved into one of two preallocated outer drain slots and a named reader thread
+handle is stored before the thread can be forgotten. A reader retains at most
+one MiB, reports overflow exactly once, and then continues draining/discarding
+until EOF so the child cannot block on a full pipe. Overflow tells the supervisor
+to enter the same group-kill path. If either reader-thread spawn fails, the
+supervisor terminates the child/group, drains any unowned pipe synchronously to
+EOF, and joins any started reader. After child reap and group `ESRCH`, both
+readers receive an unbounded terminal join; completed, I/O-error, and panicked
+joins are all terminal and error-accounted, while a handle is never detached.
+Only then does the live owner publish `drains-terminal`, binding retained bytes,
+lengths, digests, overflow flags, and join outcomes. Abrupt owner death closes
+the pipe/thread resources with that process; orphan recovery never claims their
+output and relies solely on child/group absence before aborting the stage.
+
 The live owner gives `init` one minute and `fetch` thirty minutes, with separate
 one-MiB stdout/stderr caps drained concurrently. It observes leader exit with
 `waitid(WEXITED|WNOHANG|WNOWAIT)` so the leader PID reserves the group. On
 timeout, output overflow, or after a leader exit plus a five-second helper grace
 period, it sends `SIGKILL` to the verified group exactly once (`ESRCH` is an
 acceptable no-member result), reaps the owned leader without a terminal
-deadline, and then waits without a terminal deadline for group `ESRCH`. Only
-after owned wait status and group absence does it publish `reaped`; success also
-requires status zero. The marker binds the exact wait status and captured-output
+deadline, and then waits without a terminal deadline for group `ESRCH`. It next
+joins both drains as above. Only after owned wait status, group absence, and
+`drains-terminal` does it publish `reaped`; success also requires status zero.
+The marker binds the exact wait status and captured-output
 digests. Captured diagnostic bytes are bounded and escaped without
 assuming UTF-8 when constructing a `Process` error. The next Git
 slot cannot launch until the prior slot is terminal. The stage is normalized and
 prepared only after both slots are terminal and successful.
+`owner-terminal-unrecorded` has the same owned-wait, group-absence, and joined-
+drain prerequisites as `reaped`; it differs only because `child.json` could not
+be made durable and therefore authorizes abort, never success.
 
 Cache-key recovery examines these process slots before applying SG-09 stage
 recovery. A still-live owner owns the slot. For a dead owner,
@@ -1902,10 +1924,17 @@ contain only same-mount effective-user directories at `0700` or `0755` and
 ordinary single-link files at `0600` or `0644`; browser stages add ordinary files
 at `0755`, the one registered archive at `0600`, and only the exact five
 already-validated `0755` symlinks created last. A Taffy stage whose process slots
-are terminal may contain only effective-user, same-mount directories and
-ordinary single-link files with permission bits `0000..0777` and no special
-bits—the range trusted Git can leave before normalization; while a process slot
-is nonterminal no cleanup inventory is admissible. `prepared` requires the exact
+are terminal may contain only effective-user, same-mount directories with owner
+`rwx`, permission bits `0700..0777`, and no special bits, plus ordinary
+single-link files with permission bits `0000..0777` and no special bits. Every
+directory is therefore descriptor-traversable during recovery even under a
+restrictive `077` umask; a trusted Git command that somehow leaves an
+unsearchable directory is disputed rather than admitted as removable. During
+successful top-down normalization, directories may transition only from that
+range to `0755` and files only from their observed permission bits to `0644`;
+death leaves a mixture still inside this construction subset and recovery can
+resume traversal. While a process slot is nonterminal no cleanup inventory is
+admissible. `prepared` requires the exact
 final policy, never this construction subset. After a corpus swap, the old stage
 must match the immutable old sidecar's exact modes. These are the domain
 “allowed types/modes” used by SG-09 recovery; no worker-selected policy remains.
@@ -2034,6 +2063,10 @@ unparseable or unreferenced child is disputed.
    `new-inventory.json` and `prepared.json` files. The new sidecar records each
    normalized path, type, mode, device/inode identity, link count, length/content
    digest for regular files, and target bytes/digest for an allowed symlink.
+   Directory entries encode `link_count: null`; regular files and allowed
+   symlinks encode their positive count. Directory link count is never part of a
+   tree digest or recovery comparison because child-directory removal changes it;
+   `old-inventory.json` uses the identical nullable field rule.
    `prepared.json` binds the old/new sidecar digests and the complete new-tree
    digest. No commit is attempted before the prepared marker is durable.
 
@@ -2101,7 +2134,7 @@ the registered stage-root identity and permits only same-mount entries allowed b
 that domain's construction policy; it never follows a link, crosses a mount, or
 removes a hard-linked/special entry. After `prepared`, removal is descriptor-
 rooted and postorder and each remaining entry's mount, identity, type, mode, link
-count, length/content digest, or allowed symlink target is rechecked against the
+count when nondirectory, length/content digest, or allowed symlink target is rechecked against the
 applicable sidecar immediately before unlink. Once an `aborted` or `committed`
 marker is durable, a crash-partially-deleted stage is accepted only when its
 remaining names and identities are an exact subset of that sidecar. A mismatch
@@ -2217,8 +2250,13 @@ Recovery probes the PID in the directory's current owner field without
 signalling it and does not claim while that PID exists or the probe is
 inconclusive; PID reuse is conservatively live. The one exception is a durable
 `lost-contended` marker, which is explicit relinquishment: before cleaning, the
-creator itself or another process must win the same atomic recovering-name
-claim, even if the creator PID still exists. Thus two recoverers can never both
+creator itself or another process must first acquire the internal stage lock and
+then win the same atomic recovering-name claim, even if the creator PID still
+exists. Marker publication promises that the creator closed its original stage
+lock descriptor before relinquishment. A would-be cleaner whose nonblocking
+stage lock contends does not claim; one that loses the name rename closes its
+newly acquired stage descriptor without mutation. The claim winner retains that
+lock through internal-stage removal. Thus two recoverers can never both
 remove an empty pre-intent directory, partial metadata, or a stage, and a crashed
 recoverer leaves a newly claimable name rather than an unowned cleanup race.
 Merely opening a directory before another claimant moves it grants no authority;
@@ -2244,17 +2282,23 @@ header, and acquires the advisory lock on that still-open stage. It then attempt
 `RENAME_EXCL` directly from the intent to the exact final lock name and syncs both
 directories. A winner keeps that same descriptor; on `EEXIST`, a loser validates
 the complete final inode/header without mutating it and tries its lock. If that
-nonblocking attempt contends, the loser publishes a synced `lost-contended`
-marker binding the observed final identity/header digest, wins the recovering-
-name claim, cleans only its own internal stage/intent through the bootstrap-local
-receipt protocol, and returns `LeaseActive`;
-it does not need the winner's lock to discard an unpublished private file. If the
+nonblocking attempt contends, the loser first unlocks and closes its internal
+stage descriptor, then publishes a synced `lost-contended` marker binding the
+observed final identity/header digest and the release-before-marker protocol.
+From marker publication onward it does not touch the intent through an old
+descriptor. It competes like any other cleaner: reopen/lock the exact internal
+stage, win the recovering-name claim, retain the stage lock, clean only its own
+internal stage/intent through the bootstrap-local receipt protocol, and return
+`LeaseActive`. If another cleaner wins, the creator closes its losing descriptor,
+rescans until the claimed intent is gone or owned by a live claimant, and returns
+`LeaseActive` without cleanup. Neither cleanup path needs the published final
+lock to discard an unpublished private stage. If the
 lock succeeds, it adopts the final and journal-cleans its loser stage. A live
 bootstrap intent's stage lock is never cleaned unless its durable
 `lost-contended` marker first relinquishes it and the cleaner wins the claim.
 Recovery by a claim winner first accepts an empty pre-intent directory, or a
 directory containing only one recognized incomplete `intent.json` temporary
-plus an optional `cleanup-started`, provided no `lock.stage`/registration exists
+plus an optional `cleanup-started`, provided no `lock.stage`/registration exists.
 Those states do not yet identify a final lock and cannot own an external object,
 so they are cleaned locally without inspecting any final name. With a complete
 intent it accepts only: complete intent plus final absent and no stage;
@@ -2620,7 +2664,11 @@ Shared-core tests shall prove:
    final—never an unjournaled/empty/partial poisoned final. Exact interleavings
    cover a winner publishing after a dead loser created but did not register its
    zero stage, and a live loser observing a contended valid final, publishing
-   `lost-contended`, cleaning only itself, and returning `LeaseActive`. Two
+   `lost-contended`, cleaning only itself, and returning `LeaseActive`. The
+   latter race proves release-before-marker: a third cleaner cannot claim while
+   the internal stage lock is held, and after release exactly one of creator or
+   third cleaner reacquires that lock then wins the name claim; a losing live
+   creator performs no descriptor cleanup. Two
    simultaneous recoverers race over an empty pre-intent directory, every
    partial-intent temporary, and a dead `recovering` claimant; exactly one atomic
    name claimant mutates each state while the loser closes its descriptor and
@@ -2647,7 +2695,11 @@ Shared-core tests shall prove:
    resumed. Marker or old-stage cleanup failure after the swap
    preserves the complete new final plus a read-only-detectable journal that the
    next lease clears; no test expects rollback after commit and no observed state
-   is a mixed generation. Descriptor-bound tests replace roots,
+   is a mixed generation. Nested-directory cleanup crashes after every child
+   removal and resumes despite the resulting parent `st_nlink` change; directory
+   link count is absent from both sidecars/digests, while nondirectory counts and
+   every directory identity/type/mode/mount/remaining-child check still bind.
+   Descriptor-bound tests replace roots,
    components, stage/final names, journals, and destination identities before
    each transition and prove no escape, overwrite, or disputed-object removal;
    no public plan or lease exists, internal plans have no arbitrary output-root
@@ -2731,7 +2783,18 @@ measurements, and artifacts to prove:
    `owner-terminal-unrecorded`/`reaped`/`orphan-group-absent`; recovery never removes a stage while a recorded
    process/group exists, never signals from recovery, and resumes only terminal
    slots. Init/fetch timeout and output overflow exercise the one group signal,
-   owned reap, group-absence wait, and no-detach rule;
+   owned reap, group-absence wait, and no-detach rule. A restrictive `077` umask
+   still leaves every Git directory traversable; injected death after each
+   directory/file normalization step resumes a mixed `0700`/`0755` and
+   pre-`0644`/`0644` construction subset, while an injected owner-unsearchable
+   directory is preserved as disputed rather than entered or removed. Caught-
+   panic injection after storing the child slot, after child/group marker
+   publication, while an init/fetch helper remains active, after each one-time
+   group signal/reap transition, and while each output reader is draining proves
+   the outer supervisor reaches the same terminal path. Reader spawn failure,
+   reader I/O error/panic, overflow, and delayed EOF leave no child, helper,
+   pipe, or thread handle detached; both drain joins resolve before any terminal
+   live-owner process marker or cache-lock release;
 6. representative XML shape, four variants, numeric formatting, layout fields,
    and unchanged generated-by provenance;
 7. disposition accounting, full/filtered isolation, and offline drift rejection;
@@ -2769,7 +2832,8 @@ measurements, and artifacts to prove:
    whose outside name/bytes remain untouched, arbitrary/escaping symlink targets
    that are unlinked without traversal, and every rejected owner/type/mode/mount
    state. Death after sidecar publication and each reverse-order unlink/sync/root-
-   absent marker resumes the exact subset; an injected replacement or new name
+   absent marker resumes the exact subset, including nested-directory parent
+   link-count changes; an injected replacement or new name
    preserves the remainder. Item 7 separately covers recoverable
    case-assigned page/measurement failures.
 
