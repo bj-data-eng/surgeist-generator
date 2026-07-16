@@ -223,7 +223,7 @@ The cached direct package manifests provide this reviewed license evidence:
 `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`; and `tokio` and `zip` are
 `MIT`. Every direct dependency therefore includes an MIT-compatible grant. The
 reviewed lockfile-refresh task must record
-`CARGO_NET_OFFLINE=true cargo deny list --format tsv --layout license` for the
+`cargo deny --all-features --locked --offline list --format tsv --layout license` for the
 complete resolved graph; an absent/unknown expression or a license not accepted
 by the repository's MIT distribution boundary stops that task for coordinator
 and independent-reviewer adjudication rather than being silently accepted.
@@ -368,14 +368,20 @@ builds and drives the Tokio runtime only on that thread, and synchronously joins
 it. It is therefore safe to call from either synchronous code or from a thread
 that already participates in another Tokio runtime. Thread spawn or runtime build
 failure maps to `Generation` before authority/resources exist. A normal join
-returns the worker's semantic result; an outer worker panic is resumed rather
-than mislabeled as completed cleanup. The async operation body is wrapped in
-`AssertUnwindSafe(...).catch_unwind()` *inside* the still-live private runtime,
-with its lease and resource registry owned by the enclosing supervisor; an
-operation panic therefore becomes cleanup input rather than unwinding those
-handles. The function returns only after the supervisor's lease and every domain
-resource have reached the terminal cleanup state in SG-10. No handler task or
-browser cleanup is detached.
+returns the worker's semantic result. After the runtime and an empty terminal-
+ownership registry are constructed, one absolute `std::panic::catch_unwind`
+boundary over `AssertUnwindSafe` surrounds the complete inner supervisor—not only its operation future,
+but normal cleanup and every transition that can register a resource. The
+registry itself remains owned by the outer worker frame. Inside that boundary,
+the async operation future has its own nested catch that records an operation
+panic as semantic `Generation` cleanup input. A panic escaping any supervisor
+transition reaches the absolute boundary and becomes input to SG-10's idempotent
+fallback terminalizer; only after every registered child/task/profile/lease/
+runtime resource is terminal does the worker resume that supervisor panic
+payload. The synchronous parent joins and resumes that worker panic rather than
+mislabeled cleanup success. The
+function otherwise returns only after every domain resource reaches the terminal
+state. No child, handler task, browser cleanup, or runtime worker is detached.
 
 ### SG-03.4 Exact shared-core API
 
@@ -886,6 +892,22 @@ parsing. Unknown versions fail closed; there is no best-effort downgrade.
 `ManifestVersion` is a semantic newtype. Domain code compares it to one exact
 supported version and reports the manifest path, actual value, and expected
 value on mismatch.
+
+One canonical corpus root belongs to exactly one generator domain. Both drivers
+intentionally use the root file `corpus.toml`, but layout accepts only its closed
+schema 2 and CSS accepts only its closed schema 1; the other schema is
+`InvalidManifest` before coordination or writable-namespace probing. Mutation
+reopens the same manifest identity and digest while holding the corpus gate
+before bootstrapping a domain mutex. Once a domain's persistent lease/transaction
+scaffold exists, the gate admits only that domain's fixed names; an opposite-
+domain scaffold is disputed `ArtifactTransaction` for mutation and
+`Verification` for a read-only check, never adopted or removed. Concurrent
+manifest replacement is likewise rejected before a lease or corpus write.
+Layout and CSS therefore require distinct canonical corpus roots even when both
+features are compiled into one generator binary set. Their namespace matrices
+need not guess or cross-lock the other domain's roots because the wrong driver
+cannot enter the corpus lifecycle; same-root cross-domain use and corpus-domain
+repurposing are unsupported in this cycle.
 
 ### SG-05.2 Layout schema 2
 
@@ -1686,8 +1708,15 @@ lease. A checkout content change after snapshot creation cannot alter imported
 bytes; a protected-directory identity change is caught by the under-lease
 revalidation below. Layout performs any fresh bare fetch as an SG-05 cache-key
 transaction before taking a corpus lease, proves the fetched object is a commit,
-and builds the same commit-tree snapshot for Taffy import. Expected file and case
-counts are checked against the in-memory snapshot before any corpus publication.
+and builds the same commit-tree snapshot for Taffy import. Count enforcement is
+domain-specific: Taffy import checks its complete layout manifest
+manifest inventory/count contract before publication. CSS `import-csstree`
+checks only the exact snapshot JSON-file count and byte/JSON validity; it does
+not derive cases or enforce `expected_cases`. CSS full/filtered generation
+derives every case and enforces that count before expectation publication, while
+offline checking enforces it as persisted-corpus `Verification`. Thus a
+syntactically valid zero-case CSS file can be imported and only later fails
+generation/check as already specified.
 
 Every snapshot consumer validates the complete source-protection set against its
 downstream writable namespaces. CSS performs SG-07.2's read-only comparison
@@ -2333,8 +2362,9 @@ key only. Cache coordination has no owner record.
 every layout import/generate/check command and `css` for every CSS
 import/generate/check command. Mutating commands take their domain mutex
 exclusive; checks take it shared. Therefore import, full/filtered generation,
-and checking cannot race within one domain/corpus. Layout and CSS may use distinct
-domains in a deliberately shared corpus; distinct corpora are independent.
+and checking cannot race within one domain/corpus. SG-05.1 forbids layout and CSS
+from sharing one canonical corpus root; their distinct corpora and domain mutexes
+are independent.
 
 The corpus gate and mutex live beneath
 `<canonical-corpus-root>/.surgeist-generator/`: `acquisition.lock`,
@@ -2383,10 +2413,13 @@ remain.
 
 Layout's synchronous worker owns one private resource registry. Thread-spawn and
 Tokio-runtime-build failure occurs before cache/corpus authority and maps to
-`Generation`. After supervisor construction, the registry lives outside the
-panic-contained operation future. A browser child, page, CDP/stderr task `JoinHandle`,
-profile/run intent, and generated bytes are registered immediately; no task
-handle is dropped. Normal completion, semantic error, and contained operation
+`Generation`. The registry and runtime live in the absolute outer worker frame,
+outside SG-03.3's full-supervisor unwind boundary. It uses preallocated slots for
+the browser child, every page, CDP/stderr `JoinHandle`, profile/run intent,
+cache/corpus guards, runtime, and generated bytes. Each acquired handle moves
+into its slot before later allocation, marker I/O, await, or injected panic; a
+slot is cleared only after its resource has terminal proof. Normal completion,
+semantic error, contained operation panic, and contained supervisor-transition
 panic use this exact monotonic-clock terminal sequence:
 
 1. Each page receives one close attempt with a two-second `tokio::time::timeout`.
@@ -2428,14 +2461,26 @@ artifact/report/stale tree. Only SG-09.3's case-assigned recoverable outcome may
 publish diagnostics. Once publication begins there is no async cancellation
 point; post-commit cleanup follows SG-09.2.
 
-Each cleanup await is separately panic-contained. A close panic falls through to
-the same direct kill-and-unbounded-wait path; a handler panic is a resolved
-terminal join outcome and is error-accounted. Cleanup contains no assertion,
-`unwrap`, or `expect` over external state. A contained operation panic returns
-`Generation` only after the same terminal protocol. If the outer supervisor
-itself nevertheless panics, `layout::run` joins and resumes that panic; it does
-not misreport cleanup-complete `Generation`. Chromiumoxide drop behavior is only
-last-resort unwind protection, not the claimed lifecycle.
+The outer fallback terminalizer owns the registry until it is empty. Each
+transition—including taking a handle, page/browser close, timeout polling,
+signal/reap, task abort/join, profile cleanup, guard release, and runtime
+shutdown—is individually `catch_unwind`-contained and idempotent. A panic before
+terminal proof leaves the handle in its slot; a panic after an OS action is
+resolved by re-probing the recorded state before retry. It records the first
+panic payload, continues all other resources in fixed reverse-registration
+order, and may wait without a deadline; it never clears or drops a live slot to
+make progress. A close panic falls through to the same direct kill-and-unbounded-
+wait path; a task panic is a resolved joined outcome and is error-accounted.
+After task joins, the runtime is shut down only once its registered async work is
+terminal, and runtime worker shutdown itself completes before the slot clears.
+Cleanup contains no assertion, `unwrap`, or `expect` over external state.
+
+If there was only an operation panic and terminalization succeeds, the semantic
+result is `Generation` as specified above. If any supervisor transition itself
+panicked, terminalization still completes and the worker then resumes the first
+supervisor panic; `layout::run` joins and resumes it rather than reporting
+cleanup-complete `Generation`. Chromiumoxide or Tokio `Drop` behavior is not part
+of the claimed lifecycle and is reached only for already-terminal empty slots.
 
 Mutation lifecycles are command-specific and closed:
 
@@ -2556,21 +2601,38 @@ by a checked constructor.
 
 No binary remaps a semantic error independently.
 
+Classification is contextual, not a mechanical conversion from the deepest
+`io::Error`. Resolving or canonicalizing a caller-supplied root/path is part of
+the checked path constructor and is `InvalidPath`; an I/O failure later reading
+an already validated ordinary input is `Io`. Domain manifest parsing performs
+the SG-03.4 remap before work begins, and read-only checks map structurally valid
+but drifted persisted state to `Verification`. During mutation, a successfully
+cleaned abort returns the original operation kind. An unresolved identity,
+journal, stage, marker, swap, or post-commit cleanup state returns
+`ArtifactTransaction` in preference to the original error; a browser/task/profile
+terminalization failure with no disputed durable identity returns `Generation`;
+if both occur, `ArtifactTransaction` wins. This precedence is applied once by
+the domain runner and is not changed by a binary.
+
 | Failure | Required kind | Mutation rule |
 | --- | --- | --- |
 | Missing/duplicate/unknown CLI argument | `Cli` | No filesystem mutation |
-| Root, relative path, symlink/mount escape, or textual/filesystem-equivalent protected/writable namespace overlap | `InvalidPath` | No domain mutation; private probes cleaned, exact coordination bootstrap may remain |
-| TOML parse, version, or field contract | `InvalidManifest` | No corpus mutation |
+| Missing/non-directory/non-UTF-8 caller root; caller-root canonicalization/resolution failure; invalid relative path; symlink/mount escape; or textual/filesystem-equivalent namespace overlap | `InvalidPath` | No domain mutation; private probes cleaned, exact coordination bootstrap may remain |
+| Opening/reading an already validated manifest/helper/source/artifact path fails without semantic drift and outside a durable transaction | `Io` | No commit; any private cleanable state is removed |
+| TOML read succeeds but parse, version, field, count-scalar, or domain-namespace contract fails | `InvalidManifest` | No corpus mutation |
 | Count, duplicate, unmatched override, or malformed CSSTree case | `InvalidInventory` | No artifact/report mutation |
-| Wrong/dirty Git source or origin, malformed Git storage, unsupported sanitized Git invocation, or missing promised object | `SourceVerification` | No import mutation |
+| Wrong/dirty Git source or origin, malformed Git storage, disallowed Git config/helper/executable inventory, unsupported required preflight option, missing promised object, or snapshot tree-mode/hash mismatch | `SourceVerification` | No import mutation |
+| Reqwest client/TLS/connect/request timeout or response-body read error | `Io` | Abort/clean cache stage; no cache final or corpus mutation |
+| Browser redirect/non-200 response, download-response URL/policy violation, declared/streamed size limit, ZIP syntax/CRC/path/type/mode/limit defect, logical-tree/content-pin mismatch, or invalid existing cache unit/provenance | `SourceVerification` | Abort/clean cache stage when possible; never replace an invalid final unit |
 | Non-Apple-Silicon-macOS mutation request, or missing required rename, mount-identity, or name-equivalence capability | `UnsupportedPlatform` | No cache/import/artifact/report mutation; supported-host probes cleaned and exact coordination bootstrap may remain |
 | Contended generation lease | `LeaseActive` | No corpus mutation |
-| Git/browser subprocess failure | `Process` | Domain cleanup; no stale pruning |
-| Read/write/canonicalize failure | `Io` | Pre-commit final unchanged; post-commit state follows journal |
-| Journal/stage/swap/recovery/cleanup failure | `ArtifactTransaction` | Pre-commit final unchanged, or post-commit complete new final plus durable recovery journal |
+| A permitted Git verification/acquisition command or browser spawn, group verification, timeout, output cap, nonzero status, stderr contract, DevTools startup/connection, or owned process-terminal failure | `Process` | Clean/abort domain state; no stale pruning, unless cleanup precedence above applies |
+| Browser version process succeeds but its bounded stdout differs from the exact pinned version string, or a cache reuse version/content check differs | `SourceVerification` | Invalid cache is preserved and never used/replaced |
+| Ordinary read/write/flush/sync error before durable transaction intent, or after a validated read-only input was opened | `Io` | No commit; final unchanged |
+| Durable intent/stage/sidecar/marker/rename/swap/recovery identity or I/O failure, including disputed profile state and any post-commit cleanup failure | `ArtifactTransaction` | Pre-commit final unchanged, or post-commit complete new final plus durable recovery journal |
 | Recoverable case-assigned layout page/measurement/batch failure after successful resource cleanup | `Generation` | SG-09 diagnostic publication; no stale/nonmanifest pruning |
-| Unassigned layout generation/resource cleanup or CSS neutral conversion failure | `Generation` | No publication commit; final artifact/report/stale state unchanged |
-| Offline hash/provenance/report mismatch or unresolved probe/owner/transaction journal | `Verification` | Check commands remain read-only |
+| Unassigned layout generation, page/browser/task cleanup failure, identity-matching profile removal failure with its run intent retained, or CSS neutral conversion failure | `Generation` | No publication commit; final artifact/report/stale state unchanged |
+| Offline semantic/hash/provenance/count/report mismatch, invalid persisted mode/inventory, or unresolved probe/owner/transaction/run journal | `Verification` | Check commands remain read-only; an underlying read I/O error remains `Io` |
 
 ## SG-13 Verification behavior
 
@@ -2603,7 +2665,10 @@ gate's shared advisory lock, then takes and holds the domain mutex's shared lock
 for the complete check before releasing the gate. Both acquisitions are
 nonblocking; contention releases what was acquired and returns `LeaseActive`.
 Mutation leases use exclusive locks, so verification observes one publication
-state without updating owner metadata. An existing `owner.json` is validated as
+state without updating owner metadata. While the gate is held, any persistent
+opposite-domain lease/transaction scaffold is `Verification` before this
+domain's mutex lookup; it is never treated as a harmless sibling. An existing
+`owner.json` is validated as
 historical audit only and is never described as the current contender. If
 coordination was absent at start, the check creates nothing and
 requires the exact name to remain absent at its final root-identity recheck; its
@@ -2680,7 +2745,12 @@ Shared-core tests shall prove:
    and holds a pre-bootstrap shared gate for the complete check. Two distinct
    corpora sharing one canonical owner-target and cache unit derive the same
    byte-exact cache key, contend on one key mutex, and recover only that key's
-   journal before either corpus mutex; alias target identities converge or fail;
+   journal before either corpus mutex; alias target identities converge or fail.
+   Passing schema 1 to layout or schema 2 to CSS fails `InvalidManifest` before
+   coordination, under-gate manifest replacement fails before domain bootstrap,
+   and a persisted opposite-domain lease/transaction scaffold fails mutation as
+   `ArtifactTransaction` and checking as `Verification` without adoption or
+   removal;
 8. artifact publication creates/syncs intent and old sidecar before registering
    an external stage, then deterministically builds and syncs one complete staged
    root, removes stale files only in a clean full staged state, and changes the
@@ -2722,7 +2792,12 @@ Shared-core tests shall prove:
 9. hash text validation and report counts/provenance detect drift, shared reports
    accept structurally valid failed/unsupported counts without fictitious
    artifacts while domain validators enforce their own artifact/count mapping,
-   and every `GeneratorErrorKind` has the exact SG-12 exit code;
+   and every `GeneratorErrorKind` has the exact SG-12 exit code. Table-driven
+   failures prove caller canonicalization remains `InvalidPath`, validated-input
+   I/O remains `Io`, durable transaction failure overrides an earlier operation
+   kind as `ArtifactTransaction`, browser terminal cleanup is `Generation` only
+   without a durable dispute, and read-only drift is `Verification` while a read
+   error remains `Io`;
 10. an unregistered external stage/tombstone is rejected even when its final target is
     absent; compile-time mutation selection is exactly
     `aarch64-apple-darwin`; every mutation entry point in the already-installed
@@ -2775,7 +2850,10 @@ measurements, and artifacts to prove:
    row. Synthetic archives cover early links, descendants after
    links, path escapes, duplicates/conflicts, cycles, special/hard-link modes,
    corrupt CRC, limits, and a byte change that misses the content pin without
-   creating an outside sentinel. Sanitized fresh-bare Taffy acquisition crosses
+   creating an outside sentinel. Injected browser acquisition boundaries assert
+   exact SG-12 kinds for Reqwest transport/body I/O, redirect/status/size, every
+   ZIP/content-pin/cache defect, version spawn/status/output mismatch, launch/
+   DevTools failure, and cleanup-precedence combinations. Sanitized fresh-bare Taffy acquisition crosses
    only the local sentinel boundary, without launching a browser, using the
    network, or checking out a worktree. Test-only Git children/helpers cover
    parent death before spawn, after `launching`, after child/group publication,
@@ -2808,7 +2886,9 @@ measurements, and artifacts to prove:
    cache, import, artifact/report, helper/manifest, or coordination writes;
 9. injected fatal launch, unassigned-generation, browser-close, handler-join,
    profile, cache-transaction, and acquisition-stage failures, plus an injected operation panic
-   after all synthetic resources are registered, a successful close with delayed
+   after all synthetic resources are registered and injected supervisor panics
+   immediately before/after every registry take, close, timeout, signal, reap,
+   abort, join, profile step, guard release, and runtime-shutdown transition, a successful close with delayed
    child exit, a hung page close, and a hung handler exercise the exact 2/5-second
    graceful deadlines, one kill/abort, and unbounded terminal wait. Deadline
    cases use Tokio's `test-util` support in a current-thread paused-time test
@@ -2823,7 +2903,9 @@ measurements, and artifacts to prove:
    retained only with its durable run intent, and a
    distinct-owner contender can acquire the released same-corpus lease; the
    panic maps to `Generation`, no final artifact, stale output, or report changes,
-   and no detached-task counter remains. Death after run intent, profile
+   and no detached-task counter remains. Supervisor-transition panics resume only
+   after the same zero-live-child/task/runtime counters and released guards are
+   observed; no test relies on `Drop` to reach them. Death after run intent, profile
    registration, `launching`, `spawn-failed`, child PID, `group-verified`,
    `group-mismatch`, live-owner `reaped`, recovery `orphan-group-absent`, profile
    cleanup, and run-tombstone transitions proves that uncertain child/group state
@@ -2903,7 +2985,7 @@ cargo check --locked --offline -p surgeist-generator --no-default-features --fea
 cargo test --locked --offline -p surgeist-generator --no-default-features --features layout-browser,css-corpus --all-targets
 cargo clippy --locked --offline -p surgeist-generator --no-default-features --features layout-browser,css-corpus --all-targets -- -F unsafe-code -D warnings
 cargo fmt --check
-CARGO_NET_OFFLINE=true cargo deny list --format tsv --layout license
+cargo deny --all-features --locked --offline list --format tsv --layout license
 cargo audit --no-fetch --stale
 ```
 
@@ -2924,7 +3006,8 @@ database revision and must contain no vulnerability finding.
 `README.md` shall describe the shared-core ownership, feature matrix, exact CLI
 syntax, acquisition-capable commands, offline checks, the
 Apple-Silicon-macOS-only mutation-capability boundary, the already-verified WASM
-nonmutation core, and the fact that consumer corpora remain in layout/CSS.
+nonmutation core, the requirement that layout and CSS use distinct canonical
+corpus roots, and the fact that consumer corpora remain in layout/CSS.
 `AGENTS.md` shall cease describing an empty scaffold and shall point
 discovery at the new modules, features, binaries, tests, and offline command
 matrix. No copied workflow is added.
