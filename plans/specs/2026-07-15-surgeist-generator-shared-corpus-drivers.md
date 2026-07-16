@@ -187,7 +187,7 @@ The dependency matrix is:
 | `serde_json` | `=1.0.145` | yes | inherited | inherited | Reports, layout measurements, CSSTree fixtures |
 | `sha2` | `=0.10.9` | yes | inherited | inherited | Source and artifact SHA-256 |
 | `toml` | `=0.9.8` | yes | inherited | inherited | Domain manifest parsing |
-| `rustix` | `=1.1.4`, `fs`, Unix targets only | yes on Unix | inherited | inherited | Safe descriptor-relative, non-following filesystem transactions |
+| `rustix` | `=1.1.4`, `fs`, Linux/macOS targets only | yes on Linux/macOS | inherited | inherited | Safe descriptor-relative, non-following filesystem transactions |
 | `chromiumoxide` | `=0.9.1`, no defaults, `fetcher`, `rustls`, `zip8` | no | yes | no | Managed pinned Chromium measurement |
 | `futures` | `=0.3.31` | no | yes | no | Chromium handler stream |
 | `tokio` | `=1.48.0`, `fs`, `macros`, `rt-multi-thread` | no | yes | no | Async layout driver and thin binary |
@@ -198,14 +198,15 @@ and the layout module/binary. `css-corpus` activates the CSS module/binary and n
 heavy dependency. Both features may be enabled together. The two binaries use
 `required-features` so an unrequested driver cannot compile accidentally.
 `rustix = { version = "=1.1.4", features = ["fs"] }` is declared under
-`[target.'cfg(unix)'.dependencies]`; it is a shared lifecycle dependency, not a
-domain or default feature switch.
+`[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]`;
+it is a shared lifecycle dependency, not a domain or default feature switch.
 
 All named dependency sources, including `rustix` 1.1.4, are already present in
-the local Cargo registry.
-The now binary-bearing tool package shall track `Cargo.lock`; `.gitignore` shall
-stop ignoring that one file. All implementation and verification commands use
-`--locked --offline`, so no dependency acquisition occurs.
+the local Cargo registry. `Cargo.lock` is already tracked and `.gitignore` does
+not ignore it. The task that first adds `rustix` runs exactly one unlocked
+resolution command, `cargo generate-lockfile --offline`, commits the resulting
+lockfile, and then uses `--locked --offline` for every check and test. No
+dependency acquisition occurs.
 
 ### SG-03.3 Public front door
 
@@ -223,6 +224,78 @@ All public structs have private fields and checked constructors. Public enums
 whose variants may evolve are `#[non_exhaustive]`. The library does not expose
 Chromiumoxide, Tokio task, Serde JSON value, filesystem lock, or child-process
 types in public signatures. The public API is additive relative to the scaffold.
+
+The feature-gated driver API is exact; private request struct fields are omitted
+from this signature outline:
+
+```rust
+pub mod layout {
+    #[non_exhaustive]
+    pub enum LayoutCommand {
+        Generate,
+        GenerateExisting,
+        CheckCorpus,
+        CheckTaffyCorpus,
+        ImportTaffy,
+    }
+
+    impl LayoutRequest {
+        pub fn new(
+            location: CorpusLocation,
+            command: LayoutCommand,
+            browser_path: Option<RelativePath>,
+            filter: Option<RelativePath>,
+        ) -> Result<Self>;
+        pub fn location(&self) -> &CorpusLocation;
+        pub fn command(&self) -> LayoutCommand;
+        pub fn browser_path(&self) -> Option<&RelativePath>;
+        pub fn filter(&self) -> Option<&RelativePath>;
+    }
+
+    pub async fn run(request: LayoutRequest) -> Result<()>;
+    pub async fn run_from_env() -> Result<()>;
+}
+
+pub mod css {
+    #[non_exhaustive]
+    pub enum CssCommand {
+        ImportCsstree,
+        Generate,
+        CheckCorpus,
+    }
+
+    impl CssRequest {
+        pub fn new(
+            location: CorpusLocation,
+            command: CssCommand,
+            source_root: Option<std::path::PathBuf>,
+            filter: Option<RelativePath>,
+        ) -> Result<Self>;
+        pub fn location(&self) -> &CorpusLocation;
+        pub fn command(&self) -> CssCommand;
+        pub fn source_root(&self) -> Option<&std::path::Path>;
+        pub fn filter(&self) -> Option<&RelativePath>;
+    }
+
+    pub fn run(request: CssRequest) -> Result<()>;
+    pub fn run_from_env() -> Result<()>;
+}
+```
+
+Both command enums are `Clone + Copy + Debug + Eq + PartialEq`. Request
+constructors enforce the complete option matrix in SG-11 before any domain I/O;
+the CSS constructor canonicalizes the required import source root and rejects a
+missing, non-directory, non-UTF-8, or otherwise supplied source root. The layout
+constructor retains the browser path as a checked owner-relative path for later
+manifest-cache containment validation.
+
+`run_from_env` reads `std::env::args_os()` only for command-line arguments; it
+does not read environment overrides. `run` and `run_from_env` return `Ok(())`
+only after every authorized artifact and canonical full report is atomically
+installed and verified. Check/import commands and filtered generation expose no
+in-memory report; reports remain corpus-owned files. A filtered success never
+writes the canonical report. Any partial or failed lifecycle returns the one
+semantic `GeneratorError` that the binary prints.
 
 ## SG-04 Semantic core types
 
@@ -382,8 +455,9 @@ or network access. `VerifiedSource` retains the canonical root and exact revisio
 and cannot be constructed publicly without verification.
 
 The layout `import-taffy` command retains its existing explicitly
-acquisition-capable fetch/checkout behavior in domain code and then passes the
-result through this verifier. No test or verification gate invokes that command.
+acquisition-capable fetch/checkout behavior in domain code after the SG-10
+capability preflight and lease, then passes the result through this verifier. No
+test or verification gate invokes that command.
 CSS `import-csstree` never acquires a source: it requires
 `--source-root <path>` and verifies that user-supplied checkout.
 
@@ -422,8 +496,9 @@ same accounting to derived neutral cases.
 
 ### SG-07.2 CSSTree ingestion
 
-`import-csstree` verifies the supplied checkout, collects the pinned fixture JSON
-inventory, and atomically mirrors those JSON bytes beneath the CSS-owned
+`import-csstree` verifies and inventories the supplied checkout read-only,
+performs the SG-10 capability preflight, acquires the lease, and only then
+atomically mirrors those JSON bytes beneath the CSS-owned
 `import_root`. It preserves relative paths, rejects all non-JSON and special
 entries, checks the exact source-file count, and removes stale imported JSON only
 as part of a successful complete import transaction. It writes no expectations
@@ -495,7 +570,7 @@ are rejected.
 output paths to bytes, and the exact retained output inventory for a full run.
 Construction hashes content and rejects path collisions before touching disk.
 
-On Unix, an internal rooted-filesystem capability opens the output directory
+On Linux and macOS, an internal rooted-filesystem capability opens the output directory
 once and performs every traversal, create, open, rename, and remove relative to
 held directory descriptors with non-following `rustix` filesystem operations.
 It opens each directory component separately and refuses symbolic links. An
@@ -506,11 +581,23 @@ capability. Pathname validation alone is never mutation authority. No OS
 descriptor is public.
 
 Safe descriptor-relative mutation is unavailable from this implementation on
-non-Unix targets. `ArtifactPlan` construction and `GenerationLease` acquisition
-therefore fail with `UnsupportedPlatform` before creating, opening for write, or
-changing any file. Read-only manifest, inventory, hash, provenance, and corpus
-checks remain portable. The binaries compile on non-Unix and report the semantic
-failure; operator documentation states this boundary.
+every target other than Linux and macOS, including other `cfg(unix)` targets.
+`ArtifactPlan` construction and `GenerationLease` acquisition therefore fail
+with `UnsupportedPlatform` before creating, opening for write, or changing any
+file. Read-only manifest, inventory, hash, provenance, and corpus checks remain
+portable. The binaries compile on unsupported targets and report the semantic
+failure; operator documentation states this exact target boundary.
+
+Every destination-sensitive filesystem transition is atomic with respect to
+name collisions and inode aliases. New files use exclusive descriptor-relative
+create. Backup and install renames use `renameat_with` with `NOREPLACE`; rollback
+restores use the same no-replace rule. Removal of an existing file or empty
+directory first exchanges it with a unique transaction-owned tombstone, verifies
+the displaced object's already-open descriptor identity, link count, and type,
+then unlinks the verified tombstone. A mismatch is exchanged back without
+overwriting either name and aborts. Existing lock metadata uses the analogous
+exchange protocol described in SG-10. No check-then-plain-rename, in-place
+truncate, or path-based remove is mutation authority.
 
 Installation follows one transaction:
 
@@ -542,25 +629,36 @@ The canonical report itself uses the same staged replace-and-rollback primitive.
 `GenerationLease` uses the standard library's advisory file lock. Its key is the
 domain plus canonical corpus-root digest, so full and filtered runs for the same
 domain/corpus contend while unrelated layout and CSS corpora may run concurrently.
-Lease and acquisition-gate files live beneath
-`<owner-root>/target/surgeist-generator/` and include generator, PID, corpus root,
-scope, command, and Unix start time.
+The immutable lease and acquisition-gate files plus mutable owner record live
+beneath `<owner-root>/target/surgeist-generator/`. The owner record includes
+generator, PID, corpus root, scope, command, and Unix start time.
 
-The acquisition gate is locked while owner metadata is truncated, written, and
-synced, preventing a contender from observing stale or empty ownership. A held
-lease returns a semantic `LeaseActive` error with the recorded owner. Dropping the
-lease releases it. Lock files may remain on disk as reusable coordination files;
-they are not generated corpus artifacts.
+The acquisition gate is locked while a complete owner stage is written, synced,
+and atomically installed, preventing a contender from observing stale, empty, or
+partial ownership. A held lease returns a semantic `LeaseActive` error with the
+recorded owner. Dropping the lease releases it. Coordination files may remain on
+disk for reuse; they are not generated corpus artifacts.
 
-On Unix, coordination directories and lock files are reached through the same
-safe descriptor-relative, non-following capability described in SG-09. Lock
-files are exclusively created or opened without following links. Before a
-reusable lock file is locked or written, it must be a regular file with exactly
-one filesystem link and the generator-owned schema-1 magic header
-`surgeist-generator-lock-v1\n`. A hard link,
-symlink, special file, unknown header, or residual collision fails without
-truncation. Gate and lease ownership metadata retain that header. On non-Unix,
-acquisition returns `UnsupportedPlatform` before coordination writes.
+On Linux and macOS, coordination directories and lock files are reached through
+the same safe descriptor-relative, non-following capability described in SG-09.
+The immutable acquisition-gate and lease-mutex files are exclusively created or
+opened without following links, contain exactly the generator-owned schema-1
+magic header `surgeist-generator-lock-v1\n`, and are locked but never truncated
+or rewritten. Before use they must be regular, header-valid, and single-link;
+their already-open descriptors are rechecked after locking. A hard link added
+later cannot expose a content mutation because these two inodes remain immutable.
+
+Mutable owner metadata lives in a separate owner file. Acquisition writes a new
+single-link, exclusively created and synced stage file, then uses an atomic
+descriptor-relative exchange with the owner name. The displaced owner is
+accepted for deletion only after its open descriptor proves the previously
+observed identity, single-link count, regular type, and magic header; otherwise
+the exchange is reversed without overwriting either inode and acquisition fails.
+The first owner install uses `NOREPLACE`. A contender holds the immutable gate
+lock while reading the owner file, so it observes one complete header-plus-owner
+record. No existing lock or owner inode is truncated or written in place. On
+targets other than Linux and macOS, acquisition returns `UnsupportedPlatform`
+before coordination writes.
 
 The command lifecycle is:
 
@@ -569,15 +667,22 @@ CLI parse
   -> CorpusLocation validation
   -> manifest parse and semantic validation
   -> filter/source inventory validation
-  -> optional source verification/import
+  -> optional read-only source verification
+  -> supported mutation-capability preflight
   -> generation lease
+  -> optional browser/cache acquisition or source import
   -> deterministic collection and domain generation
   -> atomic artifact groups
   -> full-only report and stale cleanup
   -> success or semantic error
 ```
 
-Manifest, source, and filter errors occur before the lease or writes. Generation
+Manifest, source, filter, and unsupported-platform errors occur before the lease
+or writes. CSS verifies the supplied CSSTree checkout read-only before acquiring
+the lease, then imports beneath the lease. Layout validates manifest acquisition
+inputs before the lease; its mutable browser/cache and Taffy fetch/checkout work
+runs only after capability preflight and lease acquisition, followed by exact-pin
+verification. Every mutation-capable command follows this ordering. Generation
 and install errors retain failure provenance and perform rollback as defined in
 SG-09.
 
@@ -623,8 +728,8 @@ access.
 
 Each binary file is at most fifteen physical lines. It selects its feature-gated
 library driver, prints `surgeist-*-generate: <error>` once on failure, and exits
-with 64 for CLI contract errors or 1 for all other errors. It contains no manifest,
-path, source, generation, artifact, or report behavior.
+only through `GeneratorError::exit_code()`. It contains no manifest, path, source,
+generation, artifact, or report behavior.
 
 ## SG-12 Error model
 
@@ -651,6 +756,25 @@ stdout, and stderr without panicking. External input returns an error rather tha
 asserting. Assertions remain only for internal states already made unrepresentable
 by a checked constructor.
 
+`GeneratorError::exit_code() -> u8` has this exhaustive mapping:
+
+| Kind | Exit code |
+| --- | --- |
+| `Cli` | 64 |
+| `InvalidPath` | 1 |
+| `InvalidManifest` | 1 |
+| `InvalidInventory` | 1 |
+| `SourceVerification` | 1 |
+| `UnsupportedPlatform` | 1 |
+| `LeaseActive` | 1 |
+| `Process` | 1 |
+| `Io` | 1 |
+| `ArtifactTransaction` | 1 |
+| `Generation` | 1 |
+| `Verification` | 1 |
+
+No binary remaps a semantic error independently.
+
 | Failure | Required kind | Mutation rule |
 | --- | --- | --- |
 | Missing/duplicate/unknown CLI argument | `Cli` | No filesystem mutation |
@@ -658,7 +782,7 @@ by a checked constructor.
 | TOML parse, version, or field contract | `InvalidManifest` | No corpus mutation |
 | Count, duplicate, unmatched override, or malformed CSSTree case | `InvalidInventory` | No artifact/report mutation |
 | Wrong/dirty Git source or origin | `SourceVerification` | No import mutation |
-| Mutation-capable command on a non-Unix target | `UnsupportedPlatform` | No filesystem write or write-open |
+| Mutation-capable command outside Linux/macOS | `UnsupportedPlatform` | No filesystem write or write-open |
 | Contended generation lease | `LeaseActive` | No corpus mutation |
 | Git/browser subprocess failure | `Process` | Domain cleanup; no stale pruning |
 | Read/write/canonicalize failure | `Io` | Transaction rollback where applicable |
@@ -698,26 +822,32 @@ Shared-core tests shall prove:
 6. filtered scope cannot authorize report or stale-output operations;
 7. full and filtered requests contend on one corpus lease, owner metadata is
    coherent, dropping releases the lease, and symlink, hard-link, unknown-header,
-   and coordination-component swaps cannot redirect or truncate a lock file;
+   post-check alias, and coordination-component swaps cannot redirect, overwrite,
+   or truncate a lock or owner file;
 8. artifact installation is deterministic, replaces atomically, removes stale
    files only when authorized, and restores every prior file after injected
    staging, installation, or cleanup failure; descriptor-bound race tests swap
-   roots and components at each mutation boundary without causing an escape;
-9. hash text validation and report counts/provenance detect drift.
+   roots, components, and destination names after pre-checks at each mutation
+   boundary without escape, overwrite, or removal of the colliding inode;
+9. hash text validation and report counts/provenance detect drift, and every
+   `GeneratorErrorKind` has the exact SG-12 exit code;
 10. a residual deterministic backup is rejected even when its final target is
-    absent, and non-Unix mutation entry points fail before writes.
+    absent; compile-time target selection is exactly Linux/macOS; every
+    mutation-capable entry point on other targets fails before a write-open,
+    coordination file, cache, import, artifact, or report mutation.
 
 Layout tests shall use synthetic temporary manifests, helpers, HTML, JSON
 measurements, and artifacts to prove:
 
 1. the explicit root CLI and closed command/argument matrix;
-2. schema-2 parsing, unknown/duplicate rejection, and manifest-derived Taffy pin;
-3. helper/base-style loading and hashes from the supplied corpus;
-4. managed/existing browser validation through injected fetch/version boundaries
+2. the exact public request constructor/getter and async `run` signatures;
+3. schema-2 parsing, unknown/duplicate rejection, and manifest-derived Taffy pin;
+4. helper/base-style loading and hashes from the supplied corpus;
+5. managed/existing browser validation through injected fetch/version boundaries
    without launching or acquiring a browser;
-5. representative XML shape, four variants, numeric formatting, layout fields,
+6. representative XML shape, four variants, numeric formatting, layout fields,
    and unchanged generated-by provenance;
-6. disposition accounting, report behavior, full/filtered isolation, and offline
+7. disposition accounting, report behavior, full/filtered isolation, and offline
    drift rejection.
 
 CSS tests shall use official-shaped synthetic fixture JSON and local temporary Git
@@ -725,14 +855,15 @@ repositories to prove:
 
 1. exact-pin import, deterministic JSON-only copying, count validation, and stale
    source removal;
-2. ordinary and error-array flattening, JSON Pointer IDs, sorted cases, options,
+2. the exact public request constructor/getter and synchronous `run` signatures;
+3. ordinary and error-array flattening, JSON Pointer IDs, sorted cases, options,
    canonical CSS, and omission of AST/error/offset data;
-3. malformed source structures and unmatched overrides fail before writes;
-4. active/default and non-active reason accounting;
-5. full generation writes expectations/report and removes stale outputs only
+4. malformed source structures and unmatched overrides fail before writes;
+5. active/default and non-active reason accounting;
+6. full generation writes expectations/report and removes stale outputs only
    after success;
-6. filtered generation updates only matches and writes/prunes no report;
-7. offline verification detects imported-source, expectation, report, hash,
+7. filtered generation updates only matches and writes/prunes no report;
+8. offline verification detects imported-source, expectation, report, hash,
    provenance, count, and stale-inventory drift.
 
 No focused test reads or executes the real layout or CSS repository corpus.
@@ -765,7 +896,7 @@ acquisition or real-corpus generation paths and does not run commands in
 ## SG-14 Documentation, compatibility, and handoff
 
 `README.md` shall describe the shared-core ownership, feature matrix, exact CLI
-syntax, acquisition-capable commands, offline checks, the Unix-only
+syntax, acquisition-capable commands, offline checks, the Linux/macOS-only
 mutation-capability boundary, and the fact that consumer corpora remain in
 layout/CSS. `AGENTS.md` shall cease describing an empty scaffold and shall point
 discovery at the new modules, features, binaries, tests, and offline command
@@ -780,8 +911,8 @@ Compatibility classification:
   of environment/default state;
 - layout manifest/XML/report schema: compatible schema 2;
 - CSS manifest/expectation/report schema: new schema 1;
-- generator mutation lifecycle: descriptor-confined on Unix and fail-closed
-  before writes on non-Unix;
+- generator mutation lifecycle: descriptor-confined on Linux/macOS and
+  fail-closed before writes everywhere else;
 - MSRV: unchanged at 1.97;
 - production dependency graph: unchanged because no production crate is wired.
 
