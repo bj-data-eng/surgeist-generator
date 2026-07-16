@@ -325,22 +325,16 @@ impl GenerationReport {
         manifest_path: &RelativePath,
     ) -> Result<()> {
         let corpus_root = corpus_root.as_ref();
-        verify_digest(
-            &self.manifest_digest,
-            &manifest_path.join(corpus_root),
-            "manifest",
-        )?;
+        let manifest_path = manifest_path.resolve_existing(corpus_root)?;
+        verify_digest(&self.manifest_digest, &manifest_path, "manifest")?;
         for artifact in &self.artifacts {
-            verify_digest(
-                artifact.provenance.source_digest(),
-                &artifact.provenance.source_path().join(corpus_root),
-                "source",
-            )?;
-            verify_digest(
-                artifact.output_digest(),
-                &artifact.output_path.join(corpus_root),
-                "artifact",
-            )?;
+            let source_path = artifact
+                .provenance
+                .source_path()
+                .resolve_existing(corpus_root)?;
+            verify_digest(artifact.provenance.source_digest(), &source_path, "source")?;
+            let output_path = artifact.output_path.resolve_existing(corpus_root)?;
+            verify_digest(artifact.output_digest(), &output_path, "artifact")?;
         }
         Ok(())
     }
@@ -404,6 +398,86 @@ mod tests {
 
     use super::{ArtifactProvenance, GenerationCounts, GenerationReport, ReportArtifact};
     use crate::{GeneratorErrorKind, ManifestVersion, RelativePath, Sha256Digest, SourceRevision};
+
+    #[cfg(unix)]
+    #[test]
+    fn report_verification_rejects_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let parent = std::env::temp_dir().join(format!(
+            "surgeist-generator-report-escape-{}-{nonce}",
+            std::process::id()
+        ));
+        let root = parent.join("corpus");
+        let outside = parent.join("outside");
+        fs::create_dir_all(&root).expect("create corpus");
+        fs::create_dir(&outside).expect("create outside directory");
+
+        for directory in [&root, &outside] {
+            fs::write(directory.join("manifest.toml"), b"schema_version = 1\n")
+                .expect("write manifest");
+            fs::write(directory.join("source.json"), b"{}\n").expect("write source");
+            fs::write(directory.join("output.json"), b"{\"cases\":[]}\n").expect("write output");
+        }
+        symlink(&outside, root.join("escape")).expect("create escaped report path");
+
+        let make_report = |source_path: &str, output_path: &str| {
+            let provenance = ArtifactProvenance::new(
+                RelativePath::new(source_path).expect("source path"),
+                Sha256Digest::from_file(if source_path.starts_with("escape/") {
+                    outside.join("source.json")
+                } else {
+                    root.join("source.json")
+                })
+                .expect("source digest"),
+                "surgeist-test",
+                ManifestVersion::new(1).expect("version"),
+                BTreeMap::new(),
+            )
+            .expect("provenance");
+            GenerationReport::new(
+                Sha256Digest::from_file(root.join("manifest.toml")).expect("manifest digest"),
+                "https://example.invalid/source.git",
+                revision(),
+                GenerationCounts::new(1, 0, 0, 0, 0),
+                vec![ReportArtifact::new(
+                    provenance,
+                    RelativePath::new(output_path).expect("output path"),
+                    Sha256Digest::from_file(if output_path.starts_with("escape/") {
+                        outside.join("output.json")
+                    } else {
+                        root.join("output.json")
+                    })
+                    .expect("output digest"),
+                    1,
+                )],
+            )
+            .expect("valid report")
+        };
+
+        let safe_manifest = RelativePath::new("manifest.toml").expect("manifest path");
+        let escaped_manifest = RelativePath::new("escape/manifest.toml").expect("escaped path");
+        let error = make_report("source.json", "output.json")
+            .verify_files(&root, &escaped_manifest)
+            .expect_err("escaped manifest must fail");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
+
+        let error = make_report("escape/source.json", "output.json")
+            .verify_files(&root, &safe_manifest)
+            .expect_err("escaped source must fail");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
+
+        let error = make_report("source.json", "escape/output.json")
+            .verify_files(&root, &safe_manifest)
+            .expect_err("escaped output must fail");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
+
+        fs::remove_dir_all(parent).expect("remove test directories");
+    }
 
     #[test]
     fn report_counts_and_provenance_detect_drift() {

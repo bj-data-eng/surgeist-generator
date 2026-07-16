@@ -237,6 +237,7 @@ pub fn verify_git_source(checkout: impl AsRef<Path>, pin: &PinnedSource) -> Resu
 
 fn git(directory: &Path, arguments: &[&str]) -> Result<Output> {
     let output = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(directory)
         .args(arguments)
@@ -409,6 +410,48 @@ mod tests {
             RelativePath::new(source).expect("strict path"),
         )
         .expect("valid pin")
+    }
+
+    #[test]
+    fn source_verification_does_not_refresh_git_index() {
+        let (directory, origin, revision) = repository();
+        let object = run_git(
+            directory.path(),
+            &[
+                OsStr::new("rev-parse"),
+                OsStr::new("HEAD:fixtures/case.json"),
+            ],
+        );
+        let cache_entry = format!("100644,{object},fixtures/case.json");
+        run_git(
+            directory.path(),
+            &[
+                OsStr::new("update-index"),
+                OsStr::new("--cacheinfo"),
+                OsStr::new(&cache_entry),
+            ],
+        );
+        let index_text = run_git(
+            directory.path(),
+            &[
+                OsStr::new("rev-parse"),
+                OsStr::new("--git-path"),
+                OsStr::new("index"),
+            ],
+        );
+        let index_path = Path::new(&index_text);
+        let index_path = if index_path.is_absolute() {
+            index_path.to_path_buf()
+        } else {
+            directory.path().join(index_path)
+        };
+        let before = fs::read(&index_path).expect("read deliberately stale Git index");
+
+        verify_git_source(directory.path(), &pin(&origin, revision, "fixtures"))
+            .expect("verify clean source");
+
+        let after = fs::read(index_path).expect("read Git index after verification");
+        assert_eq!(after, before, "source verification refreshed the Git index");
     }
 
     #[test]
