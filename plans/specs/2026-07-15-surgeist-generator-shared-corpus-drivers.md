@@ -1081,6 +1081,41 @@ transaction markers. The closed run state machine is:
 | owner absent but child/group exists or any probe is inconclusive | never signal from recovery; preserve and return `ArtifactTransaction` |
 | terminal evidence plus registered profile | descriptor-clean the exact identity; publish `profile-cleaned`, then receipt/tombstone removal |
 
+The browser profile is a dynamic child-owned cleanup namespace, not a corpus or
+cache artifact. Its registered root is created empty at mode `0700`, owned by the
+effective user, on the cache-target mount. Cleanup is forbidden until terminal
+child/group evidence exists. It then walks only from the held profile descriptor
+without following a link and admits this closed inventory:
+
+| Entry | Admissible recovery shape | Removal |
+| --- | --- | --- |
+| root directory | exact registered device/inode/fsid, effective-user owner, mode `0700`, same mount | remove only after every recorded child is absent |
+| descendant directory | effective-user owner, same device/fsid, no special mode bits, owner `rwx` bits present; group/other permission bits may vary | open no-follow, enumerate, then `unlinkat(AT_REMOVEDIR)` by verified parent/name |
+| regular file | effective-user owner, same device/fsid, permission bits `0000..0777`, no special bits, link count at least one | never open, truncate, chmod, or read; unlink only this verified profile name, so an outside hard link is untouched |
+| symlink | effective-user owner, same device/fsid, mode `0755`, link count one; target bytes may be arbitrary and are never resolved | `unlinkat` the link itself |
+| FIFO or Unix-domain socket | effective-user owner, same device/fsid, permission bits `0000..0777`, no special bits, link count one | never open; unlink the verified name |
+| block/character device, whiteout, mount crossing, foreign owner, unknown type/mode, or changed identity | never admissible | preserve the entire remaining profile and return `ArtifactTransaction` |
+
+Once the group is terminal, the cleaner takes a complete normalized inventory
+with relative path, type, permission bits, owner, device/inode/fsid, and link
+count, rechecks that no name/identity changed, and durably publishes
+`profile-inventory.json` in the run intent before the first unlink. It then
+removes entries in reverse depth/byte order. At each step, an absent recorded
+name means an earlier cleanup attempt completed that step; a present name must
+match the sidecar exactly. Regular entries sharing an inode form one recorded
+hard-link group: the sidecar stores all in-profile names and the initial outside-
+link count, computed as `st_nlink - recorded_in_profile_names`; before each
+unlink, every remaining name must expose that outside count plus the number of
+remaining recorded names. Cleanup therefore accounts for its own link-count
+decrements while never opening or changing any outside name. Any unrecorded new
+name, replacement, mount change,
+or inconclusive lookup preserves the remaining tree. Each removal and parent
+sync precedes the next. After the root disappears, an identity-bound
+`profile-root-absent` marker permits `profile-cleaned` even if the process dies
+between root removal and marker publication. A crash at any subset resumes from
+the sidecar; no recursive path API, content mutation, symlink traversal, or
+best-effort deletion is permitted.
+
 An owner that is still present owns recovery; another process does not touch its
 run intent. A marker-publication crash is interpreted only through durable final
 markers, so `launching` without a spawn outcome intentionally fails closed.
@@ -1485,6 +1520,60 @@ and permits only the HTTPS protocol. The manifest repository URL has the SG-03.4
 grammar and is passed literally, never through a remote name. There is no SCP,
 SSH, `git://`, HTTP, file, ext, or custom remote-helper production path.
 
+Taffy acquisition registers the cache transaction and moves its exact empty
+stage to the external registered name before any mutating Git spawn. Each of the
+two commands below then owns a separate `git-init` or `git-fetch` process slot
+inside that transaction journal. Before spawn it durably publishes the absolute
+program/argv digest, owner PID, expected child/PGID policy, `launching`, and the
+registered stage identity. `Command::spawn` failure publishes `spawn-failed`;
+success immediately publishes `child.json` with the returned PID and expected
+PGID equal to that PID, followed by exactly one of `group-verified` or
+`group-mismatch` after safe `getpgid`. The command starts in a new process group,
+and every permitted trusted Git helper remains in that inherited group. A group
+mismatch kills and reaps only the exact child, preserves the transaction as
+disputed, and never authorizes stage cleanup.
+
+Both process slots are registered in an outer synchronous acquisition-resource
+registry before the panic-contained Git operation begins. Each has a preallocated
+empty child slot. On successful spawn, the returned `Child` is moved into that
+slot before child-ID lookup, marker I/O, allocation, or any other fallible or
+panic-capable operation; only the outer supervisor may take it. If durable
+`child.json` publication then fails, the live supervisor still drives the child
+and verified group terminal and may publish `owner-terminal-unrecorded`, binding
+the owned wait status, as terminal evidence for abort. A process death in that
+same interval has only `launching` and therefore fails closed. Normal return,
+error, and contained panic all drive the same terminal sequence below; no child,
+pipe, or process-slot handle is dropped as cleanup. Abrupt generator-process
+death is handled only by the durable recovery states.
+
+The live owner gives `init` one minute and `fetch` thirty minutes, with separate
+one-MiB stdout/stderr caps drained concurrently. It observes leader exit with
+`waitid(WEXITED|WNOHANG|WNOWAIT)` so the leader PID reserves the group. On
+timeout, output overflow, or after a leader exit plus a five-second helper grace
+period, it sends `SIGKILL` to the verified group exactly once (`ESRCH` is an
+acceptable no-member result), reaps the owned leader without a terminal
+deadline, and then waits without a terminal deadline for group `ESRCH`. Only
+after owned wait status and group absence does it publish `reaped`; success also
+requires status zero. The marker binds the exact wait status and captured-output
+digests. Captured diagnostic bytes are bounded and escaped without
+assuming UTF-8 when constructing a `Process` error. The next Git
+slot cannot launch until the prior slot is terminal. The stage is normalized and
+prepared only after both slots are terminal and successful.
+
+Cache-key recovery examines these process slots before applying SG-09 stage
+recovery. A still-live owner owns the slot. For a dead owner,
+`launching` without `spawn-failed` or `child.json`, any `group-mismatch`, a live
+child/group, or an inconclusive probe preserves the complete transaction and
+returns `ArtifactTransaction`; recovery never signals a Git process. If the
+recorded child and expected group are both `ESRCH`, recovery publishes
+`orphan-group-absent` as alternative terminal evidence and may resume aborting
+the registered stage. `reaped`, `spawn-failed`, `owner-terminal-unrecorded`, and
+`orphan-group-absent` are the only terminal process-slot states; only the live
+owner holding the preallocated child slot may publish the third. Every marker uses SG-09's immutable
+temp/sync/`RENAME_EXCL` protocol. Consequently generator death cannot release a
+stage to cleanup while Git or a helper may still mutate it; an unknowable spawn
+outcome fails closed instead of guessing.
+
 Each acquisition starts in a new descriptor-rooted unique Taffy stage and runs
 only this closed command sequence:
 
@@ -1775,6 +1864,52 @@ hashes content and rejects path collisions before touching disk. There is no
 public plan rooted at an independently supplied path, and internal installation
 requires its matching live lease.
 
+Corpus publication has one exact mode policy on the supported target. Every
+publication-unit root and descendant directory is mode `0755`; every regular
+manifest, helper, imported fixture, generated XML/JSON, report, linked resource,
+retained artifact, and stale/nonmanifest generated candidate is mode `0644`.
+Layout and CSS Git snapshots therefore accept only `100644` fixture/resource
+blobs; an executable, symlink, gitlink, or other tree mode is
+`SourceVerification`. A current corpus unit is admissible only when every
+classified regular file/directory has the corresponding `0644`/`0755` mode;
+wrong modes are `InvalidInventory` before mutation and `Verification` during a
+check. A layout HTML import copies every retained Surgeist-authored fixture byte
+for byte but requires and preserves `0644`; clean-full, filtered, and diagnostic
+stage cloning preserves the exact admissible mode, while every newly overlaid
+file/directory is created at the fixed mode. No umask-derived corpus mode is
+accepted. Inode, mtime, and ownership are not corpus-format fields, but every
+entry must be owned by the effective user, ordinary/single-link, and same-mount.
+
+Private coordination, journal, transaction, and run directories are mode
+`0700`; their regular metadata, marker, receipt, lock-stage, and sidecar files
+are mode `0600`, except the already specified immutable cache-unit
+`.surgeist-source.json` at `0644`. A Taffy bare stage is normalized, after all
+Git processes are terminal and before `prepared`, to directories `0755` and
+ordinary single-link files `0644`; it permits no symlink, executable, hard link,
+or special entry. Browser-cache modes remain the exact per-type SG-05.2 matrix.
+These private/cache modes are included in their inventories and recovery
+validation. New ordinary files are exclusively created at `0600` and new
+directories at `0700`; while their descriptors are still held, the generator
+uses safe descriptor `fchmod` to the policy's final `0644`/`0755`, syncs, and
+rechecks permission bits before prepare. Taffy normalization applies the same
+held-descriptor operation after Git is terminal. Umask therefore cannot define a
+final mode. A chmod or verification failure aborts before prepare instead of
+becoming a platform-dependent artifact; symlink modes are never changed through
+a target-following operation.
+
+The pre-`prepared` construction-policy subset is also closed: corpus stages may
+contain only same-mount effective-user directories at `0700` or `0755` and
+ordinary single-link files at `0600` or `0644`; browser stages add ordinary files
+at `0755`, the one registered archive at `0600`, and only the exact five
+already-validated `0755` symlinks created last. A Taffy stage whose process slots
+are terminal may contain only effective-user, same-mount directories and
+ordinary single-link files with permission bits `0000..0777` and no special
+bits—the range trusted Git can leave before normalization; while a process slot
+is nonterminal no cleanup inventory is admissible. `prepared` requires the exact
+final policy, never this construction subset. After a corpus swap, the old stage
+must match the immutable old sidecar's exact modes. These are the domain
+“allowed types/modes” used by SG-09 recovery; no worker-selected policy remains.
+
 The only mutation target claimed and verified in this cycle is
 `aarch64-apple-darwin`. On that target an internal rooted-filesystem capability
 opens either the plan's bound corpus root under its live domain lease or the
@@ -1939,7 +2074,12 @@ recovers; it reports any unresolved cache journal as `Verification`.
 
 Recovery opens all names descriptor-relatively, validates the intent's recorded
 coordination and authority identities against its currently held authority, and
-recomputes inventories. It follows this closed state machine; `old` includes the
+recomputes inventories. Before classifying a Taffy stage as an interrupted
+construction, it resolves each process slot in command order under SG-06.1. A
+nonterminal/uncertain slot blocks every stage unlink and outcome marker; only
+`spawn-failed`, `reaped`, `owner-terminal-unrecorded`, or
+`orphan-group-absent` permits the ordinary table to resume. Process-slot sidecars/markers remain receipt-accounted transaction
+members through final cleanup. It then follows this closed state machine; `old` includes the
 cache-required absent state:
 
 | Observed durable state | Classification and action |
@@ -2057,10 +2197,46 @@ Lock-file bootstrap itself is journaled. Before creating a lock-file stage, a
 bootstrapper exclusively creates/syncs
 `bootstrap/locks/active-<decimal-pid>-<token>/` beneath the applicable
 coordination root; the exact name is the first durable liveness/ownership record
-even if death precedes `intent.json`. Recovery probes that PID without signalling
-it and never touches the directory while the PID exists or the probe is
-inconclusive; PID reuse is conservatively live. Once `ESRCH` proves the creating
-process is absent, only recognized internal bootstrap residue may be cleaned.
+even if death precedes `intent.json`. There is deliberately no assumed advisory
+inode before the first gate. Instead, every non-owner recovery first takes an
+exclusive directory-name claim. An `active` directory whose recorded creator is
+`ESRCH` is moved with `RENAME_EXCL` to
+`recovering-<origin-pid>-<origin-token>-by-<claimant-pid>-<claim-token>`; a later
+claimant whose current claimant is `ESRCH` moves that same directory to the same
+shape with its own PID/token. The origin pair never changes. All names are
+strictly parsed, the open source identity is checked immediately before the
+rename, and the bootstrap parent is synced afterward. Distinct claimants choose
+distinct destinations, but only one can move the single source name; `ENOENT` or
+a destination collision closes the unused descriptor and causes a fresh
+rescan/token retry, at most 16 newly generated tokens, without touching contents.
+If the state then has a live claimant it returns `LeaseActive`; exhaustion or an
+unrecognized state is `ArtifactTransaction`. A winner reopens the destination
+and proves the identity it moved before interpreting any file.
+
+Recovery probes the PID in the directory's current owner field without
+signalling it and does not claim while that PID exists or the probe is
+inconclusive; PID reuse is conservatively live. The one exception is a durable
+`lost-contended` marker, which is explicit relinquishment: before cleaning, the
+creator itself or another process must win the same atomic recovering-name
+claim, even if the creator PID still exists. Thus two recoverers can never both
+remove an empty pre-intent directory, partial metadata, or a stage, and a crashed
+recoverer leaves a newly claimable name rather than an unowned cleanup race.
+Merely opening a directory before another claimant moves it grants no authority;
+a losing descriptor is closed without mutation.
+
+The claim winner accepts only the closed bootstrap states below. It publishes a
+mode-`0600` `cleanup-started` marker through a unique temporary,
+flush/sync/`RENAME_EXCL`, and directory sync. It then removes, when present, the
+verified internal `lock.stage`, partial temporaries, `stage-created`, and
+`lost-contended`, then `intent.json` in that order with a directory sync after
+every step. `cleanup-started` is unlinked last, followed by descriptor `rmdir` of the claimed
+directory and a bootstrap-parent sync. A crash leaves a recognized subset under
+the recovering name; the next claim winner resumes it. An empty claimed
+directory is therefore terminal cleanup residue, not an ambiguous owner state.
+Unknown names/types/identities dispute the claim and are preserved. This is the
+bootstrap-local receipt protocol and does not rely on SG-09's already-held
+domain/cache mutex.
+
 The bootstrapper publishes `intent.json`, exclusively creates the fixed internal
 `lock.stage` as a mode-`0600`, zero-length regular single-link file, publishes
 its identity in `stage-created`, writes/syncs the exact
@@ -2069,12 +2245,19 @@ header, and acquires the advisory lock on that still-open stage. It then attempt
 directories. A winner keeps that same descriptor; on `EEXIST`, a loser validates
 the complete final inode/header without mutating it and tries its lock. If that
 nonblocking attempt contends, the loser publishes a synced `lost-contended`
-marker binding the observed final identity/header digest, cleans only its own
-internal stage/intent through the receipt protocol, and returns `LeaseActive`;
+marker binding the observed final identity/header digest, wins the recovering-
+name claim, cleans only its own internal stage/intent through the bootstrap-local
+receipt protocol, and returns `LeaseActive`;
 it does not need the winner's lock to discard an unpublished private file. If the
 lock succeeds, it adopts the final and journal-cleans its loser stage. A live
-bootstrap intent's stage lock is never cleaned. Recovery of a dead-owner,
-unlocked intent accepts only: complete intent plus final absent and no stage;
+bootstrap intent's stage lock is never cleaned unless its durable
+`lost-contended` marker first relinquishes it and the cleaner wins the claim.
+Recovery by a claim winner first accepts an empty pre-intent directory, or a
+directory containing only one recognized incomplete `intent.json` temporary
+plus an optional `cleanup-started`, provided no `lock.stage`/registration exists
+Those states do not yet identify a final lock and cannot own an external object,
+so they are cleaned locally without inspecting any final name. With a complete
+intent it accepts only: complete intent plus final absent and no stage;
 complete intent plus final absent and an unregistered exact `lock.stage` that is
 still mode `0600`, zero length, regular, single-link, and same-mount (death before
 `stage-created`); final absent plus the registered internal stage with any
@@ -2082,13 +2265,11 @@ prefix of the expected header (abort); a valid matching final plus absent stage
 (winner cleanup); a valid final plus the same exact unregistered zero-length
 stage (another bootstrapper won); or a valid final plus the registered loser
 stage (loser cleanup). A durable `lost-contended` intent is recoverable once its
-stage lock is acquirable even if the creating PID still exists; recovery rechecks
-the bound final identity/header and cleans only the loser intent. Header writing
+stage lock is acquirable even if the creating PID still exists; the claim winner
+rechecks the bound final identity/header and cleans only the loser intent. Header writing
 is forbidden before `stage-created`, so a nonempty unregistered stage is
 disputed. Wrong names/types/identities or final/header
-combinations are also disputed. Intent
-cleanup uses SG-09.2's receipt/tombstone order, so no unpublished unjournaled lock
-stage exists. Final lock files are exact-name, regular, single-link, immutable,
+combinations are also disputed. Final lock files are exact-name, regular, single-link, immutable,
 never truncated, and rejected on an unknown header or identity change.
 
 Cache users first open
@@ -2439,7 +2620,12 @@ Shared-core tests shall prove:
    final—never an unjournaled/empty/partial poisoned final. Exact interleavings
    cover a winner publishing after a dead loser created but did not register its
    zero stage, and a live loser observing a contended valid final, publishing
-   `lost-contended`, cleaning only itself, and returning `LeaseActive`; plan install
+   `lost-contended`, cleaning only itself, and returning `LeaseActive`. Two
+   simultaneous recoverers race over an empty pre-intent directory, every
+   partial-intent temporary, and a dead `recovering` claimant; exactly one atomic
+   name claimant mutates each state while the loser closes its descriptor and
+   rescans. Injected claimant death after claim rename and after every cleanup
+   unlink/sync is resumed by a new claimant without an advisory gate; plan install
    accepts only a still-live matching corpus/domain lease and rejects a released,
    foreign-domain, or foreign-corpus lease before probes or writes; read-only
    verification takes/contends on the shared gate/mutex without creating state,
@@ -2470,7 +2656,11 @@ Shared-core tests shall prove:
    transaction names at all depths. Exact-parent case/normalization probes use
    different injected policies in a parent and child and reject only where the
    actual parent aliases the pair; injected macOS device/fsid changes stop
-   traversal. Cache tests repeat the state matrix under the matching key guard,
+   traversal. Corpus mode tests require roots/directories `0755` and every
+   imported/retained/generated regular file `0644`, preserve those modes through
+   full and filtered clones, and reject executable Git fixtures, wrong existing
+   modes, umask-altered creation, hard links, and special entries before commit.
+   Cache tests repeat the state matrix under the matching key guard,
    verify immutable cache units publish only with `RENAME_EXCL`, reuse valid
    units, reject invalid units without replacement, accept only the browser's
    exact five link targets, and prove a corpus lease never recovers cache state.
@@ -2535,7 +2725,13 @@ measurements, and artifacts to prove:
    corrupt CRC, limits, and a byte change that misses the content pin without
    creating an outside sentinel. Sanitized fresh-bare Taffy acquisition crosses
    only the local sentinel boundary, without launching a browser, using the
-   network, or checking out a worktree;
+   network, or checking out a worktree. Test-only Git children/helpers cover
+   parent death before spawn, after `launching`, after child/group publication,
+   while a helper still writes the registered stage, after leader exit, and at
+   `owner-terminal-unrecorded`/`reaped`/`orphan-group-absent`; recovery never removes a stage while a recorded
+   process/group exists, never signals from recovery, and resumes only terminal
+   slots. Init/fetch timeout and output overflow exercise the one group signal,
+   owned reap, group-absence wait, and no-detach rule;
 6. representative XML shape, four variants, numeric formatting, layout fields,
    and unchanged generated-by provenance;
 7. disposition accounting, full/filtered isolation, and offline drift rejection;
@@ -2568,7 +2764,13 @@ measurements, and artifacts to prove:
    registration, `launching`, `spawn-failed`, child PID, `group-verified`,
    `group-mismatch`, live-owner `reaped`, recovery `orphan-group-absent`, profile
    cleanup, and run-tombstone transitions proves that uncertain child/group state
-   is preserved while either exact terminal proof resumes cleanup. Item 7 separately covers recoverable
+   is preserved while either exact terminal proof resumes cleanup. Profile
+   cleanup fixtures cover every admitted file type/mode, regular hard links
+   whose outside name/bytes remain untouched, arbitrary/escaping symlink targets
+   that are unlinked without traversal, and every rejected owner/type/mode/mount
+   state. Death after sidecar publication and each reverse-order unlink/sync/root-
+   absent marker resumes the exact subset; an injected replacement or new name
+   preserves the remainder. Item 7 separately covers recoverable
    case-assigned page/measurement failures.
 
 CSS tests shall use official-shaped synthetic fixture JSON and local temporary Git
