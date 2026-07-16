@@ -1,5 +1,9 @@
 # Surgeist Generator Shared Corpus Drivers Specification
 
+This behavior specification and
+`plans/specs/2026-07-15-surgeist-generator-focused-verification.md` form one
+normative semantic revision and are reviewed together.
+
 ## SG-01 Outcome and acceptance
 
 `surgeist-generator` shall become the owning leaf for reusable corpus-generation
@@ -735,6 +739,14 @@ well-formed but semantically invalid manifest field to `InvalidManifest` before
 constructing these generic values, so public-constructor kinds do not blur CLI
 schema diagnostics.
 
+`RunScope::require_match` returns `InvalidInventory` for an otherwise valid
+filter with no source match. `collect_regular_files` returns `InvalidPath` for a
+missing/non-directory root, root escape, or encountered symlink; `InvalidInventory`
+for an invalid extension argument, non-UTF-8/special/duplicate/wrong-extension
+entry; and `Io` for an enumeration/stat/read failure after the root is validated.
+A domain check remaps only successfully read persisted inventory defects to
+`Verification`; it never remaps `Io`.
+
 Every public type in the trait table with `Deserialize` uses a private checked
 visitor or a `#[serde(deny_unknown_fields)]` raw representation and calls the
 same checked constructor; it never derives field-wise deserialization that can
@@ -799,15 +811,17 @@ relationships needed in that component's parent descriptor:
    it journal-creates the first exact spelling and then attempts the second.
    Lookup and descriptor identity distinguish an alias from two entries;
 3. it removes only its verified single-link probes, then rechecks the parent
-   identity and mount before accepting the pair result.
+identity and mount before accepting the pair result.
 
 The result applies only to that candidate pair in that parent. A newly created
 directory is reopened, mount-checked, and receives its own direct-parent probes
 before any descendant is planned; differing policies in parent and child are
 therefore not conflated. Final `NOREPLACE` creation remains authoritative and a
 surprising collision fails closed without replacing the encountered object. An
-inconclusive probe, cleanup failure, parent-identity change, or inability to
-represent either exact pair is `UnsupportedPlatform`. A crash leaves a journaled
+inconclusive probe, parent-identity change, or inability to represent either
+exact pair is `UnsupportedPlatform` only when every private probe and journal is
+successfully removed. A probe-cleanup failure or identity dispute that leaves
+durable state is `ArtifactTransaction` under SG-12 precedence. A crash leaves a journaled
 single-link probe identity that the next gate holder removes before continuing;
 an unjournaled or identity-mismatched entry is never treated as a probe.
 
@@ -1955,8 +1969,9 @@ at `0755`, the one registered archive at `0600`, and only the exact five
 already-validated `0755` symlinks created last. A Taffy stage whose process slots
 are terminal may contain only effective-user, same-mount directories with owner
 `rwx`, permission bits `0700..0777`, and no special bits, plus ordinary
-single-link files with permission bits `0000..0777` and no special bits. Every
-directory is therefore descriptor-traversable during recovery even under a
+single-link files with the owner-read bit set, permission bits `0400..0777`, and
+no special bits. Every directory is therefore descriptor-traversable and every
+file can be reopened read-only/no-follow for identity-bound `fchmod` during recovery even under a
 restrictive `077` umask; a trusted Git command that somehow leaves an
 unsearchable directory is disputed rather than admitted as removable. During
 successful top-down normalization, directories may transition only from that
@@ -2068,9 +2083,10 @@ unparseable or unreferenced child is disputed.
    atomic directory creation is the intent reservation. An empty or partially
    populated active directory after a crash owns no external name and is a
    recoverable internal state, not a publication stage.
-3. Inside that active directory, write/sync a complete `intent.json` and
-   `old-inventory.json` through unique private temporary names and `RENAME_EXCL`,
-   then sync the active directory. The schema-1 intent records coordination,
+3. Inside that active directory, first write/sync/`RENAME_EXCL` the complete
+   `intent.json` and sync the directory; only then write/sync/`RENAME_EXCL`
+   `old-inventory.json` and sync again. Both use unique private temporaries. The
+   schema-1 intent records coordination,
    root/mount, authority-key, final-parent, final/stage, and transaction-parent
    identities; domain/cache key; publication mode; expected old digest; token;
    and the old-sidecar digest. All recorded relative paths are revalidated on
@@ -2147,6 +2163,8 @@ cache-required absent state:
 | Observed durable state | Classification and action |
 | --- | --- |
 | active directory empty or containing only recognized partial metadata temporaries; no complete intent | abandoned internal intent; because registration was forbidden, remove only the active directory's verified internal entries |
+| complete intent; old sidecar absent/partial; registration absent | pre-sidecar intent; recompute the unchanged final inventory, require its canonical bytes/digests to equal every old value committed by the intent, then remove only internal metadata; a mismatch is disputed |
+| complete old sidecar but no complete intent | unreachable publication order; disputed without cleanup |
 | complete intent/old sidecar; registration absent or its exact reservation remains internal; final = old | unregistered intent; remove only internal reservation/metadata |
 | complete registration; internal reservation absent; external registered stage is absent or a construction-policy subset; no durable `prepared`; final = old | interrupted construction; publish `aborted`, keep final, descriptor-clean the recorded stage if present |
 | durable `prepared`; final = old; external stage = complete new; no outcome marker | prepared pre-commit; publish `aborted`, keep final, clean stage |
@@ -2156,7 +2174,7 @@ cache-required absent state:
 | active journal has valid `cleanup-complete`; terminal final digest matches and external stage is absent | rename active journal to its completed name and continue metadata cleanup |
 | completed journal has valid receipt and remaining members are an exact receipt-listed subset | remove remaining metadata in receipt order, with receipt last |
 | completed journal is empty | descriptor-`rmdir` it and sync the transaction parent |
-| internal and external registration both exist, a prepared tree is incomplete, an outcome conflicts with final digest, or any identity/type/name/digest differs | disputed; return `ArtifactTransaction` without removing or renaming final or disputed external state |
+| incomplete intent/old metadata with any reservation/registration, internal and external registration both exist, a prepared tree is incomplete, an outcome conflicts with final digest, or any identity/type/name/digest differs | disputed; return `ArtifactTransaction` without removing or renaming final or disputed external state |
 
 For an interrupted construction without a new sidecar, cleanup first rechecks
 the registered stage-root identity and permits only same-mount entries allowed by
@@ -2472,25 +2490,39 @@ order, and may wait without a deadline; it never clears or drops a live slot to
 make progress. A close panic falls through to the same direct kill-and-unbounded-
 wait path; a task panic is a resolved joined outcome and is error-accounted.
 After task joins, the runtime is shut down only once its registered async work is
-terminal, and runtime worker shutdown itself completes before the slot clears.
-Cleanup contains no assertion, `unwrap`, or `expect` over external state.
+terminal. The registry then takes the runtime as its final resource and invokes
+Tokio 1.48's owned `Runtime` destructor; that destructor is the specified
+unbounded worker-shutdown mechanism. An injected panic before the take leaves the
+slot intact, while unwind after the take still owns and drops the local runtime.
+The transition is terminal only after the destructor returns and the worker
+counter is zero. `shutdown_timeout` and `shutdown_background` are forbidden
+because they can return with continuing work. Cleanup contains no assertion,
+`unwrap`, or `expect` over external state.
 
 If there was only an operation panic and terminalization succeeds, the semantic
 result is `Generation` as specified above. If any supervisor transition itself
 panicked, terminalization still completes and the worker then resumes the first
 supervisor panic; `layout::run` joins and resumes it rather than reporting
-cleanup-complete `Generation`. Chromiumoxide or Tokio `Drop` behavior is not part
-of the claimed lifecycle and is reached only for already-terminal empty slots.
+cleanup-complete `Generation`. Chromiumoxide drop behavior is not part of the
+claimed lifecycle; Tokio `Runtime` drop is the one explicit final exception and
+occurs only after every registered async resource is already terminal.
 
 Mutation lifecycles are command-specific and closed:
 
 - Layout validates request/location/manifest/filter and the static target, then
   takes required cache guard(s), recovers/acquires or verifies each immutable
   cache unit, and builds any Taffy snapshot. Only after cache transaction commit
-  does it take the corpus lease, repeat cache/source identity disjointness, create
-  a browser run/profile when needed, generate/clean resources, and perform one
-  corpus transaction. Release is corpus then cache. A cache remains durable if a
-  later corpus phase fails.
+  does it take the corpus lease. While holding the exclusive `layout` mutex and
+  before creating a browser run/profile or transaction intent, every mutating
+  layout command reopens the same manifest/helper identities and digests,
+  authoritatively recollects the complete HTML/case/current-output inventory,
+  rechecks all expected counts/dispositions and the filter match, and repeats
+  cache/source identity disjointness. The pre-cache inventory/filter check is
+  only an early rejection and never supplies generation bytes. A manifest change
+  is `InvalidManifest`; an inventory/count/filter change is `InvalidInventory`.
+  Generation/import then uses only this under-lease snapshot, creates resources
+  when needed, and performs one corpus transaction. Release is corpus then cache.
+  A cache remains durable if a later corpus phase fails.
 - `import-csstree` follows SG-07.2's eight phases. The snapshot precedes the
   exclusive `css` mutex; probe/source-identity failures after mutex acquisition
   publish no corpus unit.
@@ -2621,17 +2653,17 @@ the domain runner and is not changed by a binary.
 | Opening/reading an already validated manifest/helper/source/artifact path fails without semantic drift and outside a durable transaction | `Io` | No commit; any private cleanable state is removed |
 | TOML read succeeds but parse, version, field, count-scalar, or domain-namespace contract fails | `InvalidManifest` | No corpus mutation |
 | Count, duplicate, unmatched override, or malformed CSSTree case | `InvalidInventory` | No artifact/report mutation |
-| Wrong/dirty Git source or origin, malformed Git storage, disallowed Git config/helper/executable inventory, unsupported required preflight option, missing promised object, or snapshot tree-mode/hash mismatch | `SourceVerification` | No import mutation |
+| Wrong/dirty Git source or origin, malformed Git storage, disallowed Git config/helper/executable inventory, unsupported required preflight option, a read-only verification command's nonzero/malformed result, missing promised object, or snapshot tree-mode/hash mismatch | `SourceVerification` | No import mutation |
 | Reqwest client/TLS/connect/request timeout or response-body read error | `Io` | Abort/clean cache stage; no cache final or corpus mutation |
 | Browser redirect/non-200 response, download-response URL/policy violation, declared/streamed size limit, ZIP syntax/CRC/path/type/mode/limit defect, logical-tree/content-pin mismatch, or invalid existing cache unit/provenance | `SourceVerification` | Abort/clean cache stage when possible; never replace an invalid final unit |
-| Non-Apple-Silicon-macOS mutation request, or missing required rename, mount-identity, or name-equivalence capability | `UnsupportedPlatform` | No cache/import/artifact/report mutation; supported-host probes cleaned and exact coordination bootstrap may remain |
+| Non-Apple-Silicon-macOS mutation request, or missing required rename, mount-identity, or name-equivalence capability with all private probes cleaned | `UnsupportedPlatform` | No cache/import/artifact/report mutation; exact coordination bootstrap may remain, but no unresolved probe journal |
 | Contended generation lease | `LeaseActive` | No corpus mutation |
-| A permitted Git verification/acquisition command or browser spawn, group verification, timeout, output cap, nonzero status, stderr contract, DevTools startup/connection, or owned process-terminal failure | `Process` | Clean/abort domain state; no stale pruning, unless cleanup precedence above applies |
+| Spawn/pipe/timeout/output-cap failure for a permitted Git command; nonzero Taffy `init`/`fetch`; or browser launch-time spawn/group/status/stderr/DevTools failure | `Process` | Clean/abort domain state; no stale pruning, unless cleanup precedence above applies |
 | Browser version process succeeds but its bounded stdout differs from the exact pinned version string, or a cache reuse version/content check differs | `SourceVerification` | Invalid cache is preserved and never used/replaced |
 | Ordinary read/write/flush/sync error before durable transaction intent, or after a validated read-only input was opened | `Io` | No commit; final unchanged |
 | Durable intent/stage/sidecar/marker/rename/swap/recovery identity or I/O failure, including disputed profile state and any post-commit cleanup failure | `ArtifactTransaction` | Pre-commit final unchanged, or post-commit complete new final plus durable recovery journal |
 | Recoverable case-assigned layout page/measurement/batch failure after successful resource cleanup | `Generation` | SG-09 diagnostic publication; no stale/nonmanifest pruning |
-| Unassigned layout generation, page/browser/task cleanup failure, identity-matching profile removal failure with its run intent retained, or CSS neutral conversion failure | `Generation` | No publication commit; final artifact/report/stale state unchanged |
+| Unassigned layout generation; page/browser/task/process terminalization failure after launch; identity-matching profile removal failure with its run intent retained; or CSS neutral conversion failure | `Generation` | No publication commit; final artifact/report/stale state unchanged; a nonterminal resource blocks instead of returning |
 | Offline semantic/hash/provenance/count/report mismatch, invalid persisted mode/inventory, or unresolved probe/owner/transaction/run journal | `Verification` | Check commands remain read-only; an underlying read I/O error remains `Io` |
 
 ## SG-13 Verification behavior
@@ -2679,292 +2711,11 @@ than being repaired.
 
 ### SG-13.2 Focused test outlines
 
-Shared-core tests shall prove:
-
-1. strict paths reject absolute, dot, dotdot, backslash, empty-component,
-   non-UTF-8-at-CLI, and symlink escapes;
-2. corpus locations reject roots outside the owner and roots whose canonical
-   components contain the exact reserved coordination name;
-3. collection is sorted and rejects symlinks, special entries, and mount
-   crossings;
-4. local Git verification accepts the exact clean revision and rejects prefixes,
-   wrong revisions, tree/blob/annotated-tag/peeled-tag pins, storage-format/pin-
-   length mismatch, dirty/untracked state, wrong origins, and escaped source
-   roots; absolute executable/exec-unit identity replacement and a PATH shadow
-   sentinel (including empty and relative PATH components) fail without running
-   the sentinel; a supported-host inventory test accepts the real developer-
-   `usr`-confined `libexec/git-core/* -> ../../bin/git` links without fetching or
-   allowing a unit escape; its recursively enumerated commit-tree snapshot includes fixtures below
-   nested directories, treats pathspec metacharacters literally, ignores a
-   replacement ref, and retains pinned original blob bytes when checkout paths
-   change afterward; a synthetic promisor repository with a locally missing blob
-   fails without reading its available local promisor remote or repopulating the
-   object store, and linked-worktree/common/object plus recursive alternate
-   protection paths are resolved canonically; a tracked `.gitattributes` plus
-   repository-configured clean/process sentinel filter is never executed by the
-   raw HEAD/index/worktree cleanliness proof, verification leaves the complete
-   source/Git tree unchanged, and raw filtered-byte mismatch, skip-worktree,
-   assume-unchanged, index/tree drift, and nonignored untracked paths fail closed;
-   the test-only local acquisition transport fetches an exact object into a fresh
-   bare stage while contaminated system/global/home/local config, templates,
-   hooks, includes, URL rewrites, credentials, filters, askpass, proxies, and Git
-   environment sentinel programs remain unexecuted, auto-maintenance does not
-   run, and production rejects the same file URL without network access;
-5. dispositions require reasons exactly as SG-07 specifies, reject duplicate
-   case IDs, accept repeated source paths for distinct case IDs, and return case-ID
-   order;
-6. filtered scope cannot authorize report or stale-output operations;
-7. full and filtered requests contend on one corpus lease, including two
-   `CorpusLocation` values that use distinct valid canonical owner ancestors for
-   the same canonical corpus; owner metadata records the selected owner
-   coherently as historical audit without ever being reported as the current
-   holder; a mutator contending with a check returns generic `LeaseActive`,
-   dropping releases the lease, and symlink, hard-link,
-   unknown-header, owner-exchange collision, and coordination-component swaps
-   observed before an atomic transition cannot redirect, overwrite, or truncate
-   a lock or owner file; concurrent first acquisition publishes only complete
-   locked gate/mutex inodes and journaled bootstrap intents, a race loser adopts
-   the winner, and injected crashes before/after stage identity, header sync, and
-   `RENAME_EXCL` recover only through the bootstrap intent or a complete adoptable
-   final—never an unjournaled/empty/partial poisoned final. Exact interleavings
-   cover a winner publishing after a dead loser created but did not register its
-   zero stage, and a live loser observing a contended valid final, publishing
-   `lost-contended`, cleaning only itself, and returning `LeaseActive`. The
-   latter race proves release-before-marker: a third cleaner cannot claim while
-   the internal stage lock is held, and after release exactly one of creator or
-   third cleaner reacquires that lock then wins the name claim; a losing live
-   creator performs no descriptor cleanup. Two
-   simultaneous recoverers race over an empty pre-intent directory, every
-   partial-intent temporary, and a dead `recovering` claimant; exactly one atomic
-   name claimant mutates each state while the loser closes its descriptor and
-   rescans. Injected claimant death after claim rename and after every cleanup
-   unlink/sync is resumed by a new claimant without an advisory gate; plan install
-   accepts only a still-live matching corpus/domain lease and rejects a released,
-   foreign-domain, or foreign-corpus lease before probes or writes; read-only
-   verification takes/contends on the shared gate/mutex without creating state,
-   and holds a pre-bootstrap shared gate for the complete check. Two distinct
-   corpora sharing one canonical owner-target and cache unit derive the same
-   byte-exact cache key, contend on one key mutex, and recover only that key's
-   journal before either corpus mutex; alias target identities converge or fail.
-   Passing schema 1 to layout or schema 2 to CSS fails `InvalidManifest` before
-   coordination, under-gate manifest replacement fails before domain bootstrap,
-   and a persisted opposite-domain lease/transaction scaffold fails mutation as
-   `ArtifactTransaction` and checking as `Verification` without adoption or
-   removal;
-8. artifact publication creates/syncs intent and old sidecar before registering
-   an external stage, then deterministically builds and syncs one complete staged
-   root, removes stale files only in a clean full staged state, and changes the
-   final namespace with exactly one root transition; injected process death after
-   active-directory creation, every metadata temporary write/sync/rename, stage
-   registration, mid-file/tree construction, prepared publication, and before the swap
-   leave the complete old final, process termination immediately before/after the
-   swap recovers respectively to old/new, and termination during aborted-stage,
-   committed-old-stage, or completed-journal-tombstone cleanup resumes from the
-   exact recorded subset. Active `cleanup-complete`, completed rename, every
-   metadata deletion, receipt deletion, and final `rmdir` are independently
-   resumed. Marker or old-stage cleanup failure after the swap
-   preserves the complete new final plus a read-only-detectable journal that the
-   next lease clears; no test expects rollback after commit and no observed state
-   is a mixed generation. Nested-directory cleanup crashes after every child
-   removal and resumes despite the resulting parent `st_nlink` change; directory
-   link count is absent from both sidecars/digests, while nondirectory counts and
-   every directory identity/type/mode/mount/remaining-child check still bind.
-   Descriptor-bound tests replace roots,
-   components, stage/final names, journals, and destination identities before
-   each transition and prove no escape, overwrite, or disputed-object removal;
-   no public plan or lease exists, internal plans have no arbitrary output-root
-   constructor, a `CorpusLocation` rooted at/below coordination is rejected, and generated, retained, artifact,
-   report, clone, and stale paths reject filesystem-equivalent coordination or
-   transaction names at all depths. Exact-parent case/normalization probes use
-   different injected policies in a parent and child and reject only where the
-   actual parent aliases the pair; injected macOS device/fsid changes stop
-   traversal. Corpus mode tests require roots/directories `0755` and every
-   imported/retained/generated regular file `0644`, preserve those modes through
-   full and filtered clones, and reject executable Git fixtures, wrong existing
-   modes, umask-altered creation, hard links, and special entries before commit.
-   Cache tests repeat the state matrix under the matching key guard,
-   verify immutable cache units publish only with `RENAME_EXCL`, reuse valid
-   units, reject invalid units without replacement, accept only the browser's
-   exact five link targets, and prove a corpus lease never recovers cache state.
-   Two Taffy pins with the same revision/subdirectory but different repository
-   URLs contend on one cache key; the second rejects the first unit's canonical
-   `.surgeist-source.json` and cannot report/relabel it as its own source;
-9. hash text validation and report counts/provenance detect drift, shared reports
-   accept structurally valid failed/unsupported counts without fictitious
-   artifacts while domain validators enforce their own artifact/count mapping,
-   and every `GeneratorErrorKind` has the exact SG-12 exit code. Table-driven
-   failures prove caller canonicalization remains `InvalidPath`, validated-input
-   I/O remains `Io`, durable transaction failure overrides an earlier operation
-   kind as `ArtifactTransaction`, browser terminal cleanup is `Generation` only
-   without a durable dispute, and read-only drift is `Verification` while a read
-   error remains `Io`;
-10. an unregistered external stage/tombstone is rejected even when its final target is
-    absent; compile-time mutation selection is exactly
-    `aarch64-apple-darwin`; every mutation entry point in the already-installed
-    WASM nonmutation build fails before coordination/cache/import/artifact/report
-    mutation; supported-host rename probe failure leaves no domain mutation and
-    reports any private residue; test documentation states that non-cooperating
-    namespace mutation while leased is unsupported; missing macOS device/fsid or
-    an inconclusive exact-parent name probe fails `UnsupportedPlatform` after
-    private-probe cleanup;
-11. `tests/public_api.rs` type-checks the exact SG-03.4 root reexports,
-    constructors, getters, free functions, operation signatures, enum variants,
-    and explicit traits. It asserts exact compact JSON bytes for every public
-    Serde type, including field order, `expected-fail`, omitted versus null
-    `reason`, sorted artifacts/provenance keys, and unsigned integer grammar. It
-    rejects repeated/unknown fields, wrong scalar kinds, exponent/fraction
-    spellings, per-field/aggregate overflow, zero `case_count`, noncanonical enum
-    spellings, and every SG-03.4 identifier, case-ID, reason, URL, revision,
-    extension, provenance, report, and constructor kind/context violation,
-    proving deserialization cannot bypass one;
-    the layout,
-    CSS, and combined feature test builds type-check the exact SG-03.3 driver
-    additions, including request structs' private construction boundary and
-    `Clone + Debug + Eq + PartialEq` commitments. No alternative public module
-    or compatibility alias is added.
-
-Layout tests shall use synthetic temporary manifests, helpers, HTML, JSON
-measurements, and artifacts to prove:
-
-1. the explicit root CLI and closed command/argument matrix;
-2. the exact public request constructor/getter and synchronous `run` signatures,
-   including a call made from a thread already inside a Tokio runtime without a
-   nested-runtime panic;
-3. schema-2 parsing, unknown/duplicate and reserved-coordination overlap
-   rejection, the exact browser/launch fields and 28 arguments, content-pin row,
-   manifest-derived Taffy pin, exact owner-relative browser/Taffy cache derivation,
-   first-run persistent cache-family scaffolds, byte-exact cache keys, and the
-   complete cache/corpus/helper/HTML/XML namespace matrix before acquisition;
-4. helper/base-style loading and hashes from the supplied corpus;
-5. managed/existing browser validation through injected download/ZIP/version
-   boundaries: exact retained top-level tree, logical content digest/counts,
-   executable path/mode, five links/modes/targets, archive CRC/size/trailing-data
-   rules, strict version stdout/stderr, and direct launch argv/environment/
-   DevTools parsing. A byte-level logical-inventory golden hashes `dir` as
-   `D/0755`, `dir/file` as `F/0644` with bytes `abc`, and `dir/link` as
-   `L/0755 -> file` to exactly
-   `808368d7905aedc20e4b8cf50df818d1f18b01abbcfea5db08a4b58b3764aae6`;
-   substituting link mode `0777`, including file-type bits, or changing field
-   endianness must not match. The compiled pin table asserts its exact evidenced
-   `5ef8a535ec2e28729c989886a728517681a4f30c18819e98dd2cbe018bd3070a`
-   row. Synthetic archives cover early links, descendants after
-   links, path escapes, duplicates/conflicts, cycles, special/hard-link modes,
-   corrupt CRC, limits, and a byte change that misses the content pin without
-   creating an outside sentinel. Injected browser acquisition boundaries assert
-   exact SG-12 kinds for Reqwest transport/body I/O, redirect/status/size, every
-   ZIP/content-pin/cache defect, version spawn/status/output mismatch, launch/
-   DevTools failure, and cleanup-precedence combinations. Sanitized fresh-bare Taffy acquisition crosses
-   only the local sentinel boundary, without launching a browser, using the
-   network, or checking out a worktree. Test-only Git children/helpers cover
-   parent death before spawn, after `launching`, after child/group publication,
-   while a helper still writes the registered stage, after leader exit, and at
-   `owner-terminal-unrecorded`/`reaped`/`orphan-group-absent`; recovery never removes a stage while a recorded
-   process/group exists, never signals from recovery, and resumes only terminal
-   slots. Init/fetch timeout and output overflow exercise the one group signal,
-   owned reap, group-absence wait, and no-detach rule. A restrictive `077` umask
-   still leaves every Git directory traversable; injected death after each
-   directory/file normalization step resumes a mixed `0700`/`0755` and
-   pre-`0644`/`0644` construction subset, while an injected owner-unsearchable
-   directory is preserved as disputed rather than entered or removed. Caught-
-   panic injection after storing the child slot, after child/group marker
-   publication, while an init/fetch helper remains active, after each one-time
-   group signal/reap transition, and while each output reader is draining proves
-   the outer supervisor reaches the same terminal path. Reader spawn failure,
-   reader I/O error/panic, overflow, and delayed EOF leave no child, helper,
-   pipe, or thread handle detached; both drain joins resolve before any terminal
-   live-owner process marker or cache-lock release;
-6. representative XML shape, four variants, numeric formatting, layout fields,
-   and unchanged generated-by provenance;
-7. disposition accounting, full/filtered isolation, and offline drift rejection;
-   recoverable case-assigned failures publish successful artifacts plus the
-   full-only failed-case diagnostic report, preserve stale/nonmanifest outputs,
-   and return `Generation`, while fatal launch/acquisition/cleanup/serialization
-   and pre-commit publication failures leave the old complete XML tree; a forced
-   post-commit cleanup failure returns `ArtifactTransaction` with the complete
-   new XML/report tree and recoverable journal, never mixed state;
-8. the planned/fetched Taffy bare cache and object store cannot overlap browser
-   cache, import, artifact/report, helper/manifest, or coordination writes;
-9. injected fatal launch, unassigned-generation, browser-close, handler-join,
-   profile, cache-transaction, and acquisition-stage failures, plus an injected operation panic
-   after all synthetic resources are registered and injected supervisor panics
-   immediately before/after every registry take, close, timeout, signal, reap,
-   abort, join, profile step, guard release, and runtime-shutdown transition, a successful close with delayed
-   child exit, a hung page close, and a hung handler exercise the exact 2/5-second
-   graceful deadlines, one kill/abort, and unbounded terminal wait. Deadline
-   cases use Tokio's `test-util` support in a current-thread paused-time test
-   runtime; the production worker remains a private multi-thread runtime, and a
-   separate test retains the already-inside-a-runtime call coverage. A synthetic
-   group whose leader exits before a surviving descendant proves the non-reaping
-   leader reservation, one group signal, leader reap, and final group `ESRCH`.
-   The test
-   proves the public call remains blocked past the forced grace interval, then
-   releases the synthetic resource and observes child reap and a resolved join.
-   Every handler is completed or aborted-and-joined, the profile is removed or
-   retained only with its durable run intent, and a
-   distinct-owner contender can acquire the released same-corpus lease; the
-   panic maps to `Generation`, no final artifact, stale output, or report changes,
-   and no detached-task counter remains. Supervisor-transition panics resume only
-   after the same zero-live-child/task/runtime counters and released guards are
-   observed; no test relies on `Drop` to reach them. Death after run intent, profile
-   registration, `launching`, `spawn-failed`, child PID, `group-verified`,
-   `group-mismatch`, live-owner `reaped`, recovery `orphan-group-absent`, profile
-   cleanup, and run-tombstone transitions proves that uncertain child/group state
-   is preserved while either exact terminal proof resumes cleanup. Profile
-   cleanup fixtures cover every admitted file type/mode, regular hard links
-   whose outside name/bytes remain untouched, arbitrary/escaping symlink targets
-   that are unlinked without traversal, and every rejected owner/type/mode/mount
-   state. Death after sidecar publication and each reverse-order unlink/sync/root-
-   absent marker resumes the exact subset, including nested-directory parent
-   link-count changes; an injected replacement or new name
-   preserves the remainder. Item 7 separately covers recoverable
-   case-assigned page/measurement failures.
-
-CSS tests shall use official-shaped synthetic fixture JSON and local temporary Git
-repositories to prove:
-
-1. exact-pin snapshot import, deterministic JSON-only copying, a same-directory-
-   identity content change after snapshotting that cannot change imported bytes,
-   a protected-directory identity replacement before final revalidation that
-   returns `InvalidPath` and publishes nothing, count validation, and stale source
-   removal;
-2. the exact public request constructor/getter and synchronous `run` signatures;
-3. multiple ordinary and error-array cases from one JSON file, multiple
-   disposition overrides for that same source, JSON Pointer IDs, sorted cases,
-   options, canonical CSS, and omission of AST/error/offset data;
-4. malformed source structures, unmatched overrides, and duplicate decoded JSON
-   members at the top-level ordinary label, ordinary `source`, `options`,
-   `generate`, or `ast`, error-entry, and nested-options levels fail
-   `InvalidInventory` before writes; escaped and literal duplicate-key spellings
-   collide. A zero-case fixture is accepted by import but rejected by full and
-   filtered generation as `InvalidInventory` and by offline checking as
-   `Verification`;
-5. equal and component-wise ancestor/descendant overlaps among import,
-   expectation, manifest, and coordination namespaces fail with the specified
-   `InvalidManifest` or `InvalidPath`, while the report accepts only its exact
-   required child position within expectation. Exact-text, canonical, and
-   existing-descriptor conflicts fail in the read-only prefix before lease/
-   coordination creation; case-folded or Unicode-normalized aliases discovered
-   only by actual-parent probing fail while the exclusive `css` mutex is held and
-   leave only cleaned or durably journaled private probe state. Injected sibling
-   directories with different policies prove the split. A verified checkout
-   equal to, above, or below every CSS
-   writable/coordination namespace fails with `InvalidPath` while leaving both
-   the checkout and owner/corpus trees unchanged; linked-worktree administrative
-   and common directories, primary object storage, and a recursively configured
-   local alternate object store receive the same overlap matrix even when the
-   canonical worktree root itself is textually disjoint, including an injected
-   mount/path alias with matching descriptor ancestry;
-6. active/default and non-active reason accounting, and one fixed `css` mutex on
-   which import/full/filtered generation contend exclusively while checking
-   contends shared;
-7. full generation publishes the complete expectation/report root and removes
-   stale outputs at its single root-swap commit; pre-commit failures retain the
-   old tree and post-commit cleanup failures retain the new tree plus journal;
-8. filtered generation updates only matches and writes/prunes no report;
-9. offline verification detects imported-source, expectation, report, hash,
-   provenance, count, and stale-inventory drift.
-
-No focused test reads or executes the real layout or CSS repository corpus.
+The complete normative focused-test matrix is split at the verification
+boundary into
+`plans/specs/2026-07-15-surgeist-generator-focused-verification.md`. That
+companion is part of this same semantic revision; its requirements are not an
+informative appendix and must receive the same independent review.
 
 ### SG-13.3 Final command matrix
 
