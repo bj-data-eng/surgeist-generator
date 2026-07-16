@@ -205,14 +205,26 @@ acquisition occurs; the current cycle plan owns lockfile-refresh mechanics.
 ### SG-03.3 Public front door
 
 `src/lib.rs` remains `#![forbid(unsafe_code)]` and retains
-`CRATE_NAME: &str = "surgeist-generator"`. It intentionally exposes:
+`CRATE_NAME: &str = "surgeist-generator"`. The complete default-feature root
+surface is this exact reexport set; `core` and `error` remain private modules:
 
-- `GeneratorError`, `GeneratorErrorKind`, and the crate `Result<T>` alias;
-- `core` contract types named in SG-04 through SG-10;
-- `layout::LayoutRequest`, `layout::LayoutCommand`,
-  `layout::run`, and `layout::run_from_env` only with `layout-browser`;
-- `css::CssRequest`, `css::CssCommand`, `css::run`, and
-  `css::run_from_env` only with `css-corpus`.
+```rust
+pub use core::{
+    ArtifactPlan, ArtifactProvenance, CaseDisposition, CaseDispositionRecord,
+    CorpusLocation, GenerationCounts, GenerationLease, GenerationReport,
+    ManifestVersion, PinnedSource, RelativePath, ReportArtifact, RunScope,
+    Sha256Digest, SourceRevision, VerifiedSource, collect_regular_files,
+    parse_manifest, validate_disposition_records, verify_git_source,
+};
+pub use error::{GeneratorError, GeneratorErrorKind, Result};
+pub const CRATE_NAME: &str = "surgeist-generator";
+```
+
+The feature-gated additions are `layout::LayoutRequest`,
+`layout::LayoutCommand`, `layout::run`, and `layout::run_from_env` only with
+`layout-browser`, and `css::CssRequest`, `css::CssCommand`, `css::run`, and
+`css::run_from_env` only with `css-corpus`. No other public module, type, free
+function, constructor, field, or method is part of this cycle's surface.
 
 All public structs have private fields and checked constructors. Public enums
 whose variants may evolve are `#[non_exhaustive]`. The library does not expose
@@ -290,6 +302,289 @@ installed and verified. Check/import commands and filtered generation expose no
 in-memory report; reports remain corpus-owned files. A filtered success never
 writes the canonical report. Any partial or failed lifecycle returns the one
 semantic `GeneratorError` that the binary prints.
+
+### SG-03.4 Exact shared-core API
+
+The shared-core contract is closed. The following table lists every explicit
+public trait implementation; compiler-derived auto traits are not additional API
+commitments.
+
+| Type | Explicit public traits and attributes |
+| --- | --- |
+| `GeneratorErrorKind` | `Clone + Copy + Debug + Eq + PartialEq`, `#[non_exhaustive]` |
+| `GeneratorError` | `Debug + Display + std::error::Error` |
+| `RelativePath` | `Clone + Debug + Eq + Ord + PartialEq + PartialOrd + Hash + Serialize + Deserialize` |
+| `CorpusLocation` | `Clone + Debug + Eq + PartialEq` |
+| `RunScope` | `Clone + Debug + Eq + PartialEq`, `#[non_exhaustive]` |
+| `ManifestVersion` | `Clone + Copy + Debug + Eq + Hash + Ord + PartialEq + PartialOrd + Serialize + Deserialize` |
+| `SourceRevision` | `Clone + Debug + Display + Eq + Hash + Ord + PartialEq + PartialOrd + Serialize + Deserialize` |
+| `PinnedSource` | `Clone + Debug + Eq + PartialEq + Serialize + Deserialize` |
+| `VerifiedSource` | `Clone + Debug + Eq + PartialEq` |
+| `CaseDisposition` | `Clone + Copy + Debug + Eq + PartialEq + Serialize + Deserialize`, `#[non_exhaustive]` |
+| `CaseDispositionRecord` | `Clone + Debug + Eq + PartialEq + Serialize + Deserialize` |
+| `Sha256Digest` | `Clone + Debug + Display + Eq + Hash + Ord + PartialEq + PartialOrd + Serialize + Deserialize` |
+| `ArtifactProvenance` | `Clone + Debug + Eq + PartialEq + Serialize + Deserialize` |
+| `ReportArtifact` | `Clone + Debug + Eq + PartialEq + Serialize + Deserialize` |
+| `GenerationCounts` | `Clone + Copy + Debug + Eq + PartialEq + Serialize + Deserialize` |
+| `GenerationReport` | `Clone + Debug + Eq + PartialEq + Serialize + Deserialize` |
+| `ArtifactPlan` | `Debug` |
+| `GenerationLease` | `Debug + Drop` |
+
+The enum variants and error observations are exact:
+
+```rust
+#[non_exhaustive]
+pub enum GeneratorErrorKind {
+    Cli,
+    InvalidPath,
+    InvalidManifest,
+    InvalidInventory,
+    SourceVerification,
+    UnsupportedPlatform,
+    LeaseActive,
+    Process,
+    Io,
+    ArtifactTransaction,
+    Generation,
+    Verification,
+}
+
+impl GeneratorError {
+    pub const fn kind(&self) -> GeneratorErrorKind;
+    pub const fn exit_code(&self) -> u8;
+}
+
+#[non_exhaustive]
+pub enum RunScope {
+    Full,
+    Filtered(RelativePath),
+}
+
+#[non_exhaustive]
+pub enum CaseDisposition {
+    Active,
+    ExpectedFail,
+    Unsupported,
+    Quarantined,
+}
+```
+
+`GeneratorError` has no public constructor; checked public operations return it
+through `Result<T>`. Path, corpus, scope, manifest, source, disposition, and hash
+operations are exactly:
+
+```rust
+impl RelativePath {
+    pub fn new(value: impl AsRef<str>) -> Result<Self>;
+    pub fn with_extension(value: impl AsRef<str>, expected: &str) -> Result<Self>;
+    pub fn as_str(&self) -> &str;
+    pub fn join(&self, root: impl AsRef<std::path::Path>) -> std::path::PathBuf;
+    pub fn resolve_existing(
+        &self,
+        root: impl AsRef<std::path::Path>,
+    ) -> Result<std::path::PathBuf>;
+    pub fn resolve_output(
+        &self,
+        root: impl AsRef<std::path::Path>,
+    ) -> Result<std::path::PathBuf>;
+}
+
+impl CorpusLocation {
+    pub fn new(
+        owner_root: impl AsRef<std::path::Path>,
+        corpus_root: impl AsRef<std::path::Path>,
+    ) -> Result<Self>;
+    pub fn owner_root(&self) -> &std::path::Path;
+    pub fn corpus_root(&self) -> &std::path::Path;
+}
+
+impl RunScope {
+    pub const fn may_write_report(&self) -> bool;
+    pub const fn may_remove_stale(&self) -> bool;
+    pub fn includes(&self, source: &RelativePath) -> bool;
+    pub fn require_match(&self, sources: &[RelativePath]) -> Result<()>;
+}
+
+impl ManifestVersion {
+    pub fn new(value: u64) -> Result<Self>;
+    pub const fn get(self) -> u64;
+    pub fn require(
+        self,
+        expected: Self,
+        manifest_path: impl AsRef<std::path::Path>,
+    ) -> Result<()>;
+}
+
+pub fn parse_manifest<T: serde::de::DeserializeOwned>(
+    text: &str,
+    manifest_path: impl AsRef<std::path::Path>,
+) -> Result<T>;
+
+impl SourceRevision {
+    pub fn new(value: impl AsRef<str>) -> Result<Self>;
+    pub fn as_str(&self) -> &str;
+}
+
+impl PinnedSource {
+    pub fn new(
+        label: impl Into<String>,
+        repository_url: impl Into<String>,
+        revision: SourceRevision,
+        source_subdirectory: RelativePath,
+    ) -> Result<Self>;
+    pub fn label(&self) -> &str;
+    pub fn repository_url(&self) -> &str;
+    pub const fn revision(&self) -> &SourceRevision;
+    pub const fn source_subdirectory(&self) -> &RelativePath;
+}
+
+impl VerifiedSource {
+    pub fn canonical_root(&self) -> &std::path::Path;
+    pub fn canonical_source_root(&self) -> &std::path::Path;
+    pub const fn revision(&self) -> &SourceRevision;
+}
+
+pub fn verify_git_source(
+    checkout: impl AsRef<std::path::Path>,
+    pin: &PinnedSource,
+) -> Result<VerifiedSource>;
+
+pub fn collect_regular_files(
+    root: impl AsRef<std::path::Path>,
+    extension: &str,
+) -> Result<Vec<RelativePath>>;
+
+impl CaseDispositionRecord {
+    pub fn new(
+        case_id: impl Into<String>,
+        source_path: RelativePath,
+        disposition: CaseDisposition,
+        reason: Option<impl Into<String>>,
+    ) -> Result<Self>;
+    pub fn case_id(&self) -> &str;
+    pub const fn source_path(&self) -> &RelativePath;
+    pub const fn disposition(&self) -> CaseDisposition;
+    pub fn reason(&self) -> Option<&str>;
+}
+
+pub fn validate_disposition_records(
+    records: Vec<CaseDispositionRecord>,
+) -> Result<Vec<CaseDispositionRecord>>;
+
+impl Sha256Digest {
+    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Self;
+    pub fn from_text(value: impl AsRef<str>) -> Result<Self>;
+    pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self>;
+    pub fn as_str(&self) -> &str;
+}
+```
+
+Provenance, report, transaction, and lease operations are exactly:
+
+```rust
+impl ArtifactProvenance {
+    pub fn new(
+        source_path: RelativePath,
+        source_digest: Sha256Digest,
+        generator: impl Into<String>,
+        schema_version: ManifestVersion,
+        domain_provenance: std::collections::BTreeMap<String, Sha256Digest>,
+    ) -> Result<Self>;
+    pub const fn source_path(&self) -> &RelativePath;
+    pub const fn source_digest(&self) -> &Sha256Digest;
+    pub fn generator(&self) -> &str;
+    pub const fn schema_version(&self) -> ManifestVersion;
+    pub const fn domain_provenance(
+        &self,
+    ) -> &std::collections::BTreeMap<String, Sha256Digest>;
+}
+
+impl ReportArtifact {
+    pub const fn new(
+        provenance: ArtifactProvenance,
+        output_path: RelativePath,
+        output_digest: Sha256Digest,
+        case_count: usize,
+    ) -> Self;
+    pub const fn provenance(&self) -> &ArtifactProvenance;
+    pub const fn output_path(&self) -> &RelativePath;
+    pub const fn output_digest(&self) -> &Sha256Digest;
+    pub const fn case_count(&self) -> usize;
+}
+
+impl GenerationCounts {
+    pub const fn new(
+        active: usize,
+        expected_fail: usize,
+        unsupported: usize,
+        quarantined: usize,
+        failed_to_generate: usize,
+    ) -> Self;
+    pub fn total(self) -> Result<usize>;
+    pub const fn active(self) -> usize;
+    pub const fn expected_fail(self) -> usize;
+    pub const fn unsupported(self) -> usize;
+    pub const fn quarantined(self) -> usize;
+    pub const fn failed_to_generate(self) -> usize;
+}
+
+impl GenerationReport {
+    pub fn new(
+        manifest_digest: Sha256Digest,
+        source_repository: impl Into<String>,
+        source_revision: SourceRevision,
+        counts: GenerationCounts,
+        artifacts: Vec<ReportArtifact>,
+    ) -> Result<Self>;
+    pub const fn manifest_digest(&self) -> &Sha256Digest;
+    pub fn source_repository(&self) -> &str;
+    pub const fn source_revision(&self) -> &SourceRevision;
+    pub const fn counts(&self) -> GenerationCounts;
+    pub fn artifacts(&self) -> &[ReportArtifact];
+    pub fn verify_files(
+        &self,
+        corpus_root: impl AsRef<std::path::Path>,
+        manifest_path: &RelativePath,
+    ) -> Result<()>;
+}
+
+impl ArtifactPlan {
+    pub fn new(
+        output_root: impl AsRef<std::path::Path>,
+        generated_root: RelativePath,
+        generated_extension: impl Into<String>,
+        scope: RunScope,
+        artifacts: Vec<(RelativePath, Vec<u8>)>,
+        retained_inventory: Option<Vec<RelativePath>>,
+    ) -> Result<Self>;
+    pub fn report(
+        output_root: impl AsRef<std::path::Path>,
+        report_path: RelativePath,
+        scope: RunScope,
+        bytes: Vec<u8>,
+    ) -> Result<Self>;
+    pub fn install(&self) -> Result<()>;
+    pub fn artifact_digest(&self, path: &RelativePath) -> Option<&Sha256Digest>;
+}
+
+impl GenerationLease {
+    pub fn acquire(
+        location: &CorpusLocation,
+        domain: impl AsRef<str>,
+        generator: impl AsRef<str>,
+        scope: &RunScope,
+        command: impl AsRef<str>,
+    ) -> Result<Self>;
+}
+```
+
+`ArtifactPlan` and `GenerationLease` are mutation-capable only on the SG-09
+supported targets. Internal rooted descriptors, capability probes, Git snapshot
+objects and bytes, failure-injection hooks, and error constructors remain
+crate-private. The two checked `const` constructors (`ReportArtifact::new` and
+`GenerationCounts::new`) cannot form an invalid local value; aggregate duplicate,
+inventory, and overflow checks occur in `GenerationReport::new` and
+`GenerationCounts::total`.
 
 ## SG-04 Semantic core types
 
@@ -450,7 +745,7 @@ and cannot be constructed publicly without verification.
 
 Imports never reread fixture bytes from mutable checkout pathnames after this
 verification. The shared source module immediately builds an internal immutable
-`VerifiedSourceSnapshot` from the pinned commit tree: `git ls-tree -rz
+`VerifiedSourceSnapshot` from the pinned commit tree: `git ls-tree -r -z
 --full-tree <revision> -- <source-subdirectory>` must enumerate only regular blob
 modes beneath the declared subdirectory, and `git cat-file blob <object-id>`
 supplies each file's bytes. Paths are normalized and sorted; blob object IDs,
@@ -850,8 +1145,9 @@ Shared-core tests shall prove:
 3. collection is sorted and rejects symlinks/special entries;
 4. local Git verification accepts the exact clean revision and rejects prefixes,
    wrong revisions, dirty/untracked state, wrong origins, and escaped source
-   roots; its commit-tree snapshot retains pinned blob bytes when checkout paths
-   change afterward;
+   roots; its recursively enumerated commit-tree snapshot includes fixtures below
+   nested directories and retains pinned blob bytes when checkout paths change
+   afterward;
 5. dispositions require reasons exactly as SG-07 specifies and reject duplicates;
 6. filtered scope cannot authorize report or stale-output operations;
 7. full and filtered requests contend on one corpus lease, owner metadata is
@@ -872,7 +1168,12 @@ Shared-core tests shall prove:
     mutation-capable entry point on other targets fails before a coordination,
     cache, import, artifact, or report mutation; supported-target probe failure
     leaves no domain mutation and reports any probe residue; test documentation
-    states that non-cooperating namespace mutation while leased is unsupported.
+    states that non-cooperating namespace mutation while leased is unsupported;
+11. `tests/public_api.rs` type-checks the exact SG-03.4 root reexports,
+    constructors, getters, free functions, operation signatures, enum variants,
+    explicit traits, and Serde round trips under default features; the layout,
+    CSS, and combined feature test builds type-check the exact SG-03.3 driver
+    additions. No alternative public module or compatibility alias is added.
 
 Layout tests shall use synthetic temporary manifests, helpers, HTML, JSON
 measurements, and artifacts to prove:
