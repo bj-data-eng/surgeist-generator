@@ -330,10 +330,13 @@ caller-visible future can be dropped while Chromium or a lease remains active.
 builds and drives the Tokio runtime only on that thread, and synchronously joins
 it. It is therefore safe to call from either synchronous code or from a thread
 that already participates in another Tokio runtime. Thread spawn, runtime build,
-or join failure maps to `Generation`; a worker panic is caught and mapped rather
-than crossing the public boundary. The function returns only after the worker's
-lease and every domain resource have reached the terminal cleanup state in
-SG-10. No handler task or browser cleanup is detached.
+or join failure maps to `Generation`. The async operation body is wrapped in
+`AssertUnwindSafe(...).catch_unwind()` *inside* the still-live private runtime,
+with its lease and resource registry owned by the enclosing supervisor; an
+operation panic therefore becomes cleanup input rather than unwinding those
+handles. The function returns only after the supervisor's lease and every domain
+resource have reached the terminal cleanup state in SG-10. No handler task or
+browser cleanup is detached.
 
 ### SG-03.4 Exact shared-core API
 
@@ -588,7 +591,7 @@ impl GenerationReport {
 
 impl ArtifactPlan {
     pub fn new(
-        output_root: impl AsRef<std::path::Path>,
+        location: &CorpusLocation,
         generated_root: RelativePath,
         generated_extension: impl Into<String>,
         scope: RunScope,
@@ -596,7 +599,7 @@ impl ArtifactPlan {
         retained_inventory: Option<Vec<RelativePath>>,
     ) -> Result<Self>;
     pub fn report(
-        output_root: impl AsRef<std::path::Path>,
+        location: &CorpusLocation,
         report_path: RelativePath,
         scope: RunScope,
         bytes: Vec<u8>,
@@ -624,6 +627,11 @@ crate-private. The two checked `const` constructors (`ReportArtifact::new` and
 inventory, and overflow checks occur in `GenerationReport::new` and
 `GenerationCounts::total`.
 
+`ArtifactPlan` has no arbitrary output-root constructor: both constructors bind
+to the supplied location's canonical corpus root and privately retain that exact
+root identity. Domain cache acquisition outside the corpus uses crate-private
+rooted transactions, never a public plan.
+
 ## SG-04 Semantic core types
 
 ### SG-04.1 Corpus location
@@ -636,8 +644,10 @@ inventory, and overflow checks occur in `GenerationReport::new` and
 
 Construction rejects missing roots, non-directories, non-UTF-8 CLI inputs,
 canonicalization failures, and corpus roots that escape the owner root through
-lexical components or symlinks. Callers cannot mutate either path after
-construction.
+lexical components or symlinks. It also rejects an owner or corpus root whose
+canonical components contain the reserved exact name `.surgeist-generator`, so
+a new location cannot be rooted at or beneath another corpus's coordination
+directory. Callers cannot mutate either path after construction.
 
 Every binary invocation requires explicit `--owner-root <path>` and
 `--corpus-root <path>`. There is no default corpus, `CARGO_MANIFEST_DIR` fallback,
@@ -649,9 +659,10 @@ owner ancestors may validly describe one corpus. The reserved coordination root
 is always `<canonical-corpus-root>/.surgeist-generator/`, so every
 `CorpusLocation` for the same canonical corpus converges on one filesystem
 namespace. Domain manifests, artifacts, reports, caches, and imports may not use
-`.surgeist-generator` as an equal or ancestor/descendant path. Coordination files
-are generator state, have no generated extension, and are excluded from domain
-artifact/report inventories.
+`.surgeist-generator` as any relative-path component at any depth. Coordination
+files are generator state, have no generated extension, and are excluded from
+domain artifact/report inventories; recursive domain walks do not enter any
+directory with that exact component name.
 
 ### SG-04.2 Strict relative paths
 
@@ -1053,13 +1064,16 @@ are rejected.
 
 ## SG-09 Atomic installation and stale-output behavior
 
-`ArtifactPlan` owns one canonical output root, a `BTreeMap` of unique relative
-output paths to bytes, and the exact retained output inventory for a full run.
-Construction hashes content and rejects path collisions before touching disk.
+`ArtifactPlan` owns the supplied `CorpusLocation`'s canonical corpus-root
+identity, a `BTreeMap` of unique corpus-relative output paths to bytes, and the
+exact retained output inventory for a full run. Construction hashes content and
+rejects path collisions before touching disk. There is no public plan rooted at
+an independently supplied path.
 
-On Linux and macOS, an internal rooted-filesystem capability opens the output directory
-once and performs every traversal, create, open, rename, and remove relative to
-held directory descriptors with non-following `rustix` filesystem operations.
+On Linux and macOS, an internal rooted-filesystem capability opens the plan's
+bound corpus root (or a crate-private cache root) once and performs every
+traversal, create, open, rename, and remove relative to held directory
+descriptors with non-following `rustix` filesystem operations.
 It opens each directory component separately and refuses symbolic links. An
 attacker rename may detach an already-held directory, but it cannot redirect an
 operation to another object or outside the held root. Construction compares the
@@ -1082,8 +1096,8 @@ probe beneath `<corpus-root>/.surgeist-generator/` creates two exclusive
 files, exercises both flags, and removes them. `ENOSYS`, `EINVAL`, or
 `EOPNOTSUPP` maps to `UnsupportedPlatform`; probe residue is best-effort removed
 and reported, and no cache, import, artifact, or report mutation follows. Direct
-`ArtifactPlan::install` performs the same probe inside its output root before it
-backs up or installs a final target.
+`ArtifactPlan::install` performs the same probe inside its bound canonical corpus
+root before it backs up or installs a final target.
 
 The transaction namespace has an explicit exclusivity contract. The output and
 coordination roots are generator-owned, and callers must not mutate them outside
@@ -1120,11 +1134,13 @@ The transaction never removes a file outside the declared generated extension
 and roots. It never follows an output symlink. Residual temporary or backup names
 from another process are collisions, not files to overwrite. Every prospective
 stage and backup name is checked even when its final target does not exist.
-`ArtifactPlan` reserves the root-level `.surgeist-generator` component and
-rejects any generated root, artifact, retained path, or report path equal to or
-beneath it, so standalone public plans cannot overwrite a corpus lease
-namespace. (`RelativePath` cannot represent the output root itself, so no valid
-plan path is an ancestor of that reserved first component.)
+`ArtifactPlan` rejects `.surgeist-generator` as any component of a generated
+root, artifact, retained path, or report path, at any nesting depth. Its stale
+collector never enters a directory bearing that exact name. Together with the
+location-bound corpus root and SG-04 root rejection, callers cannot select the
+coordination directory as an output root, target the current root-level
+coordination files, or reach a nested corpus's coordination files through a
+parent-corpus plan.
 
 Domain generation may commit one coherent artifact group at a time, but each
 group uses this transaction. Full-run stale removal occurs only after every job
@@ -1203,10 +1219,21 @@ an async cancellation point. A browser, handler, measurement, profile, or cache
 cleanup error therefore leaves final artifacts, stale outputs, and canonical
 reports unchanged. The private worker thread is joined by the public function,
 so dropping a Rust future is not an API operation and returning to the caller
-means no browser or handler work remains. A defensive worker unwind uses guards
-that abort registered tasks, trigger Chromiumoxide's kill-on-drop child guard,
-quarantine the run-owned profile without following links, and release the lease
-last; the join converts the panic to `Generation`.
+means no browser or handler work remains.
+
+Panic containment follows the same sequence rather than relying on unwind-time
+Drop. The supervisor owns the lease and resource registry outside the operation
+future, catches an operation panic inside the live runtime, records a private
+panic outcome, and then invokes terminal cleanup on the still-owned handles.
+Each cleanup await is itself panic-contained and error-accounted; a close panic
+falls through to the registry's direct child kill-and-wait fallback, and a task
+panic falls through to abort-and-await. Cleanup code contains no assertion,
+`unwrap`, or `expect` over external state. Only after child reap, task join,
+profile/stage cleanup or terminal residue accounting, and lease release does the
+worker return `Generation` (with cleanup failures appended) to the joining
+public function. Chromiumoxide kill-on-drop and synchronous quarantine guards
+remain last-resort process-unwind protection, not the claimed normal or mapped-
+panic cleanup mechanism.
 
 The command lifecycle is:
 
@@ -1398,8 +1425,11 @@ Shared-core tests shall prove:
    staging, installation, or cleanup failure; descriptor-bound tests replace
    roots, components, and destination names before each atomic transition and
    prove no escape, overwrite, or removal of a colliding inode under the SG-09
-   exclusive-namespace contract; generated and report plans reject the reserved
-   root-level `.surgeist-generator` coordination subtree;
+   exclusive-namespace contract; public plans have no arbitrary output-root
+   constructor, a `CorpusLocation` rooted at/below a coordination directory is
+   rejected, and generated, retained, artifact, report, and stale-walk paths
+   reject or skip `.surgeist-generator` at the root and at nested depths, proving
+   the equal-root, parent-root-plus-target, and direct-relative bypasses closed;
 9. hash text validation and report counts/provenance detect drift, and every
    `GeneratorErrorKind` has the exact SG-12 exit code;
 10. a residual deterministic backup is rejected even when its final target is
@@ -1436,11 +1466,13 @@ measurements, and artifacts to prove:
    Git directory, primary object directory, and recursive alternates cannot
    overlap import, artifact/report, or coordination writes;
 9. injected launch, page, measurement, browser-close, handler-join, profile, and
-   acquisition-stage failures return only after the synthetic child is reaped,
-   every handler is completed or aborted-and-joined, the profile is removed or
-   reported as a collision-safe residue, and a distinct-owner contender can
-   acquire the released same-corpus lease; no final artifact, stale output, or
-   report changes, and no detached-task counter remains.
+   acquisition-stage failures, plus an injected operation panic after all
+   synthetic resources are registered, return only after the synthetic child is
+   reaped, every handler is completed or aborted-and-joined, the profile is
+   removed or reported as a collision-safe residue, and a distinct-owner
+   contender can acquire the released same-corpus lease; the panic maps to
+   `Generation`, no final artifact, stale output, or report changes, and no
+   detached-task counter remains.
 
 CSS tests shall use official-shaped synthetic fixture JSON and local temporary Git
 repositories to prove:
