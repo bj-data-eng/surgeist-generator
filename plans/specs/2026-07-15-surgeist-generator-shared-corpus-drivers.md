@@ -152,6 +152,7 @@ src/core/mod.rs
 src/core/artifact.rs
 src/core/case.rs
 src/core/corpus.rs
+src/core/fs.rs
 src/core/hash.rs
 src/core/lease.rs
 src/core/manifest.rs
@@ -186,6 +187,7 @@ The dependency matrix is:
 | `serde_json` | `=1.0.145` | yes | inherited | inherited | Reports, layout measurements, CSSTree fixtures |
 | `sha2` | `=0.10.9` | yes | inherited | inherited | Source and artifact SHA-256 |
 | `toml` | `=0.9.8` | yes | inherited | inherited | Domain manifest parsing |
+| `rustix` | `=1.1.4`, `fs`, Unix targets only | yes on Unix | inherited | inherited | Safe descriptor-relative, non-following filesystem transactions |
 | `chromiumoxide` | `=0.9.1`, no defaults, `fetcher`, `rustls`, `zip8` | no | yes | no | Managed pinned Chromium measurement |
 | `futures` | `=0.3.31` | no | yes | no | Chromium handler stream |
 | `tokio` | `=1.48.0`, `fs`, `macros`, `rt-multi-thread` | no | yes | no | Async layout driver and thin binary |
@@ -195,8 +197,12 @@ The dependency matrix is:
 and the layout module/binary. `css-corpus` activates the CSS module/binary and no
 heavy dependency. Both features may be enabled together. The two binaries use
 `required-features` so an unrequested driver cannot compile accidentally.
+`rustix = { version = "=1.1.4", features = ["fs"] }` is declared under
+`[target.'cfg(unix)'.dependencies]`; it is a shared lifecycle dependency, not a
+domain or default feature switch.
 
-All named dependency sources are already present in the local Cargo registry.
+All named dependency sources, including `rustix` 1.1.4, are already present in
+the local Cargo registry.
 The now binary-bearing tool package shall track `Cargo.lock`; `.gitignore` shall
 stop ignoring that one file. All implementation and verification commands use
 `--locked --offline`, so no dependency acquisition occurs.
@@ -489,6 +495,23 @@ are rejected.
 output paths to bytes, and the exact retained output inventory for a full run.
 Construction hashes content and rejects path collisions before touching disk.
 
+On Unix, an internal rooted-filesystem capability opens the output directory
+once and performs every traversal, create, open, rename, and remove relative to
+held directory descriptors with non-following `rustix` filesystem operations.
+It opens each directory component separately and refuses symbolic links. An
+attacker rename may detach an already-held directory, but it cannot redirect an
+operation to another object or outside the held root. Construction compares the
+opened root identity with the supplied canonical path before adopting the
+capability. Pathname validation alone is never mutation authority. No OS
+descriptor is public.
+
+Safe descriptor-relative mutation is unavailable from this implementation on
+non-Unix targets. `ArtifactPlan` construction and `GenerationLease` acquisition
+therefore fail with `UnsupportedPlatform` before creating, opening for write, or
+changing any file. Read-only manifest, inventory, hash, provenance, and corpus
+checks remain portable. The binaries compile on non-Unix and report the semantic
+failure; operator documentation states this boundary.
+
 Installation follows one transaction:
 
 1. create every parent beneath the output root;
@@ -503,7 +526,8 @@ Installation follows one transaction:
 
 The transaction never removes a file outside the declared generated extension
 and roots. It never follows an output symlink. Residual temporary or backup names
-from another process are collisions, not files to overwrite.
+from another process are collisions, not files to overwrite. Every prospective
+stage and backup name is checked even when its final target does not exist.
 
 Domain generation may commit one coherent artifact group at a time, but each
 group uses this transaction. Full-run stale removal occurs only after every job
@@ -527,6 +551,16 @@ synced, preventing a contender from observing stale or empty ownership. A held
 lease returns a semantic `LeaseActive` error with the recorded owner. Dropping the
 lease releases it. Lock files may remain on disk as reusable coordination files;
 they are not generated corpus artifacts.
+
+On Unix, coordination directories and lock files are reached through the same
+safe descriptor-relative, non-following capability described in SG-09. Lock
+files are exclusively created or opened without following links. Before a
+reusable lock file is locked or written, it must be a regular file with exactly
+one filesystem link and the generator-owned schema-1 magic header
+`surgeist-generator-lock-v1\n`. A hard link,
+symlink, special file, unknown header, or residual collision fails without
+truncation. Gate and lease ownership metadata retain that header. On non-Unix,
+acquisition returns `UnsupportedPlatform` before coordination writes.
 
 The command lifecycle is:
 
@@ -603,6 +637,7 @@ Kinds are:
 - `InvalidManifest`;
 - `InvalidInventory`;
 - `SourceVerification`;
+- `UnsupportedPlatform`;
 - `LeaseActive`;
 - `Process`;
 - `Io`;
@@ -623,6 +658,7 @@ by a checked constructor.
 | TOML parse, version, or field contract | `InvalidManifest` | No corpus mutation |
 | Count, duplicate, unmatched override, or malformed CSSTree case | `InvalidInventory` | No artifact/report mutation |
 | Wrong/dirty Git source or origin | `SourceVerification` | No import mutation |
+| Mutation-capable command on a non-Unix target | `UnsupportedPlatform` | No filesystem write or write-open |
 | Contended generation lease | `LeaseActive` | No corpus mutation |
 | Git/browser subprocess failure | `Process` | Domain cleanup; no stale pruning |
 | Read/write/canonicalize failure | `Io` | Transaction rollback where applicable |
@@ -661,11 +697,15 @@ Shared-core tests shall prove:
 5. dispositions require reasons exactly as SG-07 specifies and reject duplicates;
 6. filtered scope cannot authorize report or stale-output operations;
 7. full and filtered requests contend on one corpus lease, owner metadata is
-   coherent, and dropping releases the lease;
+   coherent, dropping releases the lease, and symlink, hard-link, unknown-header,
+   and coordination-component swaps cannot redirect or truncate a lock file;
 8. artifact installation is deterministic, replaces atomically, removes stale
    files only when authorized, and restores every prior file after injected
-   staging or installation failure;
+   staging, installation, or cleanup failure; descriptor-bound race tests swap
+   roots and components at each mutation boundary without causing an escape;
 9. hash text validation and report counts/provenance detect drift.
+10. a residual deterministic backup is rejected even when its final target is
+    absent, and non-Unix mutation entry points fail before writes.
 
 Layout tests shall use synthetic temporary manifests, helpers, HTML, JSON
 measurements, and artifacts to prove:
@@ -725,10 +765,11 @@ acquisition or real-corpus generation paths and does not run commands in
 ## SG-14 Documentation, compatibility, and handoff
 
 `README.md` shall describe the shared-core ownership, feature matrix, exact CLI
-syntax, acquisition-capable commands, offline checks, and the fact that consumer
-corpora remain in layout/CSS. `AGENTS.md` shall cease describing an empty scaffold
-and shall point discovery at the new modules, features, binaries, tests, and
-offline command matrix. No copied workflow is added.
+syntax, acquisition-capable commands, offline checks, the Unix-only
+mutation-capability boundary, and the fact that consumer corpora remain in
+layout/CSS. `AGENTS.md` shall cease describing an empty scaffold and shall point
+discovery at the new modules, features, binaries, tests, and offline command
+matrix. No copied workflow is added.
 
 Compatibility classification:
 
@@ -739,6 +780,8 @@ Compatibility classification:
   of environment/default state;
 - layout manifest/XML/report schema: compatible schema 2;
 - CSS manifest/expectation/report schema: new schema 1;
+- generator mutation lifecycle: descriptor-confined on Unix and fail-closed
+  before writes on non-Unix;
 - MSRV: unchanged at 1.97;
 - production dependency graph: unchanged because no production crate is wired.
 
