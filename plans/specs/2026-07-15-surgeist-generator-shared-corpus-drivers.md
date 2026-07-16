@@ -14,9 +14,9 @@ The crate shall provide one small shared core for manifest/version contracts,
 strict paths, source revision verification, deterministic inventory, case
 dispositions, hashes and provenance, generation reports and leases, atomic
 artifact installation, stale-output removal, full-versus-filtered behavior, and
-offline verification. Chromium, Tokio, URL, and fetcher dependencies shall only
-compile with `layout-browser`. CSS corpus code shall only compile with
-`css-corpus`. The default library shall compile only the shared core.
+offline verification. Chromium measurement, async runtime, URL, HTTPS, and ZIP
+dependencies shall only compile with `layout-browser`. CSS corpus code shall only
+compile with `css-corpus`. The default library shall compile only the shared core.
 
 Acceptance requires all of the following:
 
@@ -84,6 +84,16 @@ The original ten-line binary wrapper has SHA-256
 The inline layout tests beginning at source line 4627 are not part of the copy.
 They remain owned and preserved by `surgeist-layout`. Generator-owned behavior
 shall receive focused synthetic tests in this repository.
+
+Read-only migration evidence also inspected the committed schema-2 browser
+manifest and the already-present local Chrome-for-Testing cache without executing
+either. The manifest pins `149.0.7827.115` and the exact launch profile reproduced
+in SG-05.2. The cache unit
+`target/surgeist-browser/mac_arm-149.0.7827.115` contained 315 non-root
+directories, 331 regular files, and the five SG-05.2 links; its SG-05.2 logical
+inventory digest was
+`5ef8a535ec2e28729c989886a728517681a4f30c18819e98dd2cbe018bd3070a`.
+No layout file/cache byte was modified and no layout command or test was run.
 
 Before transformation, the production prefix shall exist as the transient
 tracked file `src/layout/legacy_generator.rs`. It contains exactly source lines
@@ -183,14 +193,19 @@ The dependency matrix is:
 | `sha2` | `=0.10.9` | yes | inherited | inherited | Source and artifact SHA-256 |
 | `toml` | `=0.9.8` | yes | inherited | inherited | Domain manifest parsing |
 | `rustix` | `=1.1.4`, `fs`, Apple Silicon macOS only | yes on the supported target | inherited | inherited | Safe descriptor-relative, non-following filesystem transactions |
-| `chromiumoxide` | `=0.9.1`, no defaults, `fetcher`, `rustls`, `zip8` | no | yes | no | Managed pinned Chromium measurement |
+| `chromiumoxide` | `=0.9.1`, no defaults, `bytes` | no | yes | no | Chromium measurement without its unsafe path-based fetcher |
 | `futures` | `=0.3.31` | no | yes | no | Chromium handler stream |
-| `tokio` | `=1.48.0`, `fs`, `macros`, `rt-multi-thread`, `time` | no | yes | no | Private Chromium runtime, handler lifecycle, and timed cleanup |
+| `tokio` | `=1.48.0`, `fs`, `io-util`, `macros`, `rt-multi-thread`, `time` | no | yes | no | Private Chromium runtime, bounded download, handler lifecycle, and timed cleanup |
 | `url` | `=2.5.7` | no | yes | no | Fixture and base URL handling |
+| `reqwest` | `=0.13.4`, no defaults, `rustls` | no | yes | no | HTTPS-only pinned browser archive download |
+| `zip` | package `zip`, `=8.6.0`, no defaults, `deflate-flate2-zlib-rs` | no | yes | no | Entry-level browser archive reading for rooted extraction |
 
-`default = []`. `layout-browser` activates the four heavy optional dependencies
-and the layout module/binary. `css-corpus` activates the CSS module/binary and no
-heavy dependency. Both features may be enabled together. The two binaries use
+All six heavy dependencies are `optional = true`. The exact feature edges are
+`default = []`,
+`layout-browser = ["dep:chromiumoxide", "dep:futures", "dep:tokio", "dep:url", "dep:reqwest", "dep:zip"]`,
+and `css-corpus = []`. `layout-browser` also gates the layout module/binary;
+`css-corpus` gates the CSS module/binary and activates no dependency. Both
+features may be enabled together. The two binaries use
 `required-features` so an unrequested driver cannot compile accidentally.
 `rustix = { version = "=1.1.4", features = ["fs"] }` is declared under
 `[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]`;
@@ -329,8 +344,10 @@ caller-visible future can be dropped while Chromium or a lease remains active.
 `layout::run` moves the checked request into one named private OS worker thread,
 builds and drives the Tokio runtime only on that thread, and synchronously joins
 it. It is therefore safe to call from either synchronous code or from a thread
-that already participates in another Tokio runtime. Thread spawn, runtime build,
-or join failure maps to `Generation`. The async operation body is wrapped in
+that already participates in another Tokio runtime. Thread spawn or runtime build
+failure maps to `Generation` before authority/resources exist. A normal join
+returns the worker's semantic result; an outer worker panic is resumed rather
+than mislabeled as completed cleanup. The async operation body is wrapped in
 `AssertUnwindSafe(...).catch_unwind()` *inside* the still-live private runtime,
 with its lease and resource registry owned by the enclosing supervisor; an
 operation panic therefore becomes cleanup input rather than unwinding those
@@ -601,10 +618,12 @@ domain's publication root as a mutation target.
 Those internal mutation types are active only on the single SG-09 supported
 target. Rooted descriptors, capability probes, Git snapshot objects and bytes,
 failure-injection hooks, and error constructors also remain crate-private.
-`ReportArtifact::new` rejects a zero case count and
-`GenerationCounts::new` rejects aggregate overflow; `GenerationReport::new`
+`ReportArtifact::new` rejects a zero or greater-than-`u32::MAX` case count and
+`GenerationCounts::new` rejects any field or checked aggregate above
+`u32::MAX`; `GenerationReport::new`
 performs duplicate, inventory, and header validation, and
-`GenerationCounts::total` repeats the checked sum for deserialized values.
+`GenerationCounts::total` repeats that same portable checked sum for
+deserialized values.
 
 `GenerationReport::new` validates count overflow, sorted unique output paths, and
 report header fields, but does not require summed `ReportArtifact::case_count` to
@@ -636,6 +655,40 @@ Every semantic string accepted by this public surface has one exact grammar:
 - a source revision is exactly 40 or 64 lowercase hexadecimal bytes; a generated
   extension is 1 through 16 lowercase ASCII alphanumeric bytes without a dot.
 
+The public Serde wire contract is also exact. JSON object fields are serialized
+in the listed order, every listed field except the conditional `reason` below is
+required on input, and no alias, flattened form, implicit default, or additional
+field is accepted:
+
+| Type | Exact JSON representation |
+| --- | --- |
+| `RelativePath` | one JSON string containing the checked relative-path spelling |
+| `ManifestVersion` | one positive unsigned JSON integer |
+| `SourceRevision` | one JSON string containing the checked full object ID |
+| `PinnedSource` | object fields `label`, `repository_url`, `revision`, `source_subdirectory` |
+| `CaseDisposition` | exactly one of the strings `active`, `expected-fail`, `unsupported`, `quarantined` |
+| `CaseDispositionRecord` | object fields `case_id`, `source_path`, `disposition`, then conditional `reason`; canonical `active` output omits `reason` and input accepts omitted or JSON `null`, while every non-active value requires one string and canonical output includes it |
+| `Sha256Digest` | one JSON string containing exactly 64 lowercase hexadecimal bytes |
+| `ArtifactProvenance` | object fields `source_path`, `source_digest`, `generator`, `schema_version`, `domain_provenance` |
+| `ReportArtifact` | object fields `provenance`, `output_path`, `output_digest`, `case_count` |
+| `GenerationCounts` | object fields `active`, `expected_fail`, `unsupported`, `quarantined`, `failed_to_generate` |
+| `GenerationReport` | object fields `manifest_digest`, `source_repository`, `source_revision`, `counts`, `artifacts` |
+
+`ManifestVersion` accepts 1 through `u64::MAX`. Every public count accepts 0
+through `u32::MAX`, except `ReportArtifact.case_count`, which accepts 1 through
+`u32::MAX`; constructors enforce this portable wire bound even when `usize` is
+wider. The checked sum of all five `GenerationCounts` fields must also be at most
+`u32::MAX` on every target; construction, deserialization, and `total()` enforce
+the same bound. Canonical JSON serialization emits unsigned base-10 digits with no leading
+zero except `0`. JSON fractions, exponent spellings, negatives, strings, and
+overflow fail. `domain_provenance` is an object whose decoded keys are unique,
+checked identifiers and whose serialization uses `BTreeMap` key order.
+`GenerationReport::new` sorts artifacts by output path before duplicate checks,
+and deserialization repeats that normalization, so `artifacts` is canonically
+sorted on output. Serialization uses these canonical scalar forms and field
+visits, giving compact Serde JSON one byte-exact golden representation for every
+public type.
+
 `ManifestVersion::new` additionally requires a nonzero value.
 `PinnedSource::new` validates its label, URL, revision, and subdirectory.
 `ArtifactProvenance::new` validates its generator and every unique `BTreeMap`
@@ -654,16 +707,19 @@ well-formed but semantically invalid manifest field to `InvalidManifest` before
 constructing these generic values, so public-constructor kinds do not blur CLI
 schema diagnostics.
 
-Every public type in the trait table with `Deserialize` uses a private
-`#[serde(deny_unknown_fields)]` raw representation and calls the same checked
-constructor; it never derives field-wise deserialization that can bypass an
-invariant. `ManifestVersion`, `SourceRevision`, `PinnedSource`,
-`CaseDispositionRecord`, `Sha256Digest`, `ArtifactProvenance`, `ReportArtifact`,
-`GenerationCounts`, and `GenerationReport` all follow this rule, and
-`GenerationReport` recursively revalidates its nested values and aggregate
-inventory. Raw struct visitors reject a repeated field, and provenance maps use
-a custom map visitor that rejects a repeated decoded key instead of allowing
-`BTreeMap` last-value-wins behavior. Constructor failures become deterministic `serde::de::Error::custom`
+Every public type in the trait table with `Deserialize` uses a private checked
+visitor or a `#[serde(deny_unknown_fields)]` raw representation and calls the
+same checked constructor; it never derives field-wise deserialization that can
+bypass an invariant. This explicitly includes the scalar `RelativePath`,
+`ManifestVersion`, `SourceRevision`, `CaseDisposition`, and `Sha256Digest`
+visitors as well as the raw representations for `PinnedSource`,
+`CaseDispositionRecord`, `ArtifactProvenance`, `ReportArtifact`,
+`GenerationCounts`, and `GenerationReport`. `GenerationReport` recursively
+revalidates its nested values and aggregate inventory. Raw object visitors reject
+repeated or unknown fields, and provenance maps use a custom map visitor that
+rejects a repeated decoded key instead of allowing `BTreeMap`
+last-value-wins behavior. Wrong scalar kinds and noncanonical enum spellings
+fail. Constructor failures become deterministic `serde::de::Error::custom`
 messages prefixed by the semantic kind. Domain manifest parsing maps any such
 error to `InvalidManifest`; generated report/expectation parsing maps it to
 `Verification`. Direct callers of Serde receive the Serde error, as required by
@@ -732,7 +788,8 @@ actual relevant parent aliases it to `.surgeist-generator`, and two case-only
 manifest roots collide only where their actual shared parent aliases them. An
 exact-text conflict remains `InvalidManifest` at semantic validation; a
 filesystem-only alias is `InvalidPath` after verified private-probe cleanup and
-before lease/domain writes.
+before mutation authority is returned or a publication root is written. The
+lease-held probe journal is the only permitted prior coordination mutation.
 
 Coordination bootstrap avoids a journal circularity. First, a read-only
 descriptor walk of the already existing owner/corpus ancestry tries the exact
@@ -742,8 +799,10 @@ either root at or beneath coordination, preflight returns `InvalidPath` without
 creating it. At the corpus root, opening the exact reserved spelling either finds
 an exact existing directory or exposes an aliased on-disk spelling, which is
 rejected. When it is absent, the implementation atomically creates and syncs the
-exact persistent coordination directory with `RENAME_EXCL`, reopens it, and
-requires the exact on-disk spelling. Only then can it publish a probe journal
+exact persistent coordination directory with exclusive descriptor-relative
+`mkdirat`, reopens it, requires the exact on-disk spelling/identity, and syncs its
+held parent. This directory is deliberate reusable scaffolding rather than a
+temporary stage. Only then can it publish a probe journal
 inside that directory and test any candidate pair directly in the corpus parent.
 A bootstrap failure may therefore leave only an exact empty generator-owned
 coordination directory; it never leaves an unjournaled alias or domain file.
@@ -824,21 +883,173 @@ and count values. It validates agreement between the existing source-root and
 import sections, then derives the pin from the manifest. Cache placement is
 fully specified rather than invented by a worker:
 
+- `browser.source` is exactly `chrome-for-testing`;
+- `browser.version` is exactly four dot-separated ASCII decimal components.
+  Each component is `0` or starts with `[1-9]`, contains digits only, and parses
+  as `u32`; leading zeroes, signs, whitespace, separators, URL characters, and
+  additional components are rejected. The currently evidenced pin
+  `149.0.7827.115` satisfies this grammar without becoming a hard-coded future
+  manifest value;
+- `browser.version_output` must equal the byte string
+  `Google Chrome for Testing <browser.version>` with no added whitespace. These
+  three checks occur during manifest validation, so neither a download URL nor
+  a process argument can be formed from unchecked browser text;
+
+Schema 2's remaining browser fields are required and exact. Unknown/missing
+fields or a wrong TOML scalar kind are `InvalidManifest`:
+
+| Field | Required value |
+| --- | --- |
+| `browser.provenance_format` | `chrome-for-testing/{version} ({repository_relative_executable})` |
+| `browser.launch.batch_size` | integer `50` |
+| `browser.launch.navigation_timeout_ms` | integer `10000` |
+| `browser.launch.dom_poll_interval_ms` | integer `25` |
+| `browser.launch.retry_count` | integer `1` |
+| `browser.launch.job_order` | `sorted-sequential` |
+| `browser.launch.retry_error_class` | `open-load-reset-timeout` |
+| `browser.launch.profile_scope` | `per-batch-and-retry` |
+| `browser.launch.page_scope` | `per-job` |
+| `browser.launch.disable_default_args` | boolean `true` |
+| `browser.launch.disable_cache` | boolean `true` |
+
+`browser.launch.arguments` is an array of exactly these 28 strings in this
+order; duplicates, added switches, leading `--`, NUL/control characters, or a
+different order fail manifest validation and the ordered array feeds the launch-
+profile digest:
+
+```text
+headless=new
+mute-audio
+disable-background-networking
+disable-background-timer-throttling
+disable-backgrounding-occluded-windows
+disable-breakpad
+disable-client-side-phishing-detection
+disable-component-extensions-with-background-pages
+disable-component-update
+disable-default-apps
+disable-dev-shm-usage
+disable-domain-reliability
+disable-features=TranslateUI,MediaRouter,OptimizationHints,AutofillServerCommunication
+disable-hang-monitor
+disable-ipc-flooding-protection
+disable-popup-blocking
+disable-prompt-on-repost
+disable-renderer-backgrounding
+disable-sync
+enable-automation
+enable-blink-features=IdleDetection,CSSGridLanesLayout
+enable-features=NetworkService,NetworkServiceInProcess
+force-color-profile=srgb
+lang=en_US
+metrics-recording-only
+no-default-browser-check
+no-first-run
+use-mock-keychain
+```
+
 - schema 2 requires the existing `browser.cache_root` value
   `target/surgeist-browser`; its canonical root is
-  `<owner-root>/target/surgeist-browser`;
+  `<owner-root>/target/surgeist-browser`. The one browser publication unit is its
+  existing platform/version child
+  `mac_arm-<browser.version>`;
 - the Taffy object cache is
   `<owner-root>/target/surgeist-sources/taffy/<exact-revision>`, preserving the
   copied generator's fixed prefix while deriving the terminal component from the
-  manifest pin. It is a generator-owned bare object repository, not a checkout;
+  manifest pin. That exact revision directory is the one Taffy publication unit
+  and is a generator-owned bare object repository, not a checkout;
 - `owner_root/target` must already be a same-mount ordinary directory. Browser
-  acquisition stages are complete-root siblings named
-  `target/._surgeist-browser-stage-<lease-token>` and publish
-  `target/surgeist-browser`; Taffy stages are complete-root siblings named
-  `target/._surgeist-sources-stage-<lease-token>` and publish
-  `target/surgeist-sources`. Per-run browser profiles alone live at
-  `<browser-cache>/._surgeist-profile-<lease-token>`. Tokens are random 128-bit
-  lowercase hex and are registered before creation.
+  and Taffy stages are unique siblings of their respective final version/revision
+  unit, never stages for the whole cache family. Per-run browser profiles live
+  outside every immutable cache unit at
+  `<owner-root>/target/.surgeist-generator-cache/runtime/browser/<token>`.
+  Tokens are registered before creation.
+
+Cache coordination is independent of every corpus. The exact namespace is
+`<canonical-owner-target>/.surgeist-generator-cache/`, with a target-wide
+`acquisition.lock`, immutable keyed mutexes under `locks/`, journals under
+`transactions/`, and the runtime subtree above. A cache key hashes the held
+target directory's device/inode/fsid identity plus the normalized final relative
+version/revision path. Thus all corpora whose owner resolves to the same target
+and cache unit converge on one lock and journal even before the final directory
+exists; pathname/mount aliases converge by descriptor identity or fail
+`InvalidPath`.
+
+The cache-key preimage is byte-exact:
+`b"surgeist-cache-key-v1\0"`, followed by `st_dev` and `st_ino` as unsigned
+64-bit big-endian values, the two macOS `fsid_t` words as signed 32-bit big-
+endian values, the final-relative-path byte length as unsigned 32-bit big-endian,
+and its normalized UTF-8 bytes. The key is the 64-character lowercase SHA-256 of
+that preimage. Its immutable mutex is `locks/<key>.lock` with exact contents
+`surgeist-generator-cache-lock-v1\n<key>\n`; the target-wide immutable gate has
+exact contents `surgeist-generator-cache-gate-v1\n`. Both use SG-10's journaled
+atomic lock bootstrap and are never truncated or rewritten.
+
+The `.surgeist-generator-cache` directory itself uses SG-04.1's exact-name,
+exclusive-`mkdirat`, reopen, identity/mount, and parent-sync bootstrap against the
+held canonical target. A crash may leave that one valid empty persistent
+scaffold; no temporary cache-coordination spelling is created.
+
+Under the target gate, `locks`, `transactions`, `runtime`, `runtime/browser`, and
+`runtime/runs` are created/adopted with the same persistent-scaffold checks. A
+per-key `transactions/<key>` and `runtime/runs/<key>` directory is created only
+while that key is held exclusive. These containers may survive empty; unknown or
+aliased entries are never adopted as state.
+
+Only `<owner-root>/target` is required beforehand. Under the target-wide gate,
+the fixed cache-family scaffolds `surgeist-browser`, `surgeist-sources`, and
+`surgeist-sources/taffy` are created one component at a time by exclusive
+descriptor-relative creation, parent sync, reopen, exact-name/identity/mount
+validation, and a second parent sync. They are persistent container scaffolding,
+not replaceable publication units. A crash may leave only one of these complete,
+empty, validated prefixes; subsequent acquisition adopts it under the gate. A
+pre-existing nonempty scaffold is accepted only when every child is a valid
+immutable version/revision unit or recognized registered transaction name under
+the applicable keyed journal; unknown content fails closed. The per-key intent
+is not created until the exact final-parent descriptor is held.
+
+Managed and existing-browser `generate` plus `import-taffy` take their exact
+cache key exclusively; generation needs exclusivity for the run/profile journal
+even when the immutable browser unit already exists. Read-only `check-corpus`
+and `check-taffy-corpus` take only shared cache guards when they inspect a cache
+and fail `Verification` on unresolved keyed state. All lock attempts are
+nonblocking; contention returns generic `LeaseActive` context naming only the
+cache key and never a stale owner. The browser cache lock is retained until
+the child is reaped and the external runtime profile is removed or remains under
+its durable recovery intent; the
+Taffy cache lock is retained until its immutable snapshot is no longer needed by
+import/check. Cache coordination bootstrap/recovery holds only the target-wide
+gate briefly. Different cache keys may run concurrently.
+
+Before creating a profile or launching Chrome, the exclusive browser cache guard
+creates and syncs
+`runtime/runs/<cache-key>/active-<token>/intent.json`. It records the cache key,
+unit and target identities, token, and exact `runtime/browser/<token>` profile
+name. The profile directory is registered with the same reservation-before-move
+protocol as SG-09.1. An immutable `launching` marker is durable before spawn;
+`child.json` records the returned PID immediately afterward, and `reaped` is
+published only after `wait` proves that exact owned child handle terminated and
+the child-created process-group probe returns `ESRCH`.
+Profile removal is descriptor-rooted and the run intent is tombstoned/removed
+only after durable reap proof and profile removal. If a process dies after
+`launching` but before recording the PID, a later acquirer cannot prove that no
+child survived and preserves the intent/profile as disputed
+`ArtifactTransaction`. With a recorded PID/process-group ID but no `reaped`,
+cleanup proceeds only when the safe process-group probe returns `ESRCH`; an
+existing/reused group or any
+inconclusive result is preserved. Merely mentioning residue in an error is never
+terminal accounting. An identity-matching profile cleanup failure retains the
+run intent for the next exclusive cache-key acquisition and returns `Generation`;
+wrong identity/type/mount returns `ArtifactTransaction` without removal.
+
+The global lock order is: cache keys in normalized key order, then the corpus
+gate/domain mutex, then browser/task resources; release is the reverse. No path
+acquires a cache lock while holding a corpus lease. A command may therefore
+commit one cache transaction and later one corpus transaction, but never has two
+transactions in their commit phase together. A successfully published cache is
+durable reusable state: if later corpus lease, browser, generation, or corpus
+publication fails, the cache remains committed while corpus outputs follow their
+own pre/post-commit state. There is no cross-root rollback claim.
 
 The fixed domain names (`chrome-for-testing`, `taffy`, `surgeist`, and
 `constrained-html`) remain layout schema semantics. The two source roots and
@@ -858,18 +1069,19 @@ Exact-text relationships are rejected in manifest/location validation; SG-04's
 per-parent equivalence and SG-09 mount/identity checks run while the acquisition
 gate is held and before a cache/domain write:
 
-- both owner-relative publication caches and their fixed `target` parent must
-  remain canonically beneath `owner_root`; the cache roots are pairwise disjoint
-  and every cache/stage/profile namespace is disjoint in both ancestor directions
-  from the whole canonical corpus root;
+- both owner-relative cache families, cache coordination/runtime, and their fixed
+  `target` parent must remain canonically beneath `owner_root`; cache families are
+  pairwise disjoint and every cache/stage/profile/coordination namespace is
+  disjoint in both ancestor directions from the whole canonical corpus root;
 - corpus `html`, `xml`, `corpus.toml`, `scripts/gentest`, and coordination roots
   are pairwise disjoint. The two named helper files are the only permitted helper
   children, and `xml/generation-reports` is the intentional report child of
   `xml`; neither cache may alias any of these namespaces;
-- browser stages, profiles, and executables may occur only beneath the browser
-  cache. Taffy stages, its bare Git administration/object paths, and its final
-  revision cache may occur only beneath the Taffy cache parent. The two cache
-  families may not alias each other;
+- browser stages/executables may occur only beneath the browser-cache parent and
+  its exact version unit; profiles may occur only beneath cache coordination's
+  runtime subtree. Taffy stages, bare Git administration/object paths, and final
+  revision may occur only beneath the Taffy-cache parent. Neither family/runtime
+  may alias another;
 - the Taffy cache's verified protection set may overlap its own acquisition root
   only. Before snapshot bytes can feed publication it must be disjoint from the
   browser cache, corpus `html`/`xml`, manifest, helpers, and coordination roots;
@@ -886,15 +1098,124 @@ a conflict cannot be deferred until after fetch. Acquisition-private stages are
 cleaned or journaled residues; no manifest/cache/helper/HTML/XML/report final is
 changed on a failed matrix check.
 
-Managed Chromium fetch points the feature-gated fetcher only at the unique
-browser stage. Before publication, a rooted inventory rejects absolute/escaped
-archive paths, symlinks, hard links, special files, mount crossings, unexpected
-executables, and any path outside that stage; the one platform executable must
-be a regular single-link executable whose sanitized `--version` output exactly
-matches `browser.version_output`. The complete validated version directory is
-then one SG-09 cache publication unit. `generate-existing` performs the same
-inventory, containment, executable, and version checks on an already published
-manifest-cache child and never fetches.
+Managed Chromium does not call `chromiumoxide_fetcher`: its path-based ZIP
+extractor is outside the safety contract. The driver constructs only
+`https://storage.googleapis.com/chrome-for-testing-public/<browser.version>/mac-arm64/chrome-mac-arm64.zip`.
+A direct Reqwest client is HTTPS-only, disables environment/system proxies and
+redirects, uses Rustls, has a 30-second connect and 10-minute request deadline,
+and accepts only status 200 at that exact URL. It streams at most 1 GiB into an
+already-open exclusive rooted stage file, then flushes and syncs it.
+
+The driver has a closed generator-owned content-pin table. This cycle contains
+exactly the evidenced row:
+
+```text
+version          149.0.7827.115
+platform         mac-arm64
+entry counts     315 directories, 331 regular files, 5 symlinks
+logical tree sha 5ef8a535ec2e28729c989886a728517681a4f30c18819e98dd2cbe018bd3070a
+```
+
+Another manifest version is `InvalidManifest` until a reviewed pin row is added.
+The logical tree SHA-256 starts with
+`b"surgeist-browser-tree-v1\0"` and, for every non-root entry sorted by UTF-8
+relative-path bytes, hashes: a big-endian `u32` path length, path bytes, one type
+byte (`D`, `F`, or `L`), and a big-endian `u16` sanitized mode. A regular file
+then contributes its big-endian `u64` length and raw 32-byte SHA-256; a symlink
+contributes a big-endian `u32` target-byte length and target bytes. The final
+version directory retains the archive's one `chrome-mac-arm64` top-level tree.
+This complete logical inventory digest—not mutable URL/version text—is the
+trusted content pin; harmless ZIP metadata/recompression may differ only when it
+extracts to exactly the same pinned bytes, modes, paths, and links. The observed
+download SHA-256 is computed for transaction diagnostics but does not add a field
+to layout-owned schema-2 XML or reports; their existing browser-version field is
+bound to this one reviewed tree pin by the generator contract.
+
+The registered version-unit stage initially contains only a mode-`0600`
+`._surgeist-download.zip`. A declared `Content-Length` above 1 GiB is rejected;
+streaming enforces the same limit when absent or inaccurate. The stream's SHA-256 is
+finished before ZIP parsing. Extraction retains the top-level directory in that
+same stage, removes and syncs the archive file only after extraction succeeds,
+and prepares the cache transaction only when the root contains exactly the
+pinned tree. Every entry's declared/computed size and CRC must verify during a
+full read; trailing archive data and a multi-disk archive are rejected.
+
+The ZIP reader performs a complete validation pass before extraction: at most
+10,000 entries, 1 GiB per entry, and 2 GiB total uncompressed bytes; UTF-8 strict
+relative forward-slash paths; one `chrome-mac-arm64` top-level tree; no duplicate
+decoded path, file/directory conflict, unsupported compression, encrypted entry,
+device, FIFO, socket, or hard-link representation; and modes exactly `0644` or
+`0755` for regular files, `0755` for directories, and `0120777` for the five
+symlink entries. Inferred parent directories
+receive the same checks. Symlink entry bodies are read during this pass and must
+be relative UTF-8 targets that contain no NUL/backslash, normalize within the
+archive root, form an acyclic graph, and resolve to another validated entry.
+
+For the pinned Apple Silicon Chrome shape the only permitted symlinks are the
+following five beneath
+`chrome-mac-arm64/Google Chrome for Testing.app/Contents/Frameworks/Google Chrome for Testing Framework.framework`
+(denoted `F`):
+
+```text
+F/Versions/Current -> <browser.version>
+F/Google Chrome for Testing Framework -> Versions/Current/Google Chrome for Testing Framework
+F/Helpers -> Versions/Current/Helpers
+F/Libraries -> Versions/Current/Libraries
+F/Resources -> Versions/Current/Resources
+```
+
+Any missing, extra, differently targeted, broken, escaping, or cyclic symlink is
+`SourceVerification`. Extraction then reopens the archive and creates all
+directories and regular files first using only held directory descriptors,
+exclusive create, no-follow component traversal, exact size accounting, flush,
+sync, and sanitized modes. It creates the five already-validated symlinks last
+with descriptor-relative `symlinkat`; no later archive write can traverse one.
+The extractor never calls `create_dir_all`, `File::create`, `ZipArchive::extract`,
+or another pathname-based write.
+
+A final rooted inventory repeats the exact type/mode/link graph and mount checks.
+The platform executable is exactly
+`chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`.
+It must be a regular single-link `0755` file. Its version probe uses only that
+held descriptor-validated path, argv `--version`, trusted working directory `/`,
+and a cleared environment with `LC_ALL=C`; it has a ten-second deadline and
+4-KiB independent stdout/stderr caps. Timeout/overflow kills and reaps the child.
+Success requires status zero and empty stderr. Stdout must be UTF-8 with no NUL
+or control byte except exactly one terminal LF (with an optional immediately
+preceding CR); removing that one line ending must yield byte-exact
+`browser.version_output`. No whitespace splitting or trimming occurs.
+
+Measurement uses a private direct launcher and then connects Chromiumoxide to
+the reported DevTools WebSocket; it does not use Chromiumoxide's ambient-
+environment/process launcher. The exact Chrome argv is the 28 manifest strings
+rendered as `--<string>` in manifest order, followed by
+`--remote-debugging-port=0`, `--disable-extensions`, and
+`--user-data-dir=<absolute registered profile>`. No default or platform-detected
+argument is added. The child uses cwd `/`, clears its environment and sets only
+`HOME=<profile>`, `TMPDIR=<profile>/tmp`, `LC_ALL=C`, and `LANG=C`; both private
+directories are rooted/registered first. The direct launcher places the browser
+and descendants in a new process group whose ID equals the child PID and records
+both in the run intent only after a safe `getpgid` check confirms that equality;
+a mismatch kills/reaps the direct child without group signalling and fails
+`Process`. Stdout is null and stderr is drained by
+an owned task. Within 20 seconds and 64 KiB of startup stderr there must be
+exactly one syntactically valid
+`DevTools listening on ws://127.0.0.1:<ephemeral-port>/devtools/browser/<uuid>`
+line; otherwise the child is killed/reaped. The drain remains owned after
+connection and a one-MiB total cap is fatal. After connection, the driver
+explicitly disables the browser cache through CDP before opening a job page.
+Navigation uses the exact 10-second/25-millisecond manifest intervals, sorted
+sequential batches of 50, one retry only for the named retry class, one page per
+job, and one registered profile per batch/retry.
+
+That version directory alone is the SG-09 cache publication unit.
+`generate-existing` requires its owner-relative browser path to equal the exact
+cache-root/version/executable path above, applies the same inventory, five-link
+graph, containment, executable, tree-pin, and version validation to the already
+published version unit, and never fetches. Synthetic tests encode this exact target-evidenced Chrome 149
+shape and malicious archives whose early symlinks, later descendants, absolute/
+parent targets, cycles, duplicates, and size limits prove no outside sentinel is
+created; no test reads the real layout cache.
 
 ### SG-05.3 CSS schema 1
 
@@ -941,7 +1262,7 @@ Manifest semantic validation treats namespace relationships as part of schema 1.
 Two paths overlap when they are equal or either is a component-wise ancestor of
 the other; string-prefix matches inside one component do not overlap. Exact-text
 overlap is rejected during manifest validation, and SG-04 filesystem-equivalent
-component overlap is rejected during capability preflight. The
+component overlap is rejected during lease-integrated capability preflight. The
 corpus-absolute `import_root` and `expectation_root` must be pairwise
 non-overlapping under both comparisons, and neither generated root may overlap
 the protected `corpus.toml` manifest path. `report_file` has only the one required
@@ -956,7 +1277,8 @@ corpus-absolute coordination namespace
 must be component-wise disjoint from that coordination namespace. A conflict at
 this canonical/text boundary fails with `InvalidPath` before capability
 preflight, lease acquisition, or writes; a filesystem-only alias fails during
-the cleaned private preflight and before lease or domain writes.
+the cleaned lease-held private preflight before mutation authority is returned or
+an import/expectation/report root is written.
 
 `[[cases]]` entries are disposition overrides keyed by a derived case ID. IDs
 are unique. An override must resolve to one collected case. Active is the
@@ -972,8 +1294,11 @@ returns `VerifiedSource` only when:
 
 1. `git rev-parse --is-inside-work-tree` succeeds, including ordinary checkouts
    and linked worktrees;
-2. `git rev-parse HEAD` exactly equals the manifest revision, not merely a
-   prefix;
+2. `git cat-file -t <revision>` returns exactly `commit`,
+   `git rev-parse --verify <revision>^{commit}` returns exactly that same full
+   object ID, and `git rev-parse --verify HEAD^{commit}` returns exactly the
+   manifest revision, not merely a prefix. Tree, blob, annotated-tag, and tag-to-
+   commit pins are rejected rather than peeled into acceptance;
 3. the crate-private raw cleanliness proof below establishes that the index
    equals the exact HEAD tree, every materialized tracked entry equals its index
    blob and type, and no nonignored untracked path exists;
@@ -1020,15 +1345,37 @@ or network access. Every Git subprocess used by shared verification or snapshot
 construction uses one crate-private sanitized read-only runner. Layout
 acquisition uses the separate sanitized bare-fetch runner defined below; neither
 path invokes ambient Git configuration.
-It clears the inherited environment, preserves only `PATH` plus the Windows
-process-loader variables `SystemRoot`, `WINDIR`, and `PATHEXT` and temporary-path
-variables `TEMP` and `TMP` when those variables exist, sets `LC_ALL=C`, and sets
+
+The runner never resolves `git` or a helper through `PATH`. On the one supported
+host it opens and identity-checks the exact `/usr/bin/git` entry before entering
+any checkout, corpus, owner, cache, or temporary directory. It must be a
+root-owned regular executable whose mode has no group/other write bit; hard-link
+count is not an integrity signal for the platform binary. From the trusted `/`
+working directory and an otherwise empty environment it invokes only
+`/usr/bin/git --exec-path`, requires one absolute canonical directory, and
+descriptor-checks every component as root-owned and not group/other writable.
+That directory is the trusted Git installation unit: a no-follow recursive
+inventory requires every directory, regular entry, and symlink to be root-owned
+and not group/other writable, and every symlink target to remain inside the unit.
+Any Git-dispatched executable actually used by read-only commands or fetch,
+including HTTPS and pack helpers, must resolve to a regular executable inside
+that inventory; no helper outside it may execute. The checked canonical
+directory is then fixed as `GIT_EXEC_PATH`. Executable/unit identities are
+rechecked immediately before and after each spawn. Any mismatch is
+`SourceVerification`.
+
+Every subsequent invocation uses the absolute `/usr/bin/git`, trusted working
+directory `/`, and either `-C <canonical-checkout>` or an absolute
+`--git-dir=<held-stage-path>`; no child process has an untrusted current working
+directory. It clears the inherited environment and `PATH` entirely, sets the
+validated `GIT_EXEC_PATH`, `LC_ALL=C`, and
 `GIT_OPTIONAL_LOCKS=0`, `GIT_NO_REPLACE_OBJECTS=1`,
 `GIT_NO_LAZY_FETCH=1`, `GIT_LITERAL_PATHSPECS=1`,
 `GIT_TERMINAL_PROMPT=0`, and `GIT_CONFIG_NOSYSTEM=1`. Consequently no inherited
 Git directory, worktree, object, alternate, namespace, replacement, config,
 credential, transport, prompt, or trace override survives; with no `HOME` or
-`XDG_CONFIG_HOME`, no global user config is read.
+`XDG_CONFIG_HOME`, no global user config is read. No process-loader or temporary-
+path variable is preserved on the supported host.
 
 Every invocation also supplies the equivalent explicit global options
 `--no-pager --no-optional-locks --no-replace-objects --no-lazy-fetch
@@ -1046,6 +1393,11 @@ requests Git worktree conversion, repository-local filter, diff, textconv, and
 credential commands are inert. A Git version that does not accept the required
 global options fails closed as `SourceVerification`; the driver does not retry
 with a weaker invocation.
+
+Before accepting a checkout or bare repository, the runner requires
+`rev-parse --show-object-format=storage` to return exactly `sha1` for a 40-byte
+pin or `sha256` for a 64-byte pin. A pin length/object-storage-format mismatch is
+`SourceVerification` even when another algorithm could spell an object prefix.
 
 The NUL-delimited local-config inventory is read without includes. Every reported
 origin must be the already protected canonical common config or per-worktree
@@ -1071,10 +1423,11 @@ Each acquisition starts in a new descriptor-rooted unique Taffy stage and runs
 only this closed command sequence:
 
 ```text
-git <sanitized-global-options> init --bare --template=<verified-empty-dir> \
+/usr/bin/git <sanitized-global-options> init --bare --template=<verified-empty-dir> \
     --object-format=<sha1-for-40-bytes|sha256-for-64-bytes> <stage>
-git <sanitized-global-options> --git-dir=<stage> fetch \
-    --no-tags --no-write-fetch-head --recurse-submodules=no --refmap= \
+/usr/bin/git <sanitized-global-options> --git-dir=<stage> fetch \
+    --no-tags --no-auto-maintenance --no-write-fetch-head \
+    --recurse-submodules=no --refmap= \
     <literal-https-url> \
     <exact-revision>:refs/surgeist-acquire/<lease-token>
 ```
@@ -1089,8 +1442,11 @@ unknown config is `SourceVerification`; repository config is never reused from a
 prior cache. The command-line empty hooks directory suppresses reference-
 transaction and every other hook even while fetch writes the private ref.
 
-The fetched ref must resolve to the exact full object ID. The sanitized read-only
-runner then enumerates the pinned commit tree and reads raw blobs directly; no
+The fetched ref must resolve to the exact full object ID. Before any tree walk,
+the sanitized runner also requires `cat-file -t <revision>` to return exactly
+`commit` and `rev-parse --verify <revision>^{commit}` to return the unchanged
+full ID; a tree, blob, or tag object is `SourceVerification`. The sanitized
+read-only runner then enumerates the pinned commit tree and reads raw blobs directly; no
 worktree, index, checkout, submodule, smudge/clean/process filter, LFS program, or
 post-checkout hook exists in this acquisition. Only after snapshot verification
 does the rooted publication transaction make the complete bare cache visible.
@@ -1146,29 +1502,32 @@ component prefix before that prefix is stripped. The snapshot type, protection
 set, and Git object details are crate-private; public provenance exposes only the
 exact source revision, normalized path, and SHA-256 digest.
 
-CSS constructs this snapshot after the clean worktree/origin/HEAD check and
-before capability preflight, then imports only retained snapshot bytes after the
-lease. A checkout path change after snapshot creation cannot alter imported
-bytes. Layout acquisition occurs beneath its lease; after its fresh bare fetch
-and exact-pin verification it uses the same commit-tree snapshot for Taffy
-import. Expected file counts are checked against the snapshot before any corpus
-mutation.
+CSS constructs this snapshot after the clean worktree/origin/HEAD proof and the
+read-only existing-path overlap checks, but before the corpus lease and every
+writable capability probe. It imports only retained snapshot bytes after the
+lease. A checkout content change after snapshot creation cannot alter imported
+bytes; a protected-directory identity change is caught by the under-lease
+revalidation below. Layout performs any fresh bare fetch as an SG-05 cache-key
+transaction before taking a corpus lease, proves the fetched object is a commit,
+and builds the same commit-tree snapshot for Taffy import. Expected file and case
+counts are checked against the in-memory snapshot before any corpus publication.
 
 Every snapshot consumer validates the complete source-protection set against its
-downstream writable namespaces. CSS performs the SG-07.2 check before its lease
-or any mutation. Layout may create and publish its manifest-derived bare cache
-only after its lease, but its planned cache namespace is checked before
-acquisition and its verified bare Git/object protection set must be disjoint from
-the Taffy import destination, layout artifact/report roots, browser cache, and
-coordination namespace before snapshotting or mutating any destination; a
-conflict is `InvalidPath`. The exact Taffy cache and its private stage are the
-only source-side namespaces layout may mutate.
+downstream writable namespaces. CSS performs SG-07.2's read-only comparison
+before snapshotting and repeats identity/disjointness validation after the lease
+has run its journaled probes. Layout checks its planned cache namespace before
+cache acquisition; once a bare cache exists, its verified Git/object protection
+set must be disjoint from the Taffy import destination, layout artifact/report
+roots, browser cache, and both coordination namespaces before snapshot bytes can
+feed a corpus publication. It repeats held/reopened identities under the later
+corpus lease. A conflict is `InvalidPath`. The exact Taffy cache unit and its
+registered private stage are the only source-side namespaces layout may mutate.
 
-The layout `import-taffy` command remains explicitly acquisition-capable after
-the SG-10 capability preflight and lease, but uses the closed bare-fetch sequence
-above instead of the copied checkout workflow, then passes raw snapshot bytes
-through this verifier. No test or verification gate contacts the real remote or
-invokes the real acquisition path.
+The layout `import-taffy` command remains explicitly acquisition-capable through
+the SG-10 cache phase, but uses the closed bare-fetch sequence above instead of
+the copied checkout workflow, then passes raw snapshot bytes through this
+verifier before the corpus phase. No test or verification gate contacts the real
+remote or invokes the real acquisition path.
 
 CSS `import-csstree` never acquires a source: it requires
 `--source-root <path>` and verifies that user-supplied checkout.
@@ -1211,13 +1570,31 @@ number of ordinary and error-array case IDs to reference one imported JSON file.
 
 ### SG-07.2 CSSTree ingestion
 
-`import-csstree` verifies and snapshots the pinned commit-tree JSON blobs
-read-only, performs the SG-10 capability preflight, acquires the lease, and only
-then atomically mirrors those retained snapshot bytes beneath the CSS-owned
-`import_root`. It preserves relative paths, rejects all non-JSON and special
-entries, checks the exact source-file count, and removes stale imported JSON only
-as part of a successful complete import transaction. It writes no expectations
-or generation report.
+`import-csstree` has one closed phase order:
+
+1. validate CLI/request, `CorpusLocation`, manifest, filter, and source-root text;
+2. apply the read-only compile-target support check;
+3. verify the user-supplied Git checkout and resolve its complete protection set;
+4. perform text, canonical, and descriptor-ancestry overlap checks for every
+   existing protected/writable path and nearest existing writable parent;
+5. build and validate the immutable in-memory commit-tree JSON snapshot;
+6. enter corpus-domain lease acquisition, lock its mutex, recover its own
+   journals, and run the journaled actual-parent alias/mount/rename capability
+   probes;
+7. while that mutex is held but before the lease is returned, reopen every protected directory without following links,
+   require its recorded device/inode/fsid identity, and repeat the complete
+   disjointness matrix against the probed writable descriptors; and
+8. finish lease acquisition and atomically mirror only the retained snapshot bytes beneath the CSS-owned
+   `import_root`.
+
+Steps 1 through 5 are read-only. No private probe, coordination bootstrap, lease,
+import path, expectation, or report is created before step 6. The driver never
+rereads checkout fixture or object bytes after step 5. Content-only source
+changes therefore cannot change the import; a path/directory identity swap fails
+step 7 with `InvalidPath`. The import preserves relative paths, rejects all
+non-JSON and special snapshot entries, checks the exact source-file count, and
+removes stale imported JSON only as part of a successful complete transaction.
+It writes no expectations or generation report.
 
 Source verification first yields the complete crate-private SG-06 protection
 set, not only the canonical checkout root. Before the commit-tree snapshot is
@@ -1226,9 +1603,7 @@ directory, primary object directory, and recursive local alternate object
 directory must be component-wise disjoint in both directions from every
 prospective CSS mutation namespace: the absolute import root, expectation root,
 report path, and corpus coordination root. Any equality, protected-ancestor, or
-protected-descendant relationship fails with `InvalidPath`; only the private
-name/capability probe may be created and cleaned, and no lease, import path,
-expectation, or report is created. The comparison uses
+protected-descendant relationship fails with `InvalidPath` without a write. The comparison uses
 canonical protected directories and owner/corpus roots plus checked relative-path
 joins. It also compares descriptor `(device, inode)` ancestry sets for every
 existing protected and nearest-existing writable directory in both directions;
@@ -1237,7 +1612,8 @@ that canonical text does not collapse. SG-04 exact-pair probes run independently
 in each actual parent needed by a not-yet-created writable suffix. Thus an external ordinary or
 linked checkout and every object store it uses remain strictly read-only even
 when the user supplies an aliased owner or corpus nested within one of those
-locations.
+locations. The only checks that need creating candidate spellings or exercising
+filesystem flags are the lease-held, journaled probes in steps 6 and 7.
 
 ### SG-07.3 Neutral expectation shape
 
@@ -1288,7 +1664,13 @@ Malformed top-level shapes, duplicate object members, nonobject ordinary cases,
 missing/nonstring `source`, ordinary cases without `ast`, nonarray `error`,
 nonobject error entries, invalid `options`, invalid `generate`, duplicate derived
 IDs, and unmatched manifest overrides fail `InvalidInventory` before any
-expectation or report write.
+expectation or report write. During full or filtered generation, each imported
+fixture JSON must derive at least one ordinary or error case; a syntactically
+valid zero-case object is also `InvalidInventory` (and the persisted equivalent
+is `Verification` during checking). Import itself validates JSON bytes/counts but
+does not interpret this shape. Consequently every CSS expectation report artifact has the
+positive `case_count` required by `ReportArtifact::new`; no empty expectation
+file/report-artifact exception exists.
 
 ## SG-08 Hashes and provenance
 
@@ -1329,12 +1711,15 @@ requires its matching live lease.
 
 The only mutation target claimed and verified in this cycle is
 `aarch64-apple-darwin`. On that target an internal rooted-filesystem capability
-opens the plan's bound corpus root (or a crate-private owner-cache root) once and
-performs every traversal, create, open, rename, sync, and remove relative to held
-directory descriptors with non-following safe `rustix` operations. It opens each
-component separately, refuses symbolic links, and compares the opened root
-identity with the supplied canonical path before adoption. Pathname validation
-alone is never mutation authority and no OS descriptor is public.
+opens either the plan's bound corpus root under its live domain lease or the
+canonical owner-target/cache-unit parent under its matching live cache-key guard.
+It performs every traversal, create, open, rename, sync, and remove relative to
+held directory descriptors with non-following safe `rustix` operations. It opens
+each component separately, refuses symbolic links, and compares the opened root
+identity with the authority's recorded canonical path before adoption. There is
+no generic "owner-cache root" capability and no independently supplied writable
+root. Pathname validation alone is never mutation authority and no OS descriptor
+is public.
 
 Every opened or newly created component must have both the root's
 `fstat().st_dev` and `fstatfs().f_fsid`; a missing value or change is
@@ -1354,13 +1739,14 @@ other native driver support are a bounded future handoff, not an unverified
 promise in this candidate.
 
 Supported macOS requires runtime `renameatx_np` `RENAME_EXCL` and `RENAME_SWAP`.
-While the acquisition gate is held and before a lease is returned, a
-descriptor-rooted journaled probe beneath the coordination root exercises both
+While the applicable coordination gate and exclusive corpus-domain or cache-key
+mutex are held and before that mutation authority is returned, a descriptor-
+rooted journaled probe beneath that authority's coordination root exercises both
 flags, syncs the parent, removes only its verified objects, and syncs again.
 `ENOSYS`, `EINVAL`, `EOPNOTSUPP`, an identity change, or uncleanable probe is
 `UnsupportedPlatform`; no cache/import/artifact/report mutation follows. Lease
-acquisition records successful recovery/probing, so internal plan installation
-rejects an unmatched lease rather than probing outside exclusivity.
+or cache-guard acquisition records successful recovery/probing, so internal plan
+installation rejects unmatched authority rather than probing outside exclusivity.
 
 The transaction namespace has an explicit exclusivity contract. The publication
 and coordination roots are generator-managed for the duration of a live lease;
@@ -1372,42 +1758,89 @@ prevents escape or overwrite of an unexpected object.
 
 ### SG-09.1 One-root publication unit
 
-One transaction has exactly one final publication root. Layout generation uses
-`xml`, including `xml/generation-reports`; layout import uses the complete `html` tree;
-CSS import uses `import_root`; CSS generation uses `expectation_root`, including
-its required report child. A command never tries to commit two final roots.
-Owner-cache acquisition similarly publishes one complete version/revision
-directory. This closed unit makes one filesystem operation the real
-linearization point.
+Each transaction has exactly one final publication root. Layout generation uses
+`xml`, including `xml/generation-reports`; layout import uses the complete `html`
+tree; CSS import uses `import_root`; and CSS generation uses `expectation_root`,
+including its required report child. A browser version or Taffy revision
+directory is likewise one cache transaction unit. A command may finish one cache
+transaction and later one corpus transaction, but those are separate journals,
+authorities, and commit points and are never simultaneously in commit cleanup.
 
-Before staging, a rooted walk inventories the current unit in normalized path
-order and accepts only ordinary single-link files and same-mount directories.
-It rejects links, special entries, reserved/transaction aliases, and mount
-crossings. A clean full run builds only the complete retained state plus
-explicitly domain-classified preserved files; an unknown regular file is
-`InvalidInventory`, not silently retained or deleted. Layout `xml` classifies
-only generated XML and structurally valid generation-report paths (including
-nonmanifest stale candidates), layout `html` additionally classifies
-validated Surgeist-authored fixtures, and both CSS publication roots classify
-only their generated JSON. A filtered or recoverable-diagnostic
-run safely clones the validated current tree into its stage, overlays successful
-artifacts, and deliberately retains stale/nonmanifest output. Layout HTML import
-clones every validated Surgeist-authored fixture byte-for-byte and replaces or
-prunes only manifest-classified Taffy files. No path is mutated in place.
+Before creating transaction state, a rooted walk inventories any current unit in
+normalized path order. Corpus units accept only ordinary single-link files and
+same-mount directories. A browser cache unit additionally accepts exactly SG-
+05.2's five validated symlinks; its inventory stores the uninterpreted link
+target bytes and their SHA-256 and every recovery operation unlinks them without
+following. Taffy cache units contain only the verified bare-Git regular-file/
+directory inventory. All policies reject hard links, other symlinks, special
+entries, reserved/transaction aliases, and mount crossings.
 
-The new tree is created as a unique sibling of the final root on the same held
-parent. Every directory and exclusive-created regular file is synced bottom-up;
-the stage is reopened and its complete normalized `(path, type, mode, length,
-sha256)` inventory is hashed. Before any final transition, an immutable schema-1
-journal is exclusively published and synced beneath
-`.surgeist-generator/transactions/<domain>/<transaction-id>/`. It records the
-domain, corpus/cache root identity and mount, final parent identity, final/stage
-names, expected old-tree digest or `absent`, expected new-tree digest, operation
-mode, and outcome class. Synced immutable old/new inventory sidecars record each
-entry's relative path, type, mode, device/inode identity, link count where
-applicable, length, and content digest; their own digests are in the journal.
-The transaction ID is random 128-bit lowercase hex and all recorded relative
-paths are revalidated on read.
+A clean full corpus run builds only the complete retained state plus explicitly
+domain-classified preserved files; an unknown regular file is `InvalidInventory`,
+not silently retained or deleted. Layout `xml` classifies only generated XML and
+structurally valid generation-report paths (including nonmanifest stale
+candidates), layout `html` additionally classifies validated Surgeist-authored
+fixtures, and both CSS publication roots classify only their generated JSON. A
+filtered or recoverable-diagnostic run clones the validated current tree into its
+stage, overlays successful artifacts, and deliberately retains stale/nonmanifest
+output. Layout HTML import clones every validated Surgeist-authored fixture byte-
+for-byte and replaces or prunes only manifest-classified Taffy files. No path is
+mutated in place.
+
+Journal authority exists before an external stage can exist. Under the matching
+exclusive corpus-domain mutex or cache-key mutex, construction follows this
+exact durable protocol:
+
+The external stage name is derived rather than caller-selected:
+`._surgeist-<domain>-stage-<transaction-id>` for a corpus unit and
+`._surgeist-cache-stage-<cache-key>-<transaction-id>` for a cache unit. These
+ASCII names and the final one-component name are stored in the intent. A cache-
+family scaffold can therefore map a stage to exactly one key journal; an
+unparseable or unreferenced child is disputed.
+
+1. Inventory the old final and compute its canonical inventory digest or
+   `absent`. Cache publication requires `absent`: a valid existing immutable
+   version/revision unit is verified and reused without a transaction, while an
+   invalid existing unit fails closed and is never replaced or repaired.
+2. Exclusively `mkdirat` an `active-<transaction-id>` directory in the applicable
+   transaction parent and sync that parent. For corpus this is
+   `<corpus>/.surgeist-generator/transactions/<domain>/`; for cache it is
+   `<owner-target>/.surgeist-generator-cache/transactions/<cache-key>/`. The
+   atomic directory creation is the intent reservation. An empty or partially
+   populated active directory after a crash owns no external name and is a
+   recoverable internal state, not a publication stage.
+3. Inside that active directory, write/sync a complete `intent.json` and
+   `old-inventory.json` through unique private temporary names and `RENAME_EXCL`,
+   then sync the active directory. The schema-1 intent records coordination,
+   root/mount, authority-key, final-parent, final/stage, and transaction-parent
+   identities; domain/cache key; publication mode; expected old digest; token;
+   and the old-sidecar digest. All recorded relative paths are revalidated on
+   read. No stage registration begins unless both immutable files are complete.
+4. Create an empty `stage-reservation` directory inside the active directory,
+   record and sync its device/inode/fsid and external stage name in an immutable
+   `stage-registration.json`, then atomically move that exact empty directory to
+   the final root's held parent with `RENAME_EXCL`. Sync both parents before
+   populating it. Thus a crash leaves the reservation internally, externally
+   under its recorded identity, or absent before population; it can never leave
+   populated external state without durable intent and registration evidence.
+5. Populate only that registered stage descriptor. Construction writes are
+   exclusive, descriptor-relative, same-mount, and no-follow. An in-progress
+   stage may contain only the domain's allowed types/modes; its registered root
+   identity is sufficient for fail-closed descriptor cleanup under the SG-09
+   cooperating-namespace contract. Chrome creates its five prevalidated links
+   last; no later write traverses them.
+6. Sync the completed tree bottom-up, reopen it, and publish immutable
+   `new-inventory.json` and `prepared.json` files. The new sidecar records each
+   normalized path, type, mode, device/inode identity, link count, length/content
+   digest for regular files, and target bytes/digest for an allowed symlink.
+   `prepared.json` binds the old/new sidecar digests and the complete new-tree
+   digest. No commit is attempted before the prepared marker is durable.
+
+Every metadata/marker/receipt publication uses a unique regular single-link
+temporary file inside the active directory, flush/sync, `RENAME_EXCL` to its one
+fixed final name, and an active-directory sync. A crash-partial temporary file
+therefore remains inside already-reserved intent state; recovery never interprets
+it as a final marker. Unknown names or wrong identities/types are disputed.
 
 On the supported target, every lease/stage/profile/transaction token is an exact
 16-byte read from `/dev/urandom`, rendered as 32 lowercase hex bytes. Failure to
@@ -1415,67 +1848,81 @@ open/read the device is `UnsupportedPlatform`; there is no clock/PID fallback.
 An exclusive-create collision retries with a fresh token at most 16 times, then
 fails without adopting the colliding name.
 
-A corpus publication journal is recoverable through any valid owner ancestor
-because its final root is beneath the canonical corpus. An owner-cache journal
-also records the exact canonical owner and cache capability identities; recovery
-is allowed only when the recorded cache remains beneath the invocation's current
-owner and repeats the namespace matrix. Otherwise acquisition fails closed with
-`ArtifactTransaction` and identifies that recovery requires the recorded owner;
-it never reaches outside current owner authority.
+The commit operation depends on the unit policy:
 
-The sole commit operation is:
-
-- final absent: rename the complete stage to the final name with `RENAME_EXCL`;
-- final present: atomically exchange the complete stage and final root with
-  `RENAME_SWAP`.
+- an absent corpus final or every cache unit publishes the complete stage with
+  `RENAME_EXCL`;
+- a present corpus final atomically exchanges the complete stage and final root
+  with `RENAME_SWAP`.
 
 The held parent is then synced. At no instant does a cooperating reader observe a
 partially renamed file set: it sees the complete old tree or complete new tree.
-For an exchange the stage name now designates the complete old tree. The
+For a corpus exchange, the stage name now designates the complete old tree. The
 transaction publishes and syncs an immutable `committed` marker only after the
-final path is reopened and its digest equals the journal's new-tree digest.
+final path is reopened and its digest equals `prepared.json`'s new-tree digest.
 
 ### SG-09.2 Recovery and cleanup states
 
-Lease acquisition, while holding the domain mutex and before returning the
-lease, recovers every journal for that domain in transaction-ID order. Recovery
-opens all names descriptor-relatively, recomputes inventories, and has this
-closed state machine:
+Corpus lease acquisition recovers only that corpus/domain's journals in
+transaction-ID order while holding its exclusive mutex. Cache acquisition
+recovers only the exact cache key's journals while holding that key exclusively,
+before any corpus lease is requested. All corpora using the same canonical
+owner-target identity and final relative cache-unit path therefore converge on
+the same recovery authority. A read-only check or other shared cache guard never
+recovers; it reports any unresolved cache journal as `Verification`.
+
+Recovery opens all names descriptor-relatively, validates the intent's recorded
+coordination and authority identities against its currently held authority, and
+recomputes inventories. It follows this closed state machine; `old` includes the
+cache-required absent state:
 
 | Observed durable state | Classification and action |
 | --- | --- |
-| final = old/absent; stage = complete new; no marker | pre-commit; publish `aborted` marker, keep final, clean stage |
-| final = old/absent; stage = new-inventory subset/absent; `aborted` marker | aborted cleanup; keep final, continue stage then journal-tombstone cleanup |
-| final = complete new; stage = complete old/absent; no marker | commit occurred; publish `committed` marker, keep final, clean old stage |
-| final = complete new; stage = old-inventory subset/absent; `committed` marker | committed cleanup; keep final, continue stage then journal-tombstone cleanup |
-| final/stage/marker differs from journal | disputed; return `ArtifactTransaction` without removing or renaming either tree |
+| active directory empty or containing only recognized partial metadata temporaries; no complete intent | abandoned internal intent; because registration was forbidden, remove only the active directory's verified internal entries |
+| complete intent/old sidecar; registration absent or its exact reservation remains internal; final = old | unregistered intent; remove only internal reservation/metadata |
+| complete registration; internal reservation absent; external registered stage is absent or a construction-policy subset; no durable `prepared`; final = old | interrupted construction; publish `aborted`, keep final, descriptor-clean the recorded stage if present |
+| durable `prepared`; final = old; external stage = complete new; no outcome marker | prepared pre-commit; publish `aborted`, keep final, clean stage |
+| durable `prepared`; final = complete new; external stage = complete old or absent; no outcome marker | commit occurred; publish `committed`, keep final, clean old stage if present |
+| final = old; external stage = permitted new-stage subset or absent; durable `aborted` | aborted cleanup; keep final, continue stage cleanup |
+| final = complete new; external stage = old-stage subset or absent; durable `committed` | committed cleanup; keep final, continue old-stage cleanup |
+| active journal has valid `cleanup-complete`; terminal final digest matches and external stage is absent | rename active journal to its completed name and continue metadata cleanup |
+| completed journal has valid receipt and remaining members are an exact receipt-listed subset | remove remaining metadata in receipt order, with receipt last |
+| completed journal is empty | descriptor-`rmdir` it and sync the transaction parent |
+| internal and external registration both exist, a prepared tree is incomplete, an outcome conflicts with final digest, or any identity/type/name/digest differs | disputed; return `ArtifactTransaction` without removing or renaming final or disputed external state |
 
-Removal is descriptor-rooted and postorder. Each remaining entry's mount,
-identity, type, and mode—and, for a regular file, its single-link count, length,
-and digest—are rechecked against the applicable sidecar immediately before
-unlink. Once an `aborted` or
-`committed` marker is durable, a crash-partially-deleted stage is accepted only
-when its remaining names and identities are an exact subset of that sidecar;
-this makes stage cleanup itself restartable. A mismatch leaves the residue and
-journal untouched.
+For an interrupted construction without a new sidecar, cleanup first rechecks
+the registered stage-root identity and permits only same-mount entries allowed by
+that domain's construction policy; it never follows a link, crosses a mount, or
+removes a hard-linked/special entry. After `prepared`, removal is descriptor-
+rooted and postorder and each remaining entry's mount, identity, type, mode, link
+count, length/content digest, or allowed symlink target is rechecked against the
+applicable sidecar immediately before unlink. Once an `aborted` or `committed`
+marker is durable, a crash-partially-deleted stage is accepted only when its
+remaining names and identities are an exact subset of that sidecar. A mismatch
+leaves the residue and journal untouched.
 
 After the stage is gone, recovery publishes a synced immutable `cleanup-complete`
-receipt, renames the validated journal directory with `RENAME_EXCL` to its unique
-`completed-<transaction-id>` name, and syncs the transactions parent. Tombstone
-cleanup removes validated sidecars/markers while retaining that receipt until
-last. A crash therefore leaves either a tombstone with its valid receipt or an
-empty tombstone; recovery continues the former and may remove the latter only
-with descriptor-relative `rmdir`, which fails if any entry appeared. Any
-receipt-less nonempty or identity-mismatched tombstone is disputed. The parent is
-synced after final `rmdir`. Unjournaled stage/tombstone names are collisions,
-never cleanup candidates.
+receipt that binds the terminal outcome/final digest and the exact immutable
+journal-member inventory/removal order, renames the validated `active-<id>` directory with `RENAME_EXCL` to its
+unique `completed-<id>` name, and syncs the transactions parent. Completed-state
+cleanup removes only the closed set of verified sidecars, markers, and recognized
+partial metadata temporaries while retaining that receipt until last. A crash
+therefore leaves a completed directory with its valid receipt or an empty one;
+recovery continues the former and removes the latter only with descriptor-
+relative `rmdir`, which fails if any entry appeared. Any receipt-less nonempty or
+identity-mismatched completed directory is disputed. The parent is synced after
+final `rmdir`. An external stage is removable only through its durable
+registration; an unregistered stage or completed name is a collision, never a
+cleanup candidate.
 
-A staging or pre-commit failure removes its verified stage/journal and leaves the
-old final unchanged; inability to complete that cleanup returns
-`ArtifactTransaction` and the next lease retries from the journal. Process death
-before the swap therefore leaves old final plus new stage; death after the swap
-leaves new final plus old stage. Recovery distinguishes them by full-tree digest
-even if death occurred before the marker write.
+A construction or pre-commit failure publishes `aborted`, leaves the old final
+unchanged, and runs the same journaled cleanup. Inability to complete cleanup
+returns `ArtifactTransaction`; the next matching authority resumes it. Process
+death at any intent, sidecar, registration, stage-population, prepared-marker,
+swap, outcome-marker, or completed-directory transition is therefore one of the
+states above. Death before commit leaves the old final; death after commit leaves
+the new final. Recovery distinguishes them by full-tree digest even if death
+occurred before the committed marker write.
 
 The swap is the irreversible commit point. A failure to sync, mark, or delete the
 old stage after it returns successfully does **not** attempt an impossible
@@ -1526,173 +1973,186 @@ XML until resource cleanup instead of writing it incrementally.
 
 ## SG-10 Generation leases and lifecycle
 
-`GenerationLease` uses the standard library's advisory file lock. Its key is the
-domain plus canonical corpus-root digest, so full and filtered runs for the same
-domain/corpus contend while unrelated layout and CSS corpora may run concurrently.
-The immutable lease and acquisition-gate files plus mutable owner record live
-beneath the single reserved
-`<canonical-corpus-root>/.surgeist-generator/` directory. The corpus-wide gate is
-`acquisition.lock`; each validated domain has
-`leases/<domain>/mutex.lock` and `leases/<domain>/owner.json`, and its transaction
-journals use `transactions/<domain>/`. The owner record includes generator, PID,
-owner root, corpus root, scope, command, and Unix start time. Because placement
-depends only on the canonical corpus and domain, distinct valid owner ancestors
-acquire the same gate and domain mutex, while different domains share only the
-short-lived gate.
+Both cache and corpus coordination use standard-library advisory file locks and
+the descriptor-rooted filesystem capability in SG-09. Lock acquisition is
+nonblocking. The global order is: cache target gate (released after key
+acquisition), required cache keys in normalized-key order, corpus gate (released
+after domain acquisition), corpus domain mutex, then browser/task resources.
+Release is reverse; no code takes a cache lock while holding a corpus mutex.
 
-The acquisition gate is locked while a complete owner stage is written, synced,
-and atomically installed, preventing a contender from observing stale, empty, or
-partial ownership. A held lease returns a semantic `LeaseActive` error with the
-recorded owner. Dropping the lease releases it. Coordination files may remain on
-disk for reuse; they are not generated corpus artifacts.
+Before the first gate exists, only the exact persistent `bootstrap` and
+`bootstrap/locks` directories may be created inside an already validated
+coordination root. Each component uses exclusive `mkdirat`, reopen, identity/
+mount/exact-name checks, and parent sync; concurrent `EEXIST` adopts only the
+same validated directory. A crash may leave either empty prefix, which is
+reusable scaffolding rather than an unjournaled stage.
 
-Immediately after locking the gate, acquisition resolves only coordination-
-bootstrap probe journals, then opens and tries the domain mutex without touching
-a domain/cache namespace. If the mutex is contended, it reads the last complete
-owner record and returns `LeaseActive` without probing or replacing it. Once the
-mutex is acquired, it resolves that domain's SG-04 probe journals, owner-record
-journal, and SG-09 domain/cache journals; performs the actual-parent namespace
-and capability probes; publishes the new owner record; then releases the gate and
-returns the mutex-backed lease. A complete probe is removed only by its recorded
-descriptor identities; a crash-partially-cleaned probe is continued from its
-immutable expected-entry sidecar, and a disputed entry fails closed. No contender
-can observe or reuse an intermediate coordination state, and no probe runs beside
-an active same-domain generator.
+Lock-file bootstrap itself is journaled. Before creating a lock-file stage, a
+bootstrapper exclusively creates/syncs
+`bootstrap/locks/active-<decimal-pid>-<token>/` beneath the applicable
+coordination root; the exact name is the first durable liveness/ownership record
+even if death precedes `intent.json`. Recovery probes that PID without signalling
+it and never touches the directory while the PID exists or the probe is
+inconclusive; PID reuse is conservatively live. Once `ESRCH` proves the creating
+process is absent, only recognized internal bootstrap residue may be cleaned.
+The bootstrapper publishes `intent.json`, creates the empty regular stage inside
+that intent, publishes its identity in `stage-created`, writes/syncs the exact
+header, and acquires the advisory lock on that still-open stage. It then attempts
+`RENAME_EXCL` directly from the intent to the exact final lock name and syncs both
+directories. A winner keeps that same descriptor; on `EEXIST`, a loser validates
+and locks the complete final inode before journal-cleaning its own stage. A live
+bootstrap intent's stage lock is never cleaned. Recovery of an unlocked intent
+accepts only: final absent plus the registered internal stage (abort); a valid
+matching final plus absent stage (winner cleanup); or a valid final plus the
+registered loser stage (loser cleanup). Other identities are disputed. Intent
+cleanup uses SG-09.2's receipt/tombstone order, so no unpublished unjournaled lock
+stage exists. Final lock files are exact-name, regular, single-link, immutable,
+never truncated, and rejected on an unknown header or identity change.
 
-On supported Apple Silicon macOS, coordination directories and lock files are
-reached through the same safe descriptor-relative, non-following capability
-described in SG-09.
-An existing coordination directory is adopted only when its directory entry has
-the exact on-disk name `.surgeist-generator`, not merely a filesystem-equivalent
-spelling, and its opened identity/mount matches the expected corpus child.
+Cache users first open
+`<canonical-owner-target>/.surgeist-generator-cache/acquisition.lock` with the
+header in SG-05.2. Mutation-capable users take it exclusive, bootstrap/open all
+needed `locks/<key>.lock` files, and try their exclusive key locks in normalized
+order before releasing the gate. They then recover only those keys' SG-09
+transactions and runtime/run intents and perform cache-parent alias/mount/rename
+probes. Read-only checks create nothing: when coordination exists they take the
+gate and relevant key locks shared, fail `Verification` on any journal/run
+intent, and hold the key guard through cache inspection; when it is absent they
+require it and the inspected final identities to remain absent/unchanged at a
+final recheck. A cache contender returns `LeaseActive` with canonical target and
+key only. Cache coordination has no owner record.
 
-The immutable acquisition-gate and lease-mutex files contain exactly the
-generator-owned schema-1 magic header `surgeist-generator-lock-v1\n`, are locked,
-and are never truncated or rewritten. Their first creation uses atomic publish,
-not direct final-name creation:
+`GenerationLease` is corpus-only. The fixed coordination domain is `layout` for
+every layout import/generate/check command and `css` for every CSS
+import/generate/check command. Mutating commands take their domain mutex
+exclusive; checks take it shared. Therefore import, full/filtered generation,
+and checking cannot race within one domain/corpus. Layout and CSS may use distinct
+domains in a deliberately shared corpus; distinct corpora are independent.
 
-1. exclusively create a unique descriptor-rooted sibling stage;
-2. write the complete header, flush and sync it, verify regular type and one link,
-   then acquire the advisory lock on that already-open stage;
-3. publish the still-open, still-locked inode to the final name with `NOREPLACE`
-   and sync the coordination directory; the winning descriptor remains the lock
-   descriptor;
-4. on `EEXIST`, safely discard only the contender's own unpublished stage, open
-   the final name without following links, require a complete header/regular
-   type/one link, acquire its lock, and reread/recheck the same descriptor before
-   adoption.
+The corpus gate and mutex live beneath
+`<canonical-corpus-root>/.surgeist-generator/`: `acquisition.lock`,
+`leases/<domain>/mutex.lock`, `leases/<domain>/owner.json`, and
+`transactions/<domain>/`. Gate and mutex contents are exactly
+`surgeist-generator-lock-v1\n`. Their placement depends only on canonical corpus
+and fixed domain, so distinct valid owner ancestors converge. Existing
+coordination is adopted only with the exact on-disk spelling, expected
+descriptor identity/mount, valid immutable lock headers, and no unknown entry.
 
-A final gate/mutex name is adopted only when its on-disk spelling is exact. A
-crash before publication can leave only a uniquely named unpublished stage;
-it cannot expose a partial final file or block a later unique publisher. A crash
-after publication leaves a complete synced immutable final inode and releases
-its advisory lock. Pre-existing empty, partial, multi-link, special, aliased-name,
-or unknown-header finals fail without truncation. The gate is bootstrapped first
-and held while the lease mutex and owner metadata are created/adopted. A hard
-link added later cannot expose a content mutation because these two final inodes
-remain immutable.
+A mutator takes the corpus gate exclusive. While it is held, missing `leases`,
+`leases/<domain>`, `transactions`,
+and `transactions/<domain>` parents are created/adopted as exact persistent
+scaffolds with the same reopen/sync checks; a crash may leave only validated
+empty prefixes. It then bootstraps/opens the mutex and tries it exclusive.
+Contention returns `LeaseActive` with only domain and canonical corpus; it never
+reads or presents `owner.json` as the current holder.
+After locking, acquisition recovers only coordination-bootstrap/probe journals,
+the domain's owner-record journal, and that domain's corpus transactions—never a
+cache journal. It then runs actual-parent namespace/mount/rename probes and final
+protected-source identity/disjointness revalidation. A complete probe is removed
+only by recorded descriptor identities; partial cleanup resumes from its
+sidecar. A dispute releases the locks and returns `ArtifactTransaction`.
 
-Mutable owner metadata lives in a separate owner file and uses the SG-09.2
-single-file journal while the immutable gate is held. Acquisition validates and
-hashes any existing regular single-link owner record, writes and syncs a complete
-new stage, publishes the journal, then uses `RENAME_EXCL` for first install or
-`RENAME_SWAP` for replacement. The final name therefore changes at one commit
-point; a displaced old record is removed only after identity/hash recheck, and a
-post-commit cleanup failure leaves the complete new owner plus its recovery
-journal. A contender holding the gate resolves that journal before reading the
-owner file, so it observes one complete header-plus-owner record. No existing
-lock or owner inode is truncated or written in place. The internal lease is
-returned only when no unresolved journal remains. A disputed journal releases
-the mutex and returns `ArtifactTransaction`. On every
-target other than `aarch64-apple-darwin`, acquisition returns
-`UnsupportedPlatform` before coordination writes.
+`owner.json` is historical audit metadata for the last successfully acquired
+lease, not liveness evidence. It contains generator, PID, owner/corpus roots,
+scope, command, and Unix start time. Replacement is the single-regular-file
+specialization of SG-09's exact `intent -> stage-registration -> prepared ->
+RENAME_EXCL/RENAME_SWAP -> committed/aborted -> cleanup-complete` protocol; the
+intent is durable before the file stage exists. While holding the gate,
+acquisition completes that journal, installs the new owner, then releases the
+gate and returns the mutex-backed lease. Checks never update owner metadata.
+Dropping a lease releases only its held mutex. No lease is returned while an
+owner/probe/corpus journal is unresolved.
 
-Layout's synchronous worker owns one private resource set beneath the lease. A
-newly launched browser, page, handler `JoinHandle`, acquisition stage, generated
-byte buffer, and profile directory are registered immediately; a task handle is
-never dropped to detach it. Normal success and every semantic error stop
-scheduling jobs and run the same terminal sequence before the worker can return:
+On every target other than `aarch64-apple-darwin`, a mutation-capable operation
+returns `UnsupportedPlatform` during the static read-only prefix, before
+coordination or source subprocesses. On the supported target, exact-text,
+canonical, and existing descriptor-ancestry conflicts fail before lock
+acquisition. Filesystem-only case/normalization aliases, runtime rename/mount
+capability failures, and a protected-directory identity change found by final
+revalidation fail while the exclusive mutex is held but before a lease is
+returned or any cache/import/artifact/report root is mutated. Only exact
+coordination bootstrap plus a cleaned or durably journaled private probe may
+remain.
 
-1. close each open page with a bounded timeout; a failure/timeout is recorded and
-   cleanup proceeds to whole-browser termination rather than awaiting the page
-   again;
-2. request browser close with a bounded timeout, then always perform a bounded
-   post-close child `wait`; successful close is not treated as process exit. A
-   close failure/timeout or delayed exit forces `kill` followed by `wait/reap`;
-   the lease is not released while the child is still observed alive;
-3. await a normally completing handler only for a bounded interval, then abort
-   and await its `JoinHandle`; abort-and-join is also bounded but remains owned
-   and retried/fail-closed rather than detaching. Every registered task is
-   accounted before lease release;
-4. remove the run-owned browser profile with the SG-09 rooted, non-following
-   cleanup primitive only after the child is reaped; a disputed or unremovable
-   profile is retained under its collision-safe run name and returned as a
-   `Generation` cleanup error, never recursively removed through an untrusted
-   path;
-5. remove every verified pre-commit browser/Taffy acquisition stage while
-   preserving any pre-existing cache; a cache root already committed by the
-   SG-09 swap remains coherent and its journal is retained if old-stage cleanup
-   cannot complete;
-6. drop the lease only after all active child/task work has terminated and every
-   remaining run-owned path is either removed or reported as terminal residue.
+Layout's synchronous worker owns one private resource registry. Thread-spawn and
+Tokio-runtime-build failure occurs before cache/corpus authority and maps to
+`Generation`. After supervisor construction, the registry lives outside the
+panic-contained operation future. A browser child, page, CDP/stderr task `JoinHandle`,
+profile/run intent, and generated bytes are registered immediately; no task
+handle is dropped. Normal completion, semantic error, and contained operation
+panic use this exact monotonic-clock terminal sequence:
 
-Layout collects all XML and report bytes in memory. It does not install an
-artifact, prune stale output, or publish a report until measurement and the
-browser/task/profile terminal sequence have succeeded. Once publication begins,
-the synchronous SG-09 transaction reaches either its pre-commit unchanged state
-or its one atomic commit without an async cancellation point. A fatal browser,
-handler, unassigned measurement, profile, or pre-commit cache cleanup error
-therefore leaves final artifacts, stale outputs, and canonical reports unchanged;
-only an SG-09 recoverable case-assigned measurement failure authorizes the exact
-diagnostic publication described there. Post-commit cleanup follows SG-09.2 and
-never exposes a partial tree. The private worker thread is joined by the public function,
-so dropping a Rust future is not an API operation and returning to the caller
-means no browser or handler work remains.
+1. Each page receives one close attempt with a two-second `tokio::time::timeout`.
+   Failure/timeout is recorded; that page is not retried.
+2. Browser close receives one five-second attempt. Whether it succeeds or fails,
+   the owned child then receives one five-second wait. If not reaped, the
+   supervisor sends kill to the recorded process group exactly once and performs
+   an intentionally unbounded blocking wait for the owned child plus process-
+   group `ESRCH`. A browser is terminal only when wait returns its exit status
+   and no member of its group remains; there is no return/detach deadline after
+   kill.
+3. Each registered CDP/stderr task receives one five-second normal join interval. If still pending,
+   abort is requested exactly once and cancellation join receives five seconds.
+   If still pending, the supervisor keeps the handle and waits without a terminal
+   deadline until it resolves completed, cancelled, or panicked. Abort request
+   alone is not terminal. The public call may therefore remain blocked forever
+   for a noncooperative task rather than detach it.
+4. Only after child reap publishes the run intent's `reaped` proof does rooted
+   profile cleanup run once. Success completes the run journal. An identity-
+   matching removal failure keeps the durable pending intent/profile and returns
+   `Generation`; a disputed identity returns `ArtifactTransaction` without
+   removal. Cache transaction stages are handled only by SG-09 recovery, not an
+   ad-hoc recursive cleanup.
+5. The corpus lease is released only after every child/task is terminal and the
+   profile is removed or durably pending; the cache guard is released afterward.
 
-Panic containment follows the same sequence rather than relying on unwind-time
-Drop. The supervisor owns the lease and resource registry outside the operation
-future, catches an operation panic inside the live runtime, records a private
-panic outcome, and then invokes terminal cleanup on the still-owned handles.
-Each cleanup await is itself panic-contained and error-accounted; a close panic
-falls through to the registry's direct child kill-and-wait fallback, and a task
-panic falls through to abort-and-await. Cleanup code contains no assertion,
-`unwrap`, or `expect` over external state. Only after child reap, task join,
-profile/stage cleanup or terminal residue accounting, and lease release does the
-worker return `Generation` (with cleanup failures appended) to the joining
-public function. Chromiumoxide kill-on-drop and synchronous quarantine guards
-remain last-resort process-unwind protection, not the claimed normal or mapped-
-panic cleanup mechanism.
+Timeouts use Tokio's clock and focused tests use a paused injected clock; retry
+counts and the unbounded forced states above are not configurable. Layout buffers
+all XML/report bytes in memory and begins the synchronous corpus transaction only
+after browser/task cleanup and profile terminal accounting. Fatal launch,
+handler, unassigned measurement, profile, or pre-commit errors leave the old
+artifact/report/stale tree. Only SG-09.3's case-assigned recoverable outcome may
+publish diagnostics. Once publication begins there is no async cancellation
+point; post-commit cleanup follows SG-09.2.
 
-The command lifecycle is:
+Each cleanup await is separately panic-contained. A close panic falls through to
+the same direct kill-and-unbounded-wait path; a handler panic is a resolved
+terminal join outcome and is error-accounted. Cleanup contains no assertion,
+`unwrap`, or `expect` over external state. A contained operation panic returns
+`Generation` only after the same terminal protocol. If the outer supervisor
+itself nevertheless panics, `layout::run` joins and resumes that panic; it does
+not misreport cleanup-complete `Generation`. Chromiumoxide drop behavior is only
+last-resort unwind protection, not the claimed lifecycle.
 
-```text
-CLI parse
-  -> CorpusLocation validation
-  -> manifest parse and semantic validation
-  -> filter/source inventory and writable-namespace validation
-  -> optional read-only source verification
-  -> verified-source/writable-namespace disjointness validation
-  -> supported mutation-capability preflight
-  -> generation lease
-  -> optional browser/cache acquisition or source import
-  -> deterministic collection and domain generation
-  -> terminal browser/task/profile/acquisition-stage cleanup
-  -> classify clean, recoverable-diagnostic, or fatal outcome
-  -> one composite artifact/report/stale publication or no publication
-  -> success or semantic error
-```
+Mutation lifecycles are command-specific and closed:
 
-Manifest, source, filter, and unsupported-platform errors occur before the lease
-or writes. CSS validates manifest namespace separation, verifies the supplied
-CSSTree checkout read-only, validates its complete worktree/Git/object protection
-set against every prospective writable namespace, and only then snapshots it,
-performs capability preflight, and acquires the lease for import. Layout validates
-manifest acquisition inputs before the lease; its mutable browser/cache and
-Taffy sanitized bare-fetch work runs only after capability preflight and lease
-acquisition, followed by exact-pin verification and protection-set validation
-before destination writes. Every mutation-capable command follows this ordering.
-Generation and install errors retain failure provenance and follow the exact
-pre-commit, committed, recovery, and cleanup states in SG-09.
+- Layout validates request/location/manifest/filter and the static target, then
+  takes required cache guard(s), recovers/acquires or verifies each immutable
+  cache unit, and builds any Taffy snapshot. Only after cache transaction commit
+  does it take the corpus lease, repeat cache/source identity disjointness, create
+  a browser run/profile when needed, generate/clean resources, and perform one
+  corpus transaction. Release is corpus then cache. A cache remains durable if a
+  later corpus phase fails.
+- `import-csstree` follows SG-07.2's eight phases. The snapshot precedes the
+  exclusive `css` mutex; probe/source-identity failures after mutex acquisition
+  publish no corpus unit.
+- CSS `generate` may use a read-only preliminary inventory only to reject an
+  obvious filter miss. After taking the exclusive `css` mutex it authoritatively
+  reopens/recollects the complete import tree, rechecks `expected_files` and the
+  filter, duplicate-checks and interprets every JSON file, requires at least one
+  derived case per file, applies every override, and requires the complete case
+  count to equal `expected_cases`. Full and filtered generation validate the same
+  complete inventory; filtering selects outputs only afterward. A mismatch is
+  `InvalidInventory` before transaction intent.
+- Layout/CSS checks take shared locks in global order and remain read-only.
+  Persisted corpus defects map to `Verification`; `check-taffy-corpus` takes its
+  cache key shared before its corpus-domain shared lock.
+
+`import-csstree` validates the pinned Git/JSON snapshot and exact file count but
+does not interpret CSSTree cases or enforce `expected_cases`; that belongs to
+generation and offline corpus verification. Generation and install errors retain
+failure provenance and follow SG-09's exact construction, commit, recovery, and
+cleanup states.
 
 ## SG-11 Domain commands and thin binaries
 
@@ -1819,13 +2279,20 @@ inventory and fail on any unresolved probe, owner, transaction, or completed-
 tombstone state; they never recover it. A failing check reports the first
 deterministic violation and writes nothing.
 
+When a check inspects a browser/Taffy cache it first applies SG-10's read-only
+target gate/cache-key protocol, then the corpus shared-lock protocol below. It
+fails on any cache transaction, run intent, or completed tombstone and never
+creates/recovers cache coordination. Locks are released in reverse order.
+
 For a pre-existing exact coordination namespace, a check opens the immutable
 gate/mutex files read-only, validates their headers/identities, briefly takes the
 gate's shared advisory lock, then takes and holds the domain mutex's shared lock
 for the complete check before releasing the gate. Both acquisitions are
 nonblocking; contention releases what was acquired and returns `LeaseActive`.
 Mutation leases use exclusive locks, so verification observes one publication
-state without updating owner metadata. If coordination was absent at start, the check creates nothing and
+state without updating owner metadata. An existing `owner.json` is validated as
+historical audit only and is never described as the current contender. If
+coordination was absent at start, the check creates nothing and
 requires the exact name to remain absent at its final root-identity recheck; its
 later appearance returns `Verification`. If a valid coordination/gate exists but
 this domain has no mutex yet, the check holds the gate's shared lock for its whole
@@ -1843,8 +2310,11 @@ Shared-core tests shall prove:
 3. collection is sorted and rejects symlinks, special entries, and mount
    crossings;
 4. local Git verification accepts the exact clean revision and rejects prefixes,
-   wrong revisions, dirty/untracked state, wrong origins, and escaped source
-   roots; its recursively enumerated commit-tree snapshot includes fixtures below
+   wrong revisions, tree/blob/annotated-tag/peeled-tag pins, storage-format/pin-
+   length mismatch, dirty/untracked state, wrong origins, and escaped source
+   roots; absolute executable/exec-unit identity replacement and a PATH shadow
+   sentinel (including empty and relative PATH components) fail without running
+   the sentinel; its recursively enumerated commit-tree snapshot includes fixtures below
    nested directories, treats pathspec metacharacters literally, ignores a
    replacement ref, and retains pinned original blob bytes when checkout paths
    change afterward; a synthetic promisor repository with a locally missing blob
@@ -1858,8 +2328,8 @@ Shared-core tests shall prove:
    the test-only local acquisition transport fetches an exact object into a fresh
    bare stage while contaminated system/global/home/local config, templates,
    hooks, includes, URL rewrites, credentials, filters, askpass, proxies, and Git
-   environment sentinel programs remain unexecuted, and production rejects the
-   same file URL without network access;
+   environment sentinel programs remain unexecuted, auto-maintenance does not
+   run, and production rejects the same file URL without network access;
 5. dispositions require reasons exactly as SG-07 specifies, reject duplicate
    case IDs, accept repeated source paths for distinct case IDs, and return case-ID
    order;
@@ -1867,24 +2337,35 @@ Shared-core tests shall prove:
 7. full and filtered requests contend on one corpus lease, including two
    `CorpusLocation` values that use distinct valid canonical owner ancestors for
    the same canonical corpus; owner metadata records the selected owner
-   coherently, dropping releases the lease, and symlink, hard-link,
+   coherently as historical audit without ever being reported as the current
+   holder; a mutator contending with a check returns generic `LeaseActive`,
+   dropping releases the lease, and symlink, hard-link,
    unknown-header, owner-exchange collision, and coordination-component swaps
    observed before an atomic transition cannot redirect, overwrite, or truncate
    a lock or owner file; concurrent first acquisition publishes only complete
-   locked gate/mutex inodes, a race loser adopts the winner, and injected crashes
-   before and after `NOREPLACE` leave respectively only an unpublished stage or
-   a complete adoptable final—never an empty/partial poisoned final; plan install
+   locked gate/mutex inodes and journaled bootstrap intents, a race loser adopts
+   the winner, and injected crashes before/after stage identity, header sync, and
+   `RENAME_EXCL` recover only through the bootstrap intent or a complete adoptable
+   final—never an unjournaled/empty/partial poisoned final; plan install
    accepts only a still-live matching corpus/domain lease and rejects a released,
    foreign-domain, or foreign-corpus lease before probes or writes; read-only
    verification takes/contends on the shared gate/mutex without creating state,
-   and holds a pre-bootstrap shared gate for the complete check;
-8. artifact publication deterministically builds and syncs one complete staged
+   and holds a pre-bootstrap shared gate for the complete check. Two distinct
+   corpora sharing one canonical owner-target and cache unit derive the same
+   byte-exact cache key, contend on one key mutex, and recover only that key's
+   journal before either corpus mutex; alias target identities converge or fail;
+8. artifact publication creates/syncs intent and old sidecar before registering
+   an external stage, then deterministically builds and syncs one complete staged
    root, removes stale files only in a clean full staged state, and changes the
-   final namespace with exactly one root swap; injected failures before the swap
+   final namespace with exactly one root transition; injected process death after
+   active-directory creation, every metadata temporary write/sync/rename, stage
+   registration, mid-file/tree construction, prepared publication, and before the swap
    leave the complete old final, process termination immediately before/after the
    swap recovers respectively to old/new, and termination during aborted-stage,
    committed-old-stage, or completed-journal-tombstone cleanup resumes from the
-   exact recorded subset. Marker or old-stage cleanup failure after the swap
+   exact recorded subset. Active `cleanup-complete`, completed rename, every
+   metadata deletion, receipt deletion, and final `rmdir` are independently
+   resumed. Marker or old-stage cleanup failure after the swap
    preserves the complete new final plus a read-only-detectable journal that the
    next lease clears; no test expects rollback after commit and no observed state
    is a mixed generation. Descriptor-bound tests replace roots,
@@ -1896,12 +2377,15 @@ Shared-core tests shall prove:
    transaction names at all depths. Exact-parent case/normalization probes use
    different injected policies in a parent and child and reject only where the
    actual parent aliases the pair; injected macOS device/fsid changes stop
-   traversal;
+   traversal. Cache tests repeat the state matrix under the matching key guard,
+   verify immutable cache units publish only with `RENAME_EXCL`, reuse valid
+   units, reject invalid units without replacement, accept only the browser's
+   exact five link targets, and prove a corpus lease never recovers cache state;
 9. hash text validation and report counts/provenance detect drift, shared reports
    accept structurally valid failed/unsupported counts without fictitious
    artifacts while domain validators enforce their own artifact/count mapping,
    and every `GeneratorErrorKind` has the exact SG-12 exit code;
-10. an unjournaled stage/tombstone is rejected even when its final target is
+10. an unregistered external stage/tombstone is rejected even when its final target is
     absent; compile-time mutation selection is exactly
     `aarch64-apple-darwin`; every mutation entry point in the already-installed
     WASM nonmutation build fails before coordination/cache/import/artifact/report
@@ -1912,10 +2396,14 @@ Shared-core tests shall prove:
     private-probe cleanup;
 11. `tests/public_api.rs` type-checks the exact SG-03.4 root reexports,
     constructors, getters, free functions, operation signatures, enum variants,
-    explicit traits, and Serde round trips under default features; invalid public
-    API and raw-Serde values exercise every SG-03.4 identifier, case-ID, reason,
-    URL, revision, extension, count, provenance, and report invariant plus exact
-    constructor kind/context mapping, proving deserialization cannot bypass one;
+    and explicit traits. It asserts exact compact JSON bytes for every public
+    Serde type, including field order, `expected-fail`, omitted versus null
+    `reason`, sorted artifacts/provenance keys, and unsigned integer grammar. It
+    rejects repeated/unknown fields, wrong scalar kinds, exponent/fraction
+    spellings, per-field/aggregate overflow, zero `case_count`, noncanonical enum
+    spellings, and every SG-03.4 identifier, case-ID, reason, URL, revision,
+    extension, provenance, report, and constructor kind/context violation,
+    proving deserialization cannot bypass one;
     the layout,
     CSS, and combined feature test builds type-check the exact SG-03.3 driver
     additions, including request structs' private construction boundary and
@@ -1930,13 +2418,21 @@ measurements, and artifacts to prove:
    including a call made from a thread already inside a Tokio runtime without a
    nested-runtime panic;
 3. schema-2 parsing, unknown/duplicate and reserved-coordination overlap
-   rejection, manifest-derived Taffy pin, exact owner-relative browser/Taffy
-   cache derivation, and the complete cache/corpus/helper/HTML/XML namespace
-   matrix before acquisition;
+   rejection, the exact browser/launch fields and 28 arguments, content-pin row,
+   manifest-derived Taffy pin, exact owner-relative browser/Taffy cache derivation,
+   first-run persistent cache-family scaffolds, byte-exact cache keys, and the
+   complete cache/corpus/helper/HTML/XML namespace matrix before acquisition;
 4. helper/base-style loading and hashes from the supplied corpus;
-5. managed/existing browser validation through injected fetch/version boundaries
-   and sanitized fresh-bare Taffy acquisition through the local sentinel boundary,
-   without launching a browser, using the network, or checking out a worktree;
+5. managed/existing browser validation through injected download/ZIP/version
+   boundaries: exact retained top-level tree, logical content digest/counts,
+   executable path/mode, five links/modes/targets, archive CRC/size/trailing-data
+   rules, strict version stdout/stderr, and direct launch argv/environment/
+   DevTools parsing. Synthetic archives cover early links, descendants after
+   links, path escapes, duplicates/conflicts, cycles, special/hard-link modes,
+   corrupt CRC, limits, and a byte change that misses the content pin without
+   creating an outside sentinel. Sanitized fresh-bare Taffy acquisition crosses
+   only the local sentinel boundary, without launching a browser, using the
+   network, or checking out a worktree;
 6. representative XML shape, four variants, numeric formatting, layout fields,
    and unchanged generated-by provenance;
 7. disposition accounting, full/filtered isolation, and offline drift rejection;
@@ -1949,21 +2445,30 @@ measurements, and artifacts to prove:
 8. the planned/fetched Taffy bare cache and object store cannot overlap browser
    cache, import, artifact/report, helper/manifest, or coordination writes;
 9. injected fatal launch, unassigned-generation, browser-close, handler-join,
-   profile, and acquisition-stage failures, plus an injected operation panic
+   profile, cache-transaction, and acquisition-stage failures, plus an injected operation panic
    after all synthetic resources are registered, a successful close with delayed
-   child exit, a hung page close, and a hung handler return only after the
-   synthetic child is reaped, every handler is completed or aborted-and-joined,
-   the profile is removed or reported as a collision-safe residue, and a
+   child exit, a hung page close, and a hung handler exercise the exact 2/5-second
+   graceful deadlines, one kill/abort, and unbounded terminal wait. The test
+   proves the public call remains blocked past the forced grace interval, then
+   releases the synthetic resource and observes child reap and a resolved join.
+   Every handler is completed or aborted-and-joined, the profile is removed or
+   retained only with its durable run intent, and a
    distinct-owner contender can acquire the released same-corpus lease; the
    panic maps to `Generation`, no final artifact, stale output, or report changes,
-   and no detached-task counter remains. Item 7 separately covers recoverable
+   and no detached-task counter remains. Death after run intent, profile
+   registration, `launching`, child PID, `reaped`, profile cleanup, and run-
+   tombstone transitions proves that uncertain child state is preserved while
+   proven-reaped state resumes cleanup. Item 7 separately covers recoverable
    case-assigned page/measurement failures.
 
 CSS tests shall use official-shaped synthetic fixture JSON and local temporary Git
 repositories to prove:
 
-1. exact-pin snapshot import, deterministic JSON-only copying, post-verification
-   checkout-path swap immunity, count validation, and stale source removal;
+1. exact-pin snapshot import, deterministic JSON-only copying, a same-directory-
+   identity content change after snapshotting that cannot change imported bytes,
+   a protected-directory identity replacement before final revalidation that
+   returns `InvalidPath` and publishes nothing, count validation, and stale source
+   removal;
 2. the exact public request constructor/getter and synchronous `run` signatures;
 3. multiple ordinary and error-array cases from one JSON file, multiple
    disposition overrides for that same source, JSON Pointer IDs, sorted cases,
@@ -1972,22 +2477,28 @@ repositories to prove:
    members at the top-level ordinary label, ordinary `source`, `options`,
    `generate`, or `ast`, error-entry, and nested-options levels fail
    `InvalidInventory` before writes; escaped and literal duplicate-key spellings
-   collide;
+   collide. A zero-case fixture is accepted by import but rejected by full and
+   filtered generation as `InvalidInventory` and by offline checking as
+   `Verification`;
 5. equal and component-wise ancestor/descendant overlaps among import,
    expectation, manifest, and coordination namespaces fail with the specified
    `InvalidManifest` or `InvalidPath`, while the report accepts only its exact
-   required child position within expectation; failures occur before lease
-   acquisition or domain directory creation (only a cleaned private alias probe
-   is allowed). Case-folded and Unicode-normalized aliases receive the same
-   actual-parent matrix, including injected sibling directories with different
-   policies; a verified checkout equal to, above, or below every CSS
+   required child position within expectation. Exact-text, canonical, and
+   existing-descriptor conflicts fail in the read-only prefix before lease/
+   coordination creation; case-folded or Unicode-normalized aliases discovered
+   only by actual-parent probing fail while the exclusive `css` mutex is held and
+   leave only cleaned or durably journaled private probe state. Injected sibling
+   directories with different policies prove the split. A verified checkout
+   equal to, above, or below every CSS
    writable/coordination namespace fails with `InvalidPath` while leaving both
    the checkout and owner/corpus trees unchanged; linked-worktree administrative
    and common directories, primary object storage, and a recursively configured
    local alternate object store receive the same overlap matrix even when the
    canonical worktree root itself is textually disjoint, including an injected
    mount/path alias with matching descriptor ancestry;
-6. active/default and non-active reason accounting;
+6. active/default and non-active reason accounting, and one fixed `css` mutex on
+   which import/full/filtered generation contend exclusively while checking
+   contends shared;
 7. full generation publishes the complete expectation/report root and removes
    stale outputs at its single root-swap commit; pre-commit failures retain the
    old tree and post-commit cleanup failures retain the new tree plus journal;
