@@ -779,13 +779,50 @@ returns `VerifiedSource` only when:
    and linked worktrees;
 2. `git rev-parse HEAD` exactly equals the manifest revision, not merely a
    prefix;
-3. `git status --porcelain=v1 --untracked-files=all` is empty;
+3. the crate-private raw cleanliness proof below establishes that the index
+   equals the exact HEAD tree, every materialized tracked entry equals its index
+   blob and type, and no nonignored untracked path exists;
 4. `git remote get-url origin` exactly equals the manifest repository URL;
 5. the requested source subdirectory is a directory inside the canonical
    checkout without a symlink escape.
 
+The raw cleanliness proof never invokes `status`, `diff`, `add`, `hash-object`,
+checkout conversion, text conversion, or any clean/smudge/process filter. Using
+the sanitized runner, it obtains the exact HEAD inventory with
+`git ls-tree -r -z --full-tree <revision>`, the index inventory with
+`git ls-files --stage -z`, index visibility flags with `git ls-files -v -z`, and
+the nonignored untracked inventory with
+`git ls-files --others --exclude-standard -z`. It then enforces all of these
+conditions without asking Git to inspect tracked worktree contents:
+
+- HEAD and stage-zero index path, mode, and object-ID inventories are identical;
+  unmerged, intent-to-add, sparse-directory, gitlink, and non-UTF-8 entries fail
+  `SourceVerification`;
+- every visibility record is exactly the ordinary uppercase `H` tag for the
+  corresponding index path; skip-worktree, assume-unchanged, unmerged, removed,
+  modified-status, or unknown tags fail closed;
+- the untracked inventory is empty; repository-owned `.gitignore` and
+  `$GIT_DIR/info/exclude` rules remain honored, while the runner overrides
+  `core.excludesFile` to the platform null device so no external global exclude
+  file participates;
+- Rust opens each indexed worktree path directly beneath the canonical worktree
+  without following a component symlink. Regular-file bytes must exactly equal
+  the original index blob read by sanitized `cat-file`; on Unix the executable
+  bit class must also match `100644` versus `100755`. A `120000` entry must be a
+  filesystem symlink whose UTF-8 link-target bytes exactly equal its blob.
+  Missing, special, mismatched, or unsupported materialization fails
+  `SourceVerification`.
+
+This is deliberately stricter than Git's configurable conversion view. A
+checkout materialized through EOL, ident, clean, smudge, or process conversion
+is rejected when raw bytes differ; no configured program is executed to make it
+appear clean. Ignored untracked files and empty directories remain consistent
+with normal clean-worktree semantics.
+
 Verification performs no fetch, checkout, remote mutation, configuration change,
-or network access. Every Git subprocess uses one crate-private sanitized runner.
+or network access. Every Git subprocess used by shared verification or snapshot
+construction uses one crate-private sanitized read-only runner; layout's
+separately authorized acquisition commands do not use this restricted runner.
 It clears the inherited environment, preserves only `PATH` plus the Windows
 process-loader variables `SystemRoot`, `WINDIR`, and `PATHEXT` and temporary-path
 variables `TEMP` and `TMP` when those variables exist, sets `LC_ALL=C`, and sets
@@ -799,13 +836,18 @@ credential, transport, prompt, or trace override survives; with no `HOME` or
 Every invocation also supplies the equivalent explicit global options
 `--no-optional-locks --no-replace-objects --no-lazy-fetch
 --literal-pathspecs`, followed by `-c core.fsmonitor=false`,
-`-c core.untrackedCache=false`, and `-c submodule.recurse=false`, before the
-built-in subcommand. Repository-local configuration remains readable only where
-Git needs repository identity, but it cannot enable a filesystem-monitor helper,
-optional index update, replacement object, pathspec magic, submodule recursion,
-or promisor fetch. A Git version that does not accept the required global
-options fails closed as `SourceVerification`; the driver does not retry with a
-weaker invocation.
+`-c core.untrackedCache=false`, `-c core.attributesFile=<platform-null>`,
+`-c core.excludesFile=<platform-null>`, and `-c submodule.recurse=false`, before
+the built-in subcommand. The runner permits only the required `rev-parse`,
+`ls-tree`, `ls-files`, `remote get-url`, and `cat-file` operations.
+Repository-local configuration remains readable only where Git needs repository
+identity, but it cannot enable a filesystem-monitor helper, external attributes
+or excludes, optional index update, replacement object, pathspec magic,
+submodule recursion, or promisor fetch. Because none of the permitted operations
+requests Git worktree conversion, repository-local filter, diff, textconv, and
+credential commands are inert. A Git version that does not accept the required
+global options fails closed as `SourceVerification`; the driver does not retry
+with a weaker invocation.
 
 `VerifiedSource` retains the canonical worktree root and exact revision and
 cannot be constructed publicly without verification. It also privately retains
@@ -1274,7 +1316,11 @@ Shared-core tests shall prove:
    change afterward; a synthetic promisor repository with a locally missing blob
    fails without reading its available local promisor remote or repopulating the
    object store, and linked-worktree/common/object plus recursive alternate
-   protection paths are resolved canonically;
+   protection paths are resolved canonically; a tracked `.gitattributes` plus
+   repository-configured clean/process sentinel filter is never executed by the
+   raw HEAD/index/worktree cleanliness proof, verification leaves the complete
+   source/Git tree unchanged, and raw filtered-byte mismatch, skip-worktree,
+   assume-unchanged, index/tree drift, and nonignored untracked paths fail closed;
 5. dispositions require reasons exactly as SG-07 specifies, reject duplicate
    case IDs, accept repeated source paths for distinct case IDs, and return case-ID
    order;
