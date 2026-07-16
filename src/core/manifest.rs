@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{DeserializeOwned, Visitor},
+};
 
 use crate::{GeneratorError, GeneratorErrorKind, Result};
 
@@ -56,8 +59,33 @@ impl<'de> Deserialize<'de> for ManifestVersion {
     where
         D: Deserializer<'de>,
     {
-        let value = u64::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
+        struct ManifestVersionVisitor;
+
+        impl Visitor<'_> for ManifestVersionVisitor {
+            type Value = ManifestVersion;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a positive unsigned manifest version")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                ManifestVersion::new(value).map_err(|error| E::custom(error.serde_message()))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let value = u64::try_from(value)
+                    .map_err(|_| E::custom("InvalidManifest: schema_version must be positive"))?;
+                ManifestVersion::new(value).map_err(|error| E::custom(error.serde_message()))
+            }
+        }
+
+        deserializer.deserialize_u64(ManifestVersionVisitor)
     }
 }
 

@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Visitor};
 use sha2::{Digest, Sha256};
 
 use crate::{GeneratorError, GeneratorErrorKind, Result};
@@ -89,8 +89,31 @@ impl<'de> Deserialize<'de> for Sha256Digest {
     where
         D: Deserializer<'de>,
     {
-        let value = String::deserialize(deserializer)?;
-        Self::from_text(value).map_err(serde::de::Error::custom)
+        struct DigestVisitor;
+
+        impl Visitor<'_> for DigestVisitor {
+            type Value = Sha256Digest;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a canonical lowercase SHA-256 string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Sha256Digest::from_text(value).map_err(|error| E::custom(error.serde_message()))
+            }
+
+            fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Sha256Digest::from_text(value).map_err(|error| E::custom(error.serde_message()))
+            }
+        }
+
+        deserializer.deserialize_str(DigestVisitor)
     }
 }
 

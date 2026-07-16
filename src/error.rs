@@ -13,6 +13,7 @@ pub enum GeneratorErrorKind {
     InvalidManifest,
     InvalidInventory,
     SourceVerification,
+    UnsupportedPlatform,
     LeaseActive,
     Process,
     Io,
@@ -71,18 +72,23 @@ impl GeneratorError {
     #[must_use]
     pub const fn exit_code(&self) -> u8 {
         match self.kind {
-            GeneratorErrorKind::Cli
-            | GeneratorErrorKind::InvalidPath
+            GeneratorErrorKind::Cli => 64,
+            GeneratorErrorKind::InvalidPath
             | GeneratorErrorKind::InvalidManifest
             | GeneratorErrorKind::InvalidInventory
-            | GeneratorErrorKind::SourceVerification => 2,
-            GeneratorErrorKind::LeaseActive => 3,
-            GeneratorErrorKind::Process
+            | GeneratorErrorKind::SourceVerification
+            | GeneratorErrorKind::UnsupportedPlatform
+            | GeneratorErrorKind::LeaseActive
+            | GeneratorErrorKind::Process
             | GeneratorErrorKind::Io
             | GeneratorErrorKind::ArtifactTransaction
-            | GeneratorErrorKind::Generation => 4,
-            GeneratorErrorKind::Verification => 5,
+            | GeneratorErrorKind::Generation
+            | GeneratorErrorKind::Verification => 1,
         }
+    }
+
+    pub(crate) fn serde_message(&self) -> String {
+        format!("{:?}: {self}", self.kind)
     }
 }
 

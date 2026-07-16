@@ -1,12 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{MapAccess, Visitor},
+};
 
 use crate::{
     GeneratorError, GeneratorErrorKind, ManifestVersion, RelativePath, Result, Sha256Digest,
     SourceRevision,
 };
+
+use super::{validate_identifier, validate_repository_url};
 
 /// Shared provenance attached to one generated artifact.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -27,17 +32,17 @@ impl ArtifactProvenance {
         domain_provenance: BTreeMap<String, Sha256Digest>,
     ) -> Result<Self> {
         let generator = generator.into();
-        if generator.is_empty() || generator.trim() != generator || generator.contains('\0') {
+        if !validate_identifier(&generator) {
             return Err(invalid_report(
-                "generator name must be nonempty and trimmed",
+                "generator name is not a canonical identifier",
             ));
         }
         if domain_provenance
             .keys()
-            .any(|key| key.is_empty() || key.trim() != key || key.contains('\0'))
+            .any(|key| !validate_identifier(key))
         {
             return Err(invalid_report(
-                "domain provenance keys must be nonempty and trimmed",
+                "domain provenance key is not a canonical identifier",
             ));
         }
         Ok(Self {
@@ -87,7 +92,7 @@ impl<'de> Deserialize<'de> for ArtifactProvenance {
             source_digest: Sha256Digest,
             generator: String,
             schema_version: ManifestVersion,
-            domain_provenance: BTreeMap<String, Sha256Digest>,
+            domain_provenance: CheckedProvenanceMap,
         }
 
         let raw = RawProvenance::deserialize(deserializer)?;
@@ -96,9 +101,9 @@ impl<'de> Deserialize<'de> for ArtifactProvenance {
             raw.source_digest,
             raw.generator,
             raw.schema_version,
-            raw.domain_provenance,
+            raw.domain_provenance.0,
         )
-        .map_err(serde::de::Error::custom)
+        .map_err(|error| serde::de::Error::custom(error.serde_message()))
     }
 }
 
@@ -112,19 +117,23 @@ pub struct ReportArtifact {
 }
 
 impl ReportArtifact {
-    #[must_use]
-    pub const fn new(
+    pub fn new(
         provenance: ArtifactProvenance,
         output_path: RelativePath,
         output_digest: Sha256Digest,
         case_count: usize,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        if case_count == 0 || case_count > u32::MAX as usize {
+            return Err(invalid_count(
+                "report artifact case_count must be 1 through u32::MAX",
+            ));
+        }
+        Ok(Self {
             provenance,
             output_path,
             output_digest,
             case_count,
-        }
+        })
     }
 
     #[must_use]
@@ -159,22 +168,24 @@ impl<'de> Deserialize<'de> for ReportArtifact {
             provenance: ArtifactProvenance,
             output_path: RelativePath,
             output_digest: Sha256Digest,
-            case_count: usize,
+            case_count: u64,
         }
 
         let raw = RawArtifact::deserialize(deserializer)?;
-        Ok(Self::new(
+        let case_count = usize::try_from(raw.case_count)
+            .map_err(|_| serde::de::Error::custom("InvalidInventory: case_count overflow"))?;
+        Self::new(
             raw.provenance,
             raw.output_path,
             raw.output_digest,
-            raw.case_count,
-        ))
+            case_count,
+        )
+        .map_err(|error| serde::de::Error::custom(error.serde_message()))
     }
 }
 
 /// Exact disposition and failure counts for a full generation report.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct GenerationCounts {
     active: usize,
     expected_fail: usize,
@@ -184,30 +195,56 @@ pub struct GenerationCounts {
 }
 
 impl GenerationCounts {
-    #[must_use]
-    pub const fn new(
+    pub fn new(
         active: usize,
         expected_fail: usize,
         unsupported: usize,
         quarantined: usize,
         failed_to_generate: usize,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let values = [
             active,
             expected_fail,
             unsupported,
             quarantined,
             failed_to_generate,
+        ];
+        if values.iter().any(|value| *value > u32::MAX as usize)
+            || values
+                .iter()
+                .try_fold(0_u64, |total, value| total.checked_add(*value as u64))
+                .is_none_or(|total| total > u64::from(u32::MAX))
+        {
+            return Err(invalid_count(
+                "generation count exceeds the portable u32 bound",
+            ));
         }
+        Ok(Self {
+            active,
+            expected_fail,
+            unsupported,
+            quarantined,
+            failed_to_generate,
+        })
     }
 
     pub fn total(self) -> Result<usize> {
-        self.active
-            .checked_add(self.expected_fail)
-            .and_then(|value| value.checked_add(self.unsupported))
-            .and_then(|value| value.checked_add(self.quarantined))
-            .and_then(|value| value.checked_add(self.failed_to_generate))
-            .ok_or_else(|| invalid_report("generation count overflow"))
+        let total = [
+            self.active,
+            self.expected_fail,
+            self.unsupported,
+            self.quarantined,
+            self.failed_to_generate,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |total, value| total.checked_add(value as u64))
+        .ok_or_else(|| invalid_count("generation count overflow"))?;
+        if total > u64::from(u32::MAX) {
+            return Err(invalid_count(
+                "generation count exceeds the portable u32 bound",
+            ));
+        }
+        usize::try_from(total).map_err(|_| invalid_count("generation count is not representable"))
     }
 
     #[must_use]
@@ -255,14 +292,14 @@ impl GenerationReport {
         mut artifacts: Vec<ReportArtifact>,
     ) -> Result<Self> {
         let source_repository = source_repository.into();
-        if source_repository.is_empty()
-            || source_repository.trim() != source_repository
-            || source_repository.contains('\0')
-        {
-            return Err(invalid_report(
-                "source repository must be nonempty and trimmed",
+        if !validate_repository_url(&source_repository) {
+            return Err(GeneratorError::new(
+                GeneratorErrorKind::SourceVerification,
+                "validate generation report source",
+                "source repository URL is not canonical HTTPS Git",
             ));
         }
+        counts.total()?;
         artifacts.sort_by(|left, right| left.output_path.cmp(&right.output_path));
         let mut outputs = BTreeSet::new();
         for artifact in &artifacts {
@@ -272,17 +309,6 @@ impl GenerationReport {
                     artifact.output_path.as_str()
                 )));
             }
-        }
-        let artifact_cases = artifacts.iter().try_fold(0_usize, |total, artifact| {
-            total
-                .checked_add(artifact.case_count)
-                .ok_or_else(|| invalid_report("artifact case count overflow"))
-        })?;
-        if artifact_cases != counts.total()? {
-            return Err(invalid_report(format!(
-                "artifact case count {artifact_cases} does not equal report count {}",
-                counts.total()?
-            )));
         }
         Ok(Self {
             manifest_digest,
@@ -363,7 +389,79 @@ impl<'de> Deserialize<'de> for GenerationReport {
             raw.counts,
             raw.artifacts,
         )
-        .map_err(serde::de::Error::custom)
+        .map_err(|error| serde::de::Error::custom(error.serde_message()))
+    }
+}
+
+impl<'de> Deserialize<'de> for GenerationCounts {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawCounts {
+            active: u64,
+            expected_fail: u64,
+            unsupported: u64,
+            quarantined: u64,
+            failed_to_generate: u64,
+        }
+
+        let raw = RawCounts::deserialize(deserializer)?;
+        let convert = |value: u64| {
+            usize::try_from(value)
+                .map_err(|_| serde::de::Error::custom("InvalidInventory: count overflow"))
+        };
+        Self::new(
+            convert(raw.active)?,
+            convert(raw.expected_fail)?,
+            convert(raw.unsupported)?,
+            convert(raw.quarantined)?,
+            convert(raw.failed_to_generate)?,
+        )
+        .map_err(|error| serde::de::Error::custom(error.serde_message()))
+    }
+}
+
+struct CheckedProvenanceMap(BTreeMap<String, Sha256Digest>);
+
+impl<'de> Deserialize<'de> for CheckedProvenanceMap {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ProvenanceMapVisitor;
+
+        impl<'de> Visitor<'de> for ProvenanceMapVisitor {
+            type Value = CheckedProvenanceMap;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a domain-provenance object with unique identifier keys")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut values = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, Sha256Digest>()? {
+                    if !validate_identifier(&key) {
+                        return Err(serde::de::Error::custom(
+                            "Verification: invalid domain-provenance identifier",
+                        ));
+                    }
+                    if values.insert(key, value).is_some() {
+                        return Err(serde::de::Error::custom(
+                            "Verification: duplicate domain-provenance key",
+                        ));
+                    }
+                }
+                Ok(CheckedProvenanceMap(values))
+            }
+        }
+
+        deserializer.deserialize_map(ProvenanceMapVisitor)
     }
 }
 
@@ -384,8 +482,16 @@ fn verify_digest(expected: &Sha256Digest, path: &Path, label: &str) -> Result<()
 
 fn invalid_report(detail: impl Into<String>) -> GeneratorError {
     GeneratorError::new(
-        GeneratorErrorKind::InvalidInventory,
+        GeneratorErrorKind::Verification,
         "validate generation report",
+        detail,
+    )
+}
+
+fn invalid_count(detail: impl Into<String>) -> GeneratorError {
+    GeneratorError::new(
+        GeneratorErrorKind::InvalidInventory,
+        "validate generation counts",
         detail,
     )
 }
@@ -443,18 +549,21 @@ mod tests {
                 Sha256Digest::from_file(root.join("manifest.toml")).expect("manifest digest"),
                 "https://example.invalid/source.git",
                 revision(),
-                GenerationCounts::new(1, 0, 0, 0, 0),
-                vec![ReportArtifact::new(
-                    provenance,
-                    RelativePath::new(output_path).expect("output path"),
-                    Sha256Digest::from_file(if output_path.starts_with("escape/") {
-                        outside.join("output.json")
-                    } else {
-                        root.join("output.json")
-                    })
-                    .expect("output digest"),
-                    1,
-                )],
+                GenerationCounts::new(1, 0, 0, 0, 0).expect("counts"),
+                vec![
+                    ReportArtifact::new(
+                        provenance,
+                        RelativePath::new(output_path).expect("output path"),
+                        Sha256Digest::from_file(if output_path.starts_with("escape/") {
+                            outside.join("output.json")
+                        } else {
+                            root.join("output.json")
+                        })
+                        .expect("output digest"),
+                        1,
+                    )
+                    .expect("artifact"),
+                ],
             )
             .expect("valid report")
         };
@@ -507,22 +616,22 @@ mod tests {
             RelativePath::new("output.json").expect("output path"),
             Sha256Digest::from_file(root.join("output.json")).expect("output digest"),
             1,
-        );
-        assert!(
-            GenerationReport::new(
-                Sha256Digest::from_file(root.join("manifest.toml")).expect("manifest digest"),
-                "https://example.invalid/source.git",
-                revision(),
-                GenerationCounts::new(2, 0, 0, 0, 0),
-                vec![artifact.clone()],
-            )
-            .is_err()
-        );
+        )
+        .expect("artifact");
+        let structurally_distinct_counts = GenerationReport::new(
+            Sha256Digest::from_file(root.join("manifest.toml")).expect("manifest digest"),
+            "https://example.invalid/source.git",
+            revision(),
+            GenerationCounts::new(2, 0, 0, 0, 0).expect("counts"),
+            vec![artifact.clone()],
+        )
+        .expect("artifact cases need not equal structural report counts");
+        assert_eq!(structurally_distinct_counts.counts().total().unwrap(), 2);
         let report = GenerationReport::new(
             Sha256Digest::from_file(root.join("manifest.toml")).expect("manifest digest"),
             "https://example.invalid/source.git",
             revision(),
-            GenerationCounts::new(1, 0, 0, 0, 0),
+            GenerationCounts::new(1, 0, 0, 0, 0).expect("counts"),
             vec![artifact],
         )
         .expect("valid report");

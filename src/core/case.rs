@@ -1,13 +1,12 @@
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Visitor};
 
 use crate::{GeneratorError, GeneratorErrorKind, RelativePath, Result};
 
 /// Manifest disposition for a generated case.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-#[serde(rename_all = "kebab-case")]
 pub enum CaseDisposition {
     Active,
     ExpectedFail,
@@ -33,8 +32,10 @@ impl CaseDispositionRecord {
         reason: Option<impl Into<String>>,
     ) -> Result<Self> {
         let case_id = case_id.into();
-        if case_id.is_empty() || case_id.trim() != case_id || case_id.contains('\0') {
-            return Err(invalid_inventory("case ID must be nonempty, trimmed UTF-8"));
+        if !validate_case_id(&case_id) {
+            return Err(invalid_inventory(
+                "case ID does not match the canonical grammar",
+            ));
         }
         let reason = reason.map(Into::into);
         match disposition {
@@ -46,7 +47,7 @@ impl CaseDispositionRecord {
             | CaseDisposition::Quarantined => {
                 if reason
                     .as_deref()
-                    .is_none_or(|value| value.is_empty() || value.trim() != value)
+                    .is_none_or(|value| !validate_reason(value))
                 {
                     return Err(invalid_inventory(
                         "non-active case must have a nonempty trimmed reason",
@@ -100,16 +101,15 @@ impl<'de> Deserialize<'de> for CaseDispositionRecord {
 
         let raw = RawRecord::deserialize(deserializer)?;
         Self::new(raw.case_id, raw.source_path, raw.disposition, raw.reason)
-            .map_err(serde::de::Error::custom)
+            .map_err(|error| serde::de::Error::custom(error.serde_message()))
     }
 }
 
-/// Validates unique case and source identities and returns deterministic ordering.
+/// Validates unique case identities and returns deterministic case-ID ordering.
 pub fn validate_disposition_records(
     mut records: Vec<CaseDispositionRecord>,
 ) -> Result<Vec<CaseDispositionRecord>> {
     let mut case_ids = BTreeSet::new();
-    let mut sources = BTreeSet::new();
     for record in &records {
         if !case_ids.insert(record.case_id.clone()) {
             return Err(invalid_inventory(format!(
@@ -117,19 +117,103 @@ pub fn validate_disposition_records(
                 record.case_id
             )));
         }
-        if !sources.insert(record.source_path.clone()) {
-            return Err(invalid_inventory(format!(
-                "duplicate case source: {}",
-                record.source_path.as_str()
-            )));
+    }
+    records.sort_by(|left, right| left.case_id.cmp(&right.case_id));
+    Ok(records)
+}
+
+impl Serialize for CaseDisposition {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::Active => "active",
+            Self::ExpectedFail => "expected-fail",
+            Self::Unsupported => "unsupported",
+            Self::Quarantined => "quarantined",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for CaseDisposition {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct DispositionVisitor;
+
+        impl Visitor<'_> for DispositionVisitor {
+            type Value = CaseDisposition;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a canonical case-disposition string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "active" => Ok(CaseDisposition::Active),
+                    "expected-fail" => Ok(CaseDisposition::ExpectedFail),
+                    "unsupported" => Ok(CaseDisposition::Unsupported),
+                    "quarantined" => Ok(CaseDisposition::Quarantined),
+                    _ => Err(E::custom("InvalidInventory: noncanonical case disposition")),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(DispositionVisitor)
+    }
+}
+
+fn validate_case_id(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 4096
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+        || value.contains('\\')
+    {
+        return false;
+    }
+    let mut parts = value.split('#');
+    let Some(path) = parts.next() else {
+        return false;
+    };
+    let suffix = parts.next();
+    if parts.next().is_some() || RelativePath::new(path).is_err() {
+        return false;
+    }
+    let Some(pointer) = suffix else {
+        return true;
+    };
+    if !pointer.is_empty() && !pointer.starts_with('/') {
+        return false;
+    }
+    let bytes = pointer.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'~' {
+            if bytes
+                .get(index + 1)
+                .is_none_or(|next| !matches!(next, b'0' | b'1'))
+            {
+                return false;
+            }
+            index += 2;
+        } else {
+            index += 1;
         }
     }
-    records.sort_by(|left, right| {
-        left.case_id
-            .cmp(&right.case_id)
-            .then_with(|| left.source_path.cmp(&right.source_path))
-    });
-    Ok(records)
+    true
+}
+
+fn validate_reason(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 2048
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
 }
 
 fn invalid_inventory(detail: impl Into<String>) -> GeneratorError {
@@ -150,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn dispositions_require_reasons_exactly_and_reject_duplicates() {
+    fn dispositions_require_reasons_reject_duplicate_ids_and_accept_repeated_sources() {
         assert!(
             CaseDispositionRecord::new(
                 "active",
@@ -209,6 +293,9 @@ mod tests {
             Some("isolated"),
         )
         .expect("duplicate source record");
-        assert!(validate_disposition_records(vec![first_source, duplicate_source]).is_err());
+        let records = validate_disposition_records(vec![duplicate_source, first_source])
+            .expect("distinct case IDs may share one source path");
+        assert_eq!(records[0].case_id(), "first");
+        assert_eq!(records[1].case_id(), "second");
     }
 }
