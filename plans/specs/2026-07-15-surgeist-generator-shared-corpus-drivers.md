@@ -85,21 +85,16 @@ The inline layout tests beginning at source line 4627 are not part of the copy.
 They remain owned and preserved by `surgeist-layout`. Generator-owned behavior
 shall receive focused synthetic tests in this repository.
 
-Copy-first is a distinct, auditable implementation step. Before changing any
-copied byte or introducing the refactored generator modules, one standalone
-implementation commit shall add only the production prefix as the tracked file
-`src/layout/legacy_generator.rs`. That file shall contain exactly source lines
-1 through 4626, including their final newline, and shall have SHA-256
+Before transformation, the production prefix shall exist as the transient
+tracked file `src/layout/legacy_generator.rs`. It contains exactly source lines
+1 through 4626, including their final newline, and has SHA-256
 `d2f5ca87cea6b36826e9172e2d7ba7a99196c375e2ca53f8a84a075200e70a9f`.
-The cycle evidence shall record the copy commit SHA, its parent SHA, the source
-commit and path above, the destination path, a byte-for-byte comparison result,
-and a name-status diff proving that the destination is the commit's only file
-change. The file remains deliberately unreferenced at this step, so the copy is
-not transformed as a side effect of making it compile. A later reviewed task may
-split, adapt, and remove the transient legacy file while preserving behavior in
-the final modules. This exemption applies only to that identified production
-prefix; all other layout and CSS source, tests, manifests, corpora, helpers, and
-artifacts remain prohibited from copying.
+Audit evidence preserves the authoritative source revision/path, destination,
+digest, and byte-comparison result. The copy remains deliberately unreferenced
+until transformation, then may be split, adapted, and removed while preserving
+behavior in the final modules. This exemption applies only to that identified
+production prefix; all other layout and CSS source, tests, manifests, corpora,
+helpers, and artifacts remain prohibited from copying.
 
 ### SG-02.3 CSS fixture evidence
 
@@ -203,10 +198,9 @@ it is a shared lifecycle dependency, not a domain or default feature switch.
 
 All named dependency sources, including `rustix` 1.1.4, are already present in
 the local Cargo registry. `Cargo.lock` is already tracked and `.gitignore` does
-not ignore it. The task that first adds `rustix` runs exactly one unlocked
-resolution command, `cargo generate-lockfile --offline`, commits the resulting
-lockfile, and then uses `--locked --offline` for every check and test. No
-dependency acquisition occurs.
+not ignore it. The final lockfile resolves the exact manifest entirely from the
+local cache and is committed before the locked verification matrix. No dependency
+acquisition occurs; the current cycle plan owns lockfile-refresh mechanics.
 
 ### SG-03.3 Public front door
 
@@ -454,10 +448,30 @@ Verification performs no fetch, checkout, remote mutation, configuration change,
 or network access. `VerifiedSource` retains the canonical root and exact revision
 and cannot be constructed publicly without verification.
 
+Imports never reread fixture bytes from mutable checkout pathnames after this
+verification. The shared source module immediately builds an internal immutable
+`VerifiedSourceSnapshot` from the pinned commit tree: `git ls-tree -rz
+--full-tree <revision> -- <source-subdirectory>` must enumerate only regular blob
+modes beneath the declared subdirectory, and `git cat-file blob <object-id>`
+supplies each file's bytes. Paths are normalized and sorted; blob object IDs,
+bytes, and SHA-256 digests are retained in memory. Symlink, submodule, tree,
+escaped, duplicate, non-UTF-8, and wrong-extension entries fail. Installed Git
+runs with optional locks disabled and never writes an object or index. The
+snapshot type and Git object details are crate-private; public provenance exposes
+only the exact source revision, normalized path, and SHA-256 digest.
+
+CSS constructs this snapshot after the clean worktree/origin/HEAD check and
+before capability preflight, then imports only retained snapshot bytes after the
+lease. A checkout path change after snapshot creation cannot alter imported
+bytes. Layout acquisition occurs beneath its lease; after checkout and exact-pin
+verification it uses the same commit-tree snapshot for Taffy import. Expected
+file counts are checked against the snapshot before any corpus mutation.
+
 The layout `import-taffy` command retains its existing explicitly
 acquisition-capable fetch/checkout behavior in domain code after the SG-10
 capability preflight and lease, then passes the result through this verifier. No
 test or verification gate invokes that command.
+
 CSS `import-csstree` never acquires a source: it requires
 `--source-root <path>` and verifies that user-supplied checkout.
 
@@ -496,9 +510,9 @@ same accounting to derived neutral cases.
 
 ### SG-07.2 CSSTree ingestion
 
-`import-csstree` verifies and inventories the supplied checkout read-only,
-performs the SG-10 capability preflight, acquires the lease, and only then
-atomically mirrors those JSON bytes beneath the CSS-owned
+`import-csstree` verifies and snapshots the pinned commit-tree JSON blobs
+read-only, performs the SG-10 capability preflight, acquires the lease, and only
+then atomically mirrors those retained snapshot bytes beneath the CSS-owned
 `import_root`. It preserves relative paths, rejects all non-JSON and special
 entries, checks the exact source-file count, and removes stale imported JSON only
 as part of a successful complete import transaction. It writes no expectations
@@ -582,22 +596,40 @@ descriptor is public.
 
 Safe descriptor-relative mutation is unavailable from this implementation on
 every target other than Linux and macOS, including other `cfg(unix)` targets.
-`ArtifactPlan` construction and `GenerationLease` acquisition therefore fail
-with `UnsupportedPlatform` before creating, opening for write, or changing any
-file. Read-only manifest, inventory, hash, provenance, and corpus checks remain
-portable. The binaries compile on unsupported targets and report the semantic
-failure; operator documentation states this exact target boundary.
+Those targets fail with `UnsupportedPlatform` before creating or opening any
+coordination, cache, import, artifact, or report path for write. Read-only
+manifest, inventory, hash, provenance, and corpus checks remain portable. The
+binaries compile on unsupported targets and report the semantic failure;
+operator documentation states this exact target boundary.
 
-Every destination-sensitive filesystem transition is atomic with respect to
-name collisions and inode aliases. New files use exclusive descriptor-relative
-create. Backup and install renames use `renameat_with` with `NOREPLACE`; rollback
-restores use the same no-replace rule. Removal of an existing file or empty
-directory first exchanges it with a unique transaction-owned tombstone, verifies
-the displaced object's already-open descriptor identity, link count, and type,
-then unlinks the verified tombstone. A mismatch is exchanged back without
-overwriting either name and aborts. Existing lock metadata uses the analogous
-exchange protocol described in SG-10. No check-then-plain-rename, in-place
-truncate, or path-based remove is mutation authority.
+Supported Linux requires runtime `renameat2` `NOREPLACE` and `EXCHANGE`; macOS
+requires `renameatx_np` with the equivalent flags. Before a mutation-capable
+command acquires its lease or changes domain state, a descriptor-rooted private
+probe beneath `<owner-root>/target/surgeist-generator/` creates two exclusive
+files, exercises both flags, and removes them. `ENOSYS`, `EINVAL`, or
+`EOPNOTSUPP` maps to `UnsupportedPlatform`; probe residue is best-effort removed
+and reported, and no cache, import, artifact, or report mutation follows. Direct
+`ArtifactPlan::install` performs the same probe inside its output root before it
+backs up or installs a final target.
+
+The transaction namespace has an explicit exclusivity contract. The output and
+coordination roots are generator-owned, and callers must not mutate them outside
+this generator while a generation lease is held. Cooperating generator processes
+obey that lease. Pre-existing names, links, special entries, and residue remain
+untrusted and are rejected. A non-cooperating same-user process that rewrites
+names after lease acquisition is outside the supported contract; descriptor
+rooting still prevents an ancestor rename from escaping the held root, but the
+generator does not claim a conditional-unlink primitive the OS does not provide.
+
+Within that exclusive namespace, every destination transition is collision-safe.
+New files use exclusive descriptor-relative create. Backup, install, and rollback
+renames use `renameat_with(NOREPLACE)`. Existing targets must be regular and
+single-link before backup. Cleanup moves the already-verified object to a unique
+transaction tombstone without replacement, rechecks the moved descriptor, then
+unlinks it. An observed identity/type/link mismatch leaves the disputed tombstone
+untouched, returns a terminal transaction error, and never deletes the disputed
+inode. No check-then-plain-rename, in-place truncate, or unrooted remove is
+mutation authority.
 
 Installation follows one transaction:
 
@@ -782,7 +814,7 @@ No binary remaps a semantic error independently.
 | TOML parse, version, or field contract | `InvalidManifest` | No corpus mutation |
 | Count, duplicate, unmatched override, or malformed CSSTree case | `InvalidInventory` | No artifact/report mutation |
 | Wrong/dirty Git source or origin | `SourceVerification` | No import mutation |
-| Mutation-capable command outside Linux/macOS | `UnsupportedPlatform` | No filesystem write or write-open |
+| Unsupported target or missing required rename flags | `UnsupportedPlatform` | No cache/import/artifact/report mutation; private probe cleanup only |
 | Contended generation lease | `LeaseActive` | No corpus mutation |
 | Git/browser subprocess failure | `Process` | Domain cleanup; no stale pruning |
 | Read/write/canonicalize failure | `Io` | Transaction rollback where applicable |
@@ -817,24 +849,30 @@ Shared-core tests shall prove:
 2. corpus locations reject roots outside the owner;
 3. collection is sorted and rejects symlinks/special entries;
 4. local Git verification accepts the exact clean revision and rejects prefixes,
-   wrong revisions, dirty/untracked state, wrong origins, and escaped source roots;
+   wrong revisions, dirty/untracked state, wrong origins, and escaped source
+   roots; its commit-tree snapshot retains pinned blob bytes when checkout paths
+   change afterward;
 5. dispositions require reasons exactly as SG-07 specifies and reject duplicates;
 6. filtered scope cannot authorize report or stale-output operations;
 7. full and filtered requests contend on one corpus lease, owner metadata is
    coherent, dropping releases the lease, and symlink, hard-link, unknown-header,
-   post-check alias, and coordination-component swaps cannot redirect, overwrite,
-   or truncate a lock or owner file;
+   owner-exchange collision, and coordination-component swaps observed before an
+   atomic transition cannot redirect, overwrite, or truncate a lock or owner
+   file;
 8. artifact installation is deterministic, replaces atomically, removes stale
    files only when authorized, and restores every prior file after injected
-   staging, installation, or cleanup failure; descriptor-bound race tests swap
-   roots, components, and destination names after pre-checks at each mutation
-   boundary without escape, overwrite, or removal of the colliding inode;
+   staging, installation, or cleanup failure; descriptor-bound tests replace
+   roots, components, and destination names before each atomic transition and
+   prove no escape, overwrite, or removal of a colliding inode under the SG-09
+   exclusive-namespace contract;
 9. hash text validation and report counts/provenance detect drift, and every
    `GeneratorErrorKind` has the exact SG-12 exit code;
 10. a residual deterministic backup is rejected even when its final target is
     absent; compile-time target selection is exactly Linux/macOS; every
-    mutation-capable entry point on other targets fails before a write-open,
-    coordination file, cache, import, artifact, or report mutation.
+    mutation-capable entry point on other targets fails before a coordination,
+    cache, import, artifact, or report mutation; supported-target probe failure
+    leaves no domain mutation and reports any probe residue; test documentation
+    states that non-cooperating namespace mutation while leased is unsupported.
 
 Layout tests shall use synthetic temporary manifests, helpers, HTML, JSON
 measurements, and artifacts to prove:
@@ -853,8 +891,8 @@ measurements, and artifacts to prove:
 CSS tests shall use official-shaped synthetic fixture JSON and local temporary Git
 repositories to prove:
 
-1. exact-pin import, deterministic JSON-only copying, count validation, and stale
-   source removal;
+1. exact-pin snapshot import, deterministic JSON-only copying, post-verification
+   checkout-path swap immunity, count validation, and stale source removal;
 2. the exact public request constructor/getter and synchronous `run` signatures;
 3. ordinary and error-array flattening, JSON Pointer IDs, sorted cases, options,
    canonical CSS, and omission of AST/error/offset data;
