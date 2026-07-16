@@ -8,10 +8,15 @@
 - Cycle base: `a8b8c6d1cbfe0480ca11a5d5f530ae5b06572412`.
 - Reviewed semantic pair at exact commit
   `d3b3f8a783d7adfa2e0584af4a1f2f999c0bd0d4`, review `CLEAN`:
-  - main SG-01–SG-14, SHA-256
+  - `plans/specs/2026-07-15-surgeist-generator-shared-corpus-drivers.md`,
+    SG-01–SG-14, SHA-256
     `a672526df3d703419cfb0adf971405c6780b67dd78ceaece5ab3fc813cb22adc`;
-  - normative SG-13.2 companion, SHA-256
+  - `plans/specs/2026-07-15-surgeist-generator-focused-verification.md`,
+    normative SG-13.2 companion, SHA-256
     `a8db3583cca978eaa6154977bb12e4e7601076b1a87b144df21bf8c101c2ed1f`.
+- Reviewed sequence:
+  `plans/sequences/2026-07-16-surgeist-generator-shared-corpus-drivers.md`
+  at `5b2ee3c`, independent review `CLEAN`.
 - Outcome: preserve the audited layout copy and make the default-feature shared
   API, pinned-source verifier, rooted coordination, and durable transaction core
   satisfy the final pair. No domain driver is implemented in C01.
@@ -51,6 +56,16 @@
     SHA-256 `08ba1dc26fd92faf7d95f562cb9639a9f9d40520b98992e6e5eef24083b3c1b6`;
   - root HEAD `19590f6d9fa01c0df197c5ef07fb626c5cf18ced`, empty porcelain status.
 
+## Impacts
+
+- API: additive exact default shared surface; feature APIs remain deferred.
+- Dependencies/features: add only target-specific exact `rustix`; refresh the
+  tracked lockfile offline; keep empty domain features and `default = []`.
+- Artifacts/docs: no generated corpus artifact, binary, README, or AGENTS change.
+- Compatibility: Rust 1.97/edition 2024 and `CRATE_NAME` remain unchanged.
+- Root/siblings: no integration or mutation; published C01 SHA is C02 input.
+- Safety: no executable `unsafe`; descriptor authority remains crate-private.
+
 ## Task Packets
 
 ### C01-T01 — Preserve the layout production prefix (complete)
@@ -65,15 +80,16 @@
 ### C01-T02 — Reconcile shared values, reports, and pinned sources (reopened)
 
 - Complete review packet: initial implementation commits `5521d54` and
-  `d2980f7`, plus the ordered corrective commit span recorded here before review.
-  The prior clean review is historical; a fresh reviewer assesses the complete
-  packet against the final pair.
+  `d2980f7`, plus the ordered corrective span recorded outside this semantic plan
+  in `plans/evidence/2026-07-16-c01-t02.md`. The prior review is historical; a
+  fresh reviewer assesses that complete packet against the final pair.
 - Trace: C01 evidence owner for focused shared items 1–3 and 5. It implements
   prerequisites from SG-03.4, SG-06–8, and SG-12 plus source/public-API cases
   toward focused items 4 and 11, whose executable closure remains C02/C03.
-- Files: `Cargo.toml`, mechanically refreshed `Cargo.lock`, `src/lib.rs`,
-  `src/error.rs`, `src/core/{mod,case,corpus,hash,manifest,report,source}.rs`, and
-  focused public/source tests. The legacy copy remains untouched.
+- Files: retained-range `.gitignore`; `Cargo.toml`; mechanically refreshed
+  `Cargo.lock`; `src/lib.rs`; `src/error.rs`;
+  `src/core/{mod,case,corpus,hash,manifest,report,source}.rs`; focused
+  public/source tests; task evidence. The legacy copy remains untouched.
 - RED: first record targeted failures for exact public API/Serde goldens,
   overflow/path/disposition/report contracts, installed-Git trust, ordinary and
   linked `config.worktree`, raw cleanliness/filter sentinels, promisor absence,
@@ -88,14 +104,18 @@
   - `cargo clippy --locked --offline -p surgeist-generator --no-default-features --all-targets -- -F unsafe-code -D warnings`
   - `cargo check --locked --offline -p surgeist-generator --target wasm32-unknown-unknown --no-default-features --lib`
   - `cargo fmt --check`
+  - `cargo deny --all-features --locked --offline list --format tsv --layout license`
+  - `cargo audit --no-fetch --stale`
   - compare all three read-only baselines above exactly.
+- Dependencies: reviewed sequence/C01 plan and preserved clean T01 evidence.
 - Intended correction commit: `feat(core): reconcile shared source contracts`.
 
 ### C01-T03 — Reconcile rooted leases and durable transactions (reopened)
 
 - Complete review packet: initial implementation commits `b70dea3` and
-  `d32e9f6`, plus the ordered corrective commit span recorded here before review.
-  Its prior review was not clean; no finding or span is waived.
+  `d32e9f6`, plus the ordered corrective span recorded outside this semantic plan
+  in `plans/evidence/2026-07-16-c01-t03.md`. Its prior review was not clean; no
+  finding or span is waived.
 - Trace: C01 evidence owner for focused shared item 6. It implements prerequisite
   shared mechanisms from SG-04, SG-09–10, SG-12, and SG-13.1 plus precursor
   cases toward focused items 7–10, whose executable closure remains C03.
@@ -118,21 +138,25 @@
   - `cargo check --locked --offline -p surgeist-generator --target wasm32-unknown-unknown --no-default-features --lib`
   - `cargo fmt --check`
   - compare all three read-only baselines above exactly.
+- Dependencies: fresh `CLEAN` complete-packet review for T02.
 - Intended correction commit: `feat(core): reconcile rooted transactions`.
 
 ## C01 Closeout
 
-1. Record each correction span in this plan and obtain fresh `CLEAN` reviews of
-   the complete ordered T02 and T03 packets; retain T01's exact clean proof.
-2. In a planning-only commit mark C01 tasks/status complete, then rerun both task
-   gates, the owned-Rust manifest plus canonical executable-unsafe scan, and exact
-   sibling/root baseline comparisons.
+1. Complete the external task-evidence files and obtain fresh `CLEAN` complete-
+   packet reviews for T02/T03; retain T01's exact clean proof.
+2. Make only the header status transition to `complete`. Run both task gates,
+   license/audit commands, owned-Rust manifest plus canonical unsafe scan, exact
+   baselines, and clean-HEAD/status verification.
 3. Obtain a fresh holistic `CLEAN` review of exact `cycle_base..cycle_head`, the
-   complete semantic pair, all task reviews, and final evidence. A finding reopens
-   its owning T02/T03 packet, appends a correction, and repeats that packet review
-   and closeout; it does not create an unplanned task.
-4. Canonically land/publish the reviewed C01 descendant, verify its immutable
-   remote SHA/readback and cleanup, then hand that exact published SHA to C02.
+   semantic pair, task packets/reviews, and evidence. An owned finding reopens
+   T02/T03. A cross-task finding first requires a fresh reviewed plan revision
+   adding one bounded integration-fix packet; no edit precedes that review.
+4. After holistic `CLEAN`, rerun the complete step-2 gate and clean-HEAD/baseline
+   verification at the unchanged reviewed SHA.
+5. Apply the canonical Surgeist exact-range reconciliation, re-review, automated
+   landing/publication, immutable-SHA remote readback, and cleanup workflow; hand
+   the published C01 SHA to C02 and only then plan C02 from it.
 
 Stop for coordinator adjudication on an authority-remote change, unavailable
 cached dependency/installed target, sibling baseline change, safety finding, or
