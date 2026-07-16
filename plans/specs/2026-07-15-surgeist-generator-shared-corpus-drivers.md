@@ -718,6 +718,24 @@ instruction. `revision` is an exact lowercase 40- or 64-hex object ID.
 relative paths. The report path must be one JSON file under
 `generation-reports`. File and case counts are positive and exact.
 
+Manifest semantic validation treats namespace relationships as part of schema 1.
+Two paths overlap when they are equal or either is a component-wise ancestor of
+the other; string-prefix matches inside one component do not overlap. The
+corpus-absolute `import_root`, `expectation_root`, and `report_file` must be
+pairwise non-overlapping, and neither generated root may overlap the protected
+`corpus.toml` manifest path. Equal, ancestor, and descendant configurations fail
+with `InvalidManifest` before source verification, lease acquisition, directory
+creation, or writes.
+
+After `CorpusLocation` construction, the driver also forms the prospective
+owner-absolute coordination namespace
+`<owner-root>/target/surgeist-generator/`. Each manifest-declared writable path
+must be component-wise disjoint from that coordination namespace. A conflict at
+this absolute-root boundary fails with `InvalidPath` before capability preflight,
+lease acquisition, or writes. This closes the case where the selected corpus
+itself is nested beneath generator coordination even though the manifest paths
+are distinct.
+
 `[[cases]]` entries are disposition overrides keyed by a derived case ID. IDs
 are unique. An override must resolve to one collected case. Active is the
 default for a collected case without an override.
@@ -812,6 +830,16 @@ then atomically mirrors those retained snapshot bytes beneath the CSS-owned
 entries, checks the exact source-file count, and removes stale imported JSON only
 as part of a successful complete import transaction. It writes no expectations
 or generation report.
+
+Source verification first yields the canonical Git checkout root. Before the
+commit-tree snapshot is built, that checkout root must be component-wise
+disjoint in both directions from every prospective CSS mutation namespace: the
+absolute import root, expectation root, report path, and owner coordination
+root. Any equality, checkout-ancestor, or checkout-descendant relationship fails
+with `InvalidPath`; no capability probe, lease path, import path, expectation, or
+report is created. The comparison uses the canonical checkout and owner/corpus
+roots plus checked relative-path joins, so an external checkout remains strictly
+read-only even when the user supplies an owner or corpus nested within it.
 
 ### SG-07.3 Neutral expectation shape
 
@@ -993,8 +1021,9 @@ The command lifecycle is:
 CLI parse
   -> CorpusLocation validation
   -> manifest parse and semantic validation
-  -> filter/source inventory validation
+  -> filter/source inventory and writable-namespace validation
   -> optional read-only source verification
+  -> verified-source/writable-namespace disjointness validation
   -> supported mutation-capability preflight
   -> generation lease
   -> optional browser/cache acquisition or source import
@@ -1005,10 +1034,12 @@ CLI parse
 ```
 
 Manifest, source, filter, and unsupported-platform errors occur before the lease
-or writes. CSS verifies the supplied CSSTree checkout read-only before acquiring
-the lease, then imports beneath the lease. Layout validates manifest acquisition
-inputs before the lease; its mutable browser/cache and Taffy fetch/checkout work
-runs only after capability preflight and lease acquisition, followed by exact-pin
+or writes. CSS validates manifest namespace separation, verifies the supplied
+CSSTree checkout read-only, validates that checkout against every prospective
+writable namespace, and only then snapshots it, performs capability preflight,
+and acquires the lease for import. Layout validates manifest acquisition inputs
+before the lease; its mutable browser/cache and Taffy fetch/checkout work runs
+only after capability preflight and lease acquisition, followed by exact-pin
 verification. Every mutation-capable command follows this ordering. Generation
 and install errors retain failure provenance and perform rollback as defined in
 SG-09.
@@ -1198,11 +1229,17 @@ repositories to prove:
 3. ordinary and error-array flattening, JSON Pointer IDs, sorted cases, options,
    canonical CSS, and omission of AST/error/offset data;
 4. malformed source structures and unmatched overrides fail before writes;
-5. active/default and non-active reason accounting;
-6. full generation writes expectations/report and removes stale outputs only
+5. equal and component-wise ancestor/descendant overlaps among import,
+   expectation, report, manifest, and coordination namespaces fail with the
+   specified `InvalidManifest` or `InvalidPath` before lease acquisition or any
+   directory creation; a verified checkout equal to, above, or below every CSS
+   writable/coordination namespace fails with `InvalidPath` while leaving both
+   the checkout and owner/corpus trees unchanged;
+6. active/default and non-active reason accounting;
+7. full generation writes expectations/report and removes stale outputs only
    after success;
-7. filtered generation updates only matches and writes/prunes no report;
-8. offline verification detects imported-source, expectation, report, hash,
+8. filtered generation updates only matches and writes/prunes no report;
+9. offline verification detects imported-source, expectation, report, hash,
    provenance, count, and stale-inventory drift.
 
 No focused test reads or executes the real layout or CSS repository corpus.
