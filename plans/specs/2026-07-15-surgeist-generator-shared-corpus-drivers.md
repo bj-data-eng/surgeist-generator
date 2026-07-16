@@ -185,7 +185,7 @@ The dependency matrix is:
 | `rustix` | `=1.1.4`, `fs`, Linux/macOS targets only | yes on Linux/macOS | inherited | inherited | Safe descriptor-relative, non-following filesystem transactions |
 | `chromiumoxide` | `=0.9.1`, no defaults, `fetcher`, `rustls`, `zip8` | no | yes | no | Managed pinned Chromium measurement |
 | `futures` | `=0.3.31` | no | yes | no | Chromium handler stream |
-| `tokio` | `=1.48.0`, `fs`, `macros`, `rt-multi-thread` | no | yes | no | Async layout driver and thin binary |
+| `tokio` | `=1.48.0`, `fs`, `macros`, `rt-multi-thread`, `time` | no | yes | no | Private Chromium runtime, handler lifecycle, and timed cleanup |
 | `url` | `=2.5.7` | no | yes | no | Fixture and base URL handling |
 
 `default = []`. `layout-browser` activates the four heavy optional dependencies
@@ -267,8 +267,8 @@ pub mod layout {
         pub fn filter(&self) -> Option<&RelativePath>;
     }
 
-    pub async fn run(request: LayoutRequest) -> Result<()>;
-    pub async fn run_from_env() -> Result<()>;
+    pub fn run(request: LayoutRequest) -> Result<()>;
+    pub fn run_from_env() -> Result<()>;
 }
 
 pub mod css {
@@ -323,6 +323,17 @@ installed and verified. Check/import commands and filtered generation expose no
 in-memory report; reports remain corpus-owned files. A filtered success never
 writes the canonical report. Any partial or failed lifecycle returns the one
 semantic `GeneratorError` that the binary prints.
+
+The layout functions are deliberately synchronous at the public boundary; no
+caller-visible future can be dropped while Chromium or a lease remains active.
+`layout::run` moves the checked request into one named private OS worker thread,
+builds and drives the Tokio runtime only on that thread, and synchronously joins
+it. It is therefore safe to call from either synchronous code or from a thread
+that already participates in another Tokio runtime. Thread spawn, runtime build,
+or join failure maps to `Generation`; a worker panic is caught and mapped rather
+than crossing the public boundary. The function returns only after the worker's
+lease and every domain resource have reached the terminal cleanup state in
+SG-10. No handler task or browser cleanup is detached.
 
 ### SG-03.4 Exact shared-core API
 
@@ -619,8 +630,7 @@ inventory, and overflow checks occur in `GenerationReport::new` and
 
 `CorpusLocation` owns two canonical absolute paths:
 
-- an owner root, used for repository-relative caches, provenance, and lease
-  placement;
+- an owner root, used for repository-relative acquisition caches and provenance;
 - a corpus root, which must exist as a directory at construction and must be the
   owner root itself or a descendant of it.
 
@@ -633,6 +643,15 @@ Every binary invocation requires explicit `--owner-root <path>` and
 `--corpus-root <path>`. There is no default corpus, `CARGO_MANIFEST_DIR` fallback,
 current-directory inference, or corpus-root environment override. A consumer may
 pass relative CLI paths, but construction canonicalizes them before use.
+
+The owner root is intentionally not lease identity: two different canonical
+owner ancestors may validly describe one corpus. The reserved coordination root
+is always `<canonical-corpus-root>/.surgeist-generator/`, so every
+`CorpusLocation` for the same canonical corpus converges on one filesystem
+namespace. Domain manifests, artifacts, reports, caches, and imports may not use
+`.surgeist-generator` as an equal or ancestor/descendant path. Coordination files
+are generator state, have no generated extension, and are excluded from domain
+artifact/report inventories.
 
 ### SG-04.2 Strict relative paths
 
@@ -754,14 +773,12 @@ pairwise non-overlapping, and neither generated root may overlap the protected
 with `InvalidManifest` before source verification, lease acquisition, directory
 creation, or writes.
 
-After `CorpusLocation` construction, the driver also forms the prospective
-owner-absolute coordination namespace
-`<owner-root>/target/surgeist-generator/`. Each manifest-declared writable path
+After `CorpusLocation` construction, the driver also forms the canonical
+corpus-absolute coordination namespace
+`<corpus-root>/.surgeist-generator/`. Each manifest-declared writable path
 must be component-wise disjoint from that coordination namespace. A conflict at
 this absolute-root boundary fails with `InvalidPath` before capability preflight,
-lease acquisition, or writes. This closes the case where the selected corpus
-itself is nested beneath generator coordination even though the manifest paths
-are distinct.
+lease acquisition, or writes.
 
 `[[cases]]` entries are disposition overrides keyed by a derived case ID. IDs
 are unique. An override must resolve to one collected case. Active is the
@@ -966,7 +983,7 @@ built, every protected worktree, per-worktree Git directory, common Git
 directory, primary object directory, and recursive local alternate object
 directory must be component-wise disjoint in both directions from every
 prospective CSS mutation namespace: the absolute import root, expectation root,
-report path, and owner coordination root. Any equality, protected-ancestor, or
+report path, and corpus coordination root. Any equality, protected-ancestor, or
 protected-descendant relationship fails with `InvalidPath`; no capability probe,
 lease path, import path, expectation, or report is created. The comparison uses
 canonical protected directories and owner/corpus roots plus checked relative-path
@@ -1061,7 +1078,7 @@ operator documentation states this exact target boundary.
 Supported Linux requires runtime `renameat2` `NOREPLACE` and `EXCHANGE`; macOS
 requires `renameatx_np` with the equivalent flags. Before a mutation-capable
 command acquires its lease or changes domain state, a descriptor-rooted private
-probe beneath `<owner-root>/target/surgeist-generator/` creates two exclusive
+probe beneath `<corpus-root>/.surgeist-generator/` creates two exclusive
 files, exercises both flags, and removes them. `ENOSYS`, `EINVAL`, or
 `EOPNOTSUPP` maps to `UnsupportedPlatform`; probe residue is best-effort removed
 and reported, and no cache, import, artifact, or report mutation follows. Direct
@@ -1103,6 +1120,11 @@ The transaction never removes a file outside the declared generated extension
 and roots. It never follows an output symlink. Residual temporary or backup names
 from another process are collisions, not files to overwrite. Every prospective
 stage and backup name is checked even when its final target does not exist.
+`ArtifactPlan` reserves the root-level `.surgeist-generator` component and
+rejects any generated root, artifact, retained path, or report path equal to or
+beneath it, so standalone public plans cannot overwrite a corpus lease
+namespace. (`RelativePath` cannot represent the output root itself, so no valid
+plan path is an ancestor of that reserved first component.)
 
 Domain generation may commit one coherent artifact group at a time, but each
 group uses this transaction. Full-run stale removal occurs only after every job
@@ -1118,8 +1140,11 @@ The canonical report itself uses the same staged replace-and-rollback primitive.
 domain plus canonical corpus-root digest, so full and filtered runs for the same
 domain/corpus contend while unrelated layout and CSS corpora may run concurrently.
 The immutable lease and acquisition-gate files plus mutable owner record live
-beneath `<owner-root>/target/surgeist-generator/`. The owner record includes
-generator, PID, corpus root, scope, command, and Unix start time.
+beneath the single reserved
+`<canonical-corpus-root>/.surgeist-generator/` directory. The owner record
+includes generator, PID, owner root, corpus root, scope, command, and Unix start
+time. Because placement depends only on the canonical corpus, distinct valid
+owner ancestors acquire the same gate and mutex.
 
 The acquisition gate is locked while a complete owner stage is written, synced,
 and atomically installed, preventing a contender from observing stale, empty, or
@@ -1148,6 +1173,41 @@ record. No existing lock or owner inode is truncated or written in place. On
 targets other than Linux and macOS, acquisition returns `UnsupportedPlatform`
 before coordination writes.
 
+Layout's synchronous worker owns one private resource set beneath the lease. A
+newly launched browser, page, handler `JoinHandle`, acquisition stage, generated
+byte buffer, and profile directory are registered immediately; a task handle is
+never dropped to detach it. Normal success and every semantic error stop
+scheduling jobs and run the same terminal sequence before the worker can return:
+
+1. close each open page;
+2. request browser close with a bounded timeout, then force `kill` and wait/reap
+   when close fails or times out; the lease is not released while the child is
+   still observed alive;
+3. await a normally completed handler task, or abort and await it after browser
+   failure/timeout, and account for every registered task;
+4. remove the run-owned browser profile with the SG-09 rooted, non-following
+   cleanup primitive only after the child is reaped; a disputed or unremovable
+   profile is retained under its collision-safe run name and returned as a
+   `Generation` cleanup error, never recursively removed through an untrusted
+   path;
+5. remove or roll back every incomplete browser/Taffy acquisition stage while
+   preserving any pre-existing or fully atomically installed cache entry;
+6. drop the lease only after all active child/task work has terminated and every
+   remaining run-owned path is either removed or reported as terminal residue.
+
+Layout collects all XML and report bytes in memory. It does not install an
+artifact, prune stale output, or publish a report until measurement and the
+browser/task/profile terminal sequence have succeeded. Once publication begins,
+the synchronous SG-09 transaction runs to success or complete rollback without
+an async cancellation point. A browser, handler, measurement, profile, or cache
+cleanup error therefore leaves final artifacts, stale outputs, and canonical
+reports unchanged. The private worker thread is joined by the public function,
+so dropping a Rust future is not an API operation and returning to the caller
+means no browser or handler work remains. A defensive worker unwind uses guards
+that abort registered tasks, trigger Chromiumoxide's kill-on-drop child guard,
+quarantine the run-owned profile without following links, and release the lease
+last; the join converts the panic to `Generation`.
+
 The command lifecycle is:
 
 ```text
@@ -1161,6 +1221,7 @@ CLI parse
   -> generation lease
   -> optional browser/cache acquisition or source import
   -> deterministic collection and domain generation
+  -> terminal browser/task/profile/acquisition-stage cleanup
   -> atomic artifact groups
   -> full-only report and stale cleanup
   -> success or semantic error
@@ -1325,17 +1386,20 @@ Shared-core tests shall prove:
    case IDs, accept repeated source paths for distinct case IDs, and return case-ID
    order;
 6. filtered scope cannot authorize report or stale-output operations;
-7. full and filtered requests contend on one corpus lease, owner metadata is
-   coherent, dropping releases the lease, and symlink, hard-link, unknown-header,
-   owner-exchange collision, and coordination-component swaps observed before an
-   atomic transition cannot redirect, overwrite, or truncate a lock or owner
-   file;
+7. full and filtered requests contend on one corpus lease, including two
+   `CorpusLocation` values that use distinct valid canonical owner ancestors for
+   the same canonical corpus; owner metadata records the selected owner
+   coherently, dropping releases the lease, and symlink, hard-link,
+   unknown-header, owner-exchange collision, and coordination-component swaps
+   observed before an atomic transition cannot redirect, overwrite, or truncate
+   a lock or owner file;
 8. artifact installation is deterministic, replaces atomically, removes stale
    files only when authorized, and restores every prior file after injected
    staging, installation, or cleanup failure; descriptor-bound tests replace
    roots, components, and destination names before each atomic transition and
    prove no escape, overwrite, or removal of a colliding inode under the SG-09
-   exclusive-namespace contract;
+   exclusive-namespace contract; generated and report plans reject the reserved
+   root-level `.surgeist-generator` coordination subtree;
 9. hash text validation and report counts/provenance detect drift, and every
    `GeneratorErrorKind` has the exact SG-12 exit code;
 10. a residual deterministic backup is rejected even when its final target is
@@ -1356,8 +1420,11 @@ Layout tests shall use synthetic temporary manifests, helpers, HTML, JSON
 measurements, and artifacts to prove:
 
 1. the explicit root CLI and closed command/argument matrix;
-2. the exact public request constructor/getter and async `run` signatures;
-3. schema-2 parsing, unknown/duplicate rejection, and manifest-derived Taffy pin;
+2. the exact public request constructor/getter and synchronous `run` signatures,
+   including a call made from a thread already inside a Tokio runtime without a
+   nested-runtime panic;
+3. schema-2 parsing, unknown/duplicate and reserved-coordination overlap
+   rejection, and manifest-derived Taffy pin;
 4. helper/base-style loading and hashes from the supplied corpus;
 5. managed/existing browser validation through injected fetch/version boundaries
    without launching or acquiring a browser;
@@ -1367,7 +1434,13 @@ measurements, and artifacts to prove:
    drift rejection;
 8. a verified Taffy checkout's worktree, linked-worktree administration, common
    Git directory, primary object directory, and recursive alternates cannot
-   overlap import, artifact/report, or coordination writes.
+   overlap import, artifact/report, or coordination writes;
+9. injected launch, page, measurement, browser-close, handler-join, profile, and
+   acquisition-stage failures return only after the synthetic child is reaped,
+   every handler is completed or aborted-and-joined, the profile is removed or
+   reported as a collision-safe residue, and a distinct-owner contender can
+   acquire the released same-corpus lease; no final artifact, stale output, or
+   report changes, and no detached-task counter remains.
 
 CSS tests shall use official-shaped synthetic fixture JSON and local temporary Git
 repositories to prove:
