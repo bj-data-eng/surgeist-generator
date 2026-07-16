@@ -35,9 +35,9 @@ later closure owner, but cannot claim that later section complete.
 
 | Cycle | Exact main-spec closure | Exact focused evidence |
 | --- | --- | --- |
-| C01 Shared Core | SG-02.1–2.4; SG-03.1; SG-04.1–4.3; SG-07.1 | shared items 1–11 |
-| C02 Layout Driver | SG-03.2; SG-05.2; SG-11.1 | layout items 1–9 |
-| C03 CSS And Driver Integration | SG-03.3–3.4; SG-05.1 and 5.3; SG-06.1–6.2; SG-07.2–7.3; SG-08; SG-09.1–9.3; SG-10; SG-11.2–11.3; SG-12; SG-13.1–13.2 | CSS items 1–9 |
+| C01 Shared Core | SG-02 (2.1–2.4) | shared items 1–3 and 5–6 |
+| C02 Layout Driver | SG-03.2; SG-05.2; SG-11.1 | shared item 4 and layout items 1–9 |
+| C03 CSS And Driver Integration | SG-03 and 3.1/3.3–3.4; SG-04 (4.1–4.3); SG-05 and 5.1/5.3; SG-06 (6.1–6.2); SG-07 (7.1–7.3); SG-08; SG-09 including 9.1–9.3; SG-10; SG-11 and 11.2–11.3; SG-12; SG-13 and 13.1–13.2 | shared items 7–11 and CSS items 1–9 |
 | C04 Final Integration | SG-01; SG-13.3; SG-14 | final matrix/evidence, not a new SG-13.2 item |
 
 ## Ordered Cycles
@@ -46,7 +46,7 @@ later closure owner, but cannot claim that later section complete.
 
 - Preserve the reviewed layout prefix copy, then reconcile the retained T02/T03
   code with the final default-feature shared API, source verification, rooted
-  coordination, transactions, recovery, and all shared focused evidence.
+  coordination, transactions, recovery, and shared focused items 1–3 and 5–6.
 - Prerequisite clauses implemented for later closure: shared API portions of
   SG-03.4, shared source/collection of SG-06, shared hashes/provenance of SG-08,
   shared mechanisms of SG-09–10, shared errors of SG-12, and read-only shared
@@ -60,7 +60,8 @@ later closure owner, but cannot claim that later section complete.
 - Add the complete SG-03.2 optional dependency graph, layout feature/API/binary,
   schema-2 manifest, Taffy and Chromium cache/acquisition/resource lifecycle,
   deterministic XML/report behavior, layout offline checking, and synthetic
-  layout evidence; remove the transient copied file only after representation.
+  layout evidence plus shared source/acquisition item 4; remove the transient
+  copied file only after representation.
 - Prerequisite clauses implemented for C03 closure: layout portions of
   SG-03.3–3.4, SG-05.1, SG-06, SG-08–10, SG-12, SG-13.1, and SG-11.3.
 - Impacts: additive feature/API and exact optional dependencies; one exact
@@ -71,7 +72,8 @@ later closure owner, but cannot claim that later section complete.
 
 - Add the dependency-free CSS feature/API/binary, schema-1 import sidecar,
   neutral expectations/reports, CSS checking, CSS focused evidence, and combined
-  feature coexistence; close every cross-domain/shared section allocated above.
+  feature coexistence; close shared items 7–11 and every cross-domain/shared
+  section allocated above.
 - Impacts: additive feature/API, no dependency; one exact at-most-15-physical-
   line binary; no committed corpus artifact/MSRV/unsafe change. Run default,
   layout-only, CSS-only, and combined gates, then publish/read back before C04.

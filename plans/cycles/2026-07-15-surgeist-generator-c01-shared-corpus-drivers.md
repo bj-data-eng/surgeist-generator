@@ -29,9 +29,10 @@
    CSS items 1–9. It owns CSS import provenance, neutral output, the exact
    at-most-15-physical-line binary, and the combined-feature task gate.
 4. **C04, separately planned/reviewed after C03:** remaining SG-01, SG-13.3, and
-   SG-14 integration/docs/evidence; full matrix, holistic review, canonical
-   automated landing/publication with immutable-SHA push/readback/cleanup, and
-   cross-repository handoff. No earlier cycle publishes.
+   SG-14 integration/docs/evidence; full matrix, holistic review, final canonical
+   publication/readback, and cross-repository handoff. Each preceding cycle is
+   also canonically landed, published, and remotely verified before the next is
+   planned from that immutable SHA.
 
 ## Boundary And Read-Only Baselines
 
@@ -127,8 +128,8 @@
    complete semantic pair, all task reviews, and final evidence. A finding reopens
    its owning T02/T03 packet, appends a correction, and repeats that packet review
    and closeout; it does not create an unplanned task.
-4. Record the reviewed C01 SHA as C02's immutable input. Do not land/push/publish
-   in C01; C04 alone applies the canonical Surgeist landing/publication workflow.
+4. Canonically land/publish the reviewed C01 descendant, verify its immutable
+   remote SHA/readback and cleanup, then hand that exact published SHA to C02.
 
 Stop for coordinator adjudication on an authority-remote change, unavailable
 cached dependency/installed target, sibling baseline change, safety finding, or
