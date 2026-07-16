@@ -182,7 +182,7 @@ The dependency matrix is:
 | `serde_json` | `=1.0.145` | yes | inherited | inherited | Reports, layout measurements, CSSTree fixtures |
 | `sha2` | `=0.10.9` | yes | inherited | inherited | Source and artifact SHA-256 |
 | `toml` | `=0.9.8` | yes | inherited | inherited | Domain manifest parsing |
-| `rustix` | `=1.1.4`, `fs`, Linux/macOS targets only | yes on Linux/macOS | inherited | inherited | Safe descriptor-relative, non-following filesystem transactions |
+| `rustix` | `=1.1.4`, `fs`, Apple Silicon macOS only | yes on the supported target | inherited | inherited | Safe descriptor-relative, non-following filesystem transactions |
 | `chromiumoxide` | `=0.9.1`, no defaults, `fetcher`, `rustls`, `zip8` | no | yes | no | Managed pinned Chromium measurement |
 | `futures` | `=0.3.31` | no | yes | no | Chromium handler stream |
 | `tokio` | `=1.48.0`, `fs`, `macros`, `rt-multi-thread`, `time` | no | yes | no | Private Chromium runtime, handler lifecycle, and timed cleanup |
@@ -193,7 +193,7 @@ and the layout module/binary. `css-corpus` activates the CSS module/binary and n
 heavy dependency. Both features may be enabled together. The two binaries use
 `required-features` so an unrequested driver cannot compile accidentally.
 `rustix = { version = "=1.1.4", features = ["fs"] }` is declared under
-`[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]`;
+`[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]`;
 it is a shared lifecycle dependency, not a domain or default feature switch.
 
 All named dependency sources, including `rustix` 1.1.4, are already present in
@@ -210,11 +210,11 @@ surface is this exact reexport set; `core` and `error` remain private modules:
 
 ```rust
 pub use core::{
-    ArtifactPlan, ArtifactProvenance, CaseDisposition, CaseDispositionRecord,
-    CorpusLocation, GenerationCounts, GenerationLease, GenerationReport,
-    ManifestVersion, PinnedSource, RelativePath, ReportArtifact, RunScope,
-    Sha256Digest, SourceRevision, VerifiedSource, collect_regular_files,
-    parse_manifest, validate_disposition_records, verify_git_source,
+    ArtifactProvenance, CaseDisposition, CaseDispositionRecord, CorpusLocation,
+    GenerationCounts, GenerationReport, ManifestVersion, PinnedSource,
+    RelativePath, ReportArtifact, RunScope, Sha256Digest, SourceRevision,
+    VerifiedSource, collect_regular_files, parse_manifest,
+    validate_disposition_records, verify_git_source,
 };
 pub use error::{GeneratorError, GeneratorErrorKind, Result};
 pub const CRATE_NAME: &str = "surgeist-generator";
@@ -362,8 +362,6 @@ commitments.
 | `ReportArtifact` | `Clone + Debug + Eq + PartialEq + Serialize + Deserialize` |
 | `GenerationCounts` | `Clone + Copy + Debug + Eq + PartialEq + Serialize + Deserialize` |
 | `GenerationReport` | `Clone + Debug + Eq + PartialEq + Serialize + Deserialize` |
-| `ArtifactPlan` | `Debug` |
-| `GenerationLease` | `Debug + Drop` |
 
 The enum variants and error observations are exact:
 
@@ -541,12 +539,12 @@ impl ArtifactProvenance {
 }
 
 impl ReportArtifact {
-    pub const fn new(
+    pub fn new(
         provenance: ArtifactProvenance,
         output_path: RelativePath,
         output_digest: Sha256Digest,
         case_count: usize,
-    ) -> Self;
+    ) -> Result<Self>;
     pub const fn provenance(&self) -> &ArtifactProvenance;
     pub const fn output_path(&self) -> &RelativePath;
     pub const fn output_digest(&self) -> &Sha256Digest;
@@ -554,13 +552,13 @@ impl ReportArtifact {
 }
 
 impl GenerationCounts {
-    pub const fn new(
+    pub fn new(
         active: usize,
         expected_fail: usize,
         unsupported: usize,
         quarantined: usize,
         failed_to_generate: usize,
-    ) -> Self;
+    ) -> Result<Self>;
     pub fn total(self) -> Result<usize>;
     pub const fn active(self) -> usize;
     pub const fn expected_fail(self) -> usize;
@@ -589,43 +587,24 @@ impl GenerationReport {
     ) -> Result<()>;
 }
 
-impl ArtifactPlan {
-    pub fn new(
-        location: &CorpusLocation,
-        generated_root: RelativePath,
-        generated_extension: impl Into<String>,
-        scope: RunScope,
-        artifacts: Vec<(RelativePath, Vec<u8>)>,
-        retained_inventory: Option<Vec<RelativePath>>,
-    ) -> Result<Self>;
-    pub fn report(
-        location: &CorpusLocation,
-        report_path: RelativePath,
-        scope: RunScope,
-        bytes: Vec<u8>,
-    ) -> Result<Self>;
-    pub fn install(&self) -> Result<()>;
-    pub fn artifact_digest(&self, path: &RelativePath) -> Option<&Sha256Digest>;
-}
-
-impl GenerationLease {
-    pub fn acquire(
-        location: &CorpusLocation,
-        domain: impl AsRef<str>,
-        generator: impl AsRef<str>,
-        scope: &RunScope,
-        command: impl AsRef<str>,
-    ) -> Result<Self>;
-}
 ```
 
-`ArtifactPlan` and `GenerationLease` are mutation-capable only on the SG-09
-supported targets. Internal rooted descriptors, capability probes, Git snapshot
-objects and bytes, failure-injection hooks, and error constructors remain
-crate-private. The two checked `const` constructors (`ReportArtifact::new` and
-`GenerationCounts::new`) cannot form an invalid local value; aggregate duplicate,
-inventory, and overflow checks occur in `GenerationReport::new` and
-`GenerationCounts::total`.
+Mutation authority is deliberately not public. Crate-private `ArtifactPlan`,
+composite publication plans, and `GenerationLease` accept only domain-validated
+paths and metadata. Every plan stores the exact `CorpusLocation` identity and
+domain; install requires a still-live lease whose private corpus/domain identity
+matches. A released, absent, foreign-domain, or foreign-corpus lease cannot reach
+capability probing or writes. Domain drivers are the only constructors, so a
+generic library caller cannot select `corpus.toml`, helpers, fixtures, or another
+domain's publication root as a mutation target.
+
+Those internal mutation types are active only on the single SG-09 supported
+target. Rooted descriptors, capability probes, Git snapshot objects and bytes,
+failure-injection hooks, and error constructors also remain crate-private.
+`ReportArtifact::new` rejects a zero case count and
+`GenerationCounts::new` rejects aggregate overflow; `GenerationReport::new`
+performs duplicate, inventory, and header validation, and
+`GenerationCounts::total` repeats the checked sum for deserialized values.
 
 `GenerationReport::new` validates count overflow, sorted unique output paths, and
 report header fields, but does not require summed `ReportArtifact::case_count` to
@@ -633,10 +612,62 @@ equal `GenerationCounts::total()`. Layout can have failed/unsupported cases with
 no artifact, while a CSS expectation artifact can document non-active cases.
 Each domain report validator owns its exact artifact-to-case/count relationship.
 
-`ArtifactPlan` has no arbitrary output-root constructor: both constructors bind
-to the supplied location's canonical corpus root and privately retain that exact
-root identity. Domain cache acquisition outside the corpus uses crate-private
-rooted transactions, never a public plan.
+Domain cache acquisition outside the corpus uses the same crate-private rooted
+transaction machinery. No public plan or lease type exists.
+
+Every semantic string accepted by this public surface has one exact grammar:
+
+- an `identifier` is 1 through 64 ASCII bytes, starts with `[a-z0-9]`, and has
+  only `[a-z0-9._-]` thereafter; it has no `..` substring. Source labels,
+  generator names, lease domains/commands, artifact-plan domains, and domain-
+  provenance keys use this grammar;
+- a case ID is 1 through 4,096 UTF-8 bytes. Its part before an optional single
+  `#` is a valid `RelativePath`; when present, the suffix is empty or an RFC 6901
+  JSON Pointer beginning `/`, and every `~` escape is exactly `~0` or `~1`.
+  ASCII controls, backslashes, and leading/trailing Unicode whitespace are
+  therefore rejected;
+- a reason is 1 through 2,048 UTF-8 bytes, equals its Unicode-trimmed form, and
+  contains no control character. `Active` forbids one; every other disposition
+  requires one;
+- a repository URL is ASCII and has exactly the form `https://<dns>/<path>.git`:
+  the lowercase DNS authority has two or more nonempty `[a-z0-9-]` labels, no
+  userinfo or port, and the nonempty slash-separated path uses visible ASCII
+  other than `%`, `?`, `#`, or backslash and has no empty, `.` or `..` segment;
+- a source revision is exactly 40 or 64 lowercase hexadecimal bytes; a generated
+  extension is 1 through 16 lowercase ASCII alphanumeric bytes without a dot.
+
+`ManifestVersion::new` additionally requires a nonzero value.
+`PinnedSource::new` validates its label, URL, revision, and subdirectory.
+`ArtifactProvenance::new` validates its generator and every unique `BTreeMap`
+key. `GenerationReport::new` validates its repository URL. Lease acquisition
+validates domain, generator, and command; plan construction validates domain,
+extension, unique paths, scope/retained-inventory agreement, and content.
+
+Checked-constructor error kinds are fixed: path/location failures are
+`InvalidPath`; manifest-version failures are `InvalidManifest`; source revision,
+source label, and repository failures are `SourceVerification`; case/reason/count
+failures are `InvalidInventory`; digest/provenance/report failures are
+`Verification`; lease metadata failures are `InvalidInventory`; and plan domain,
+extension, or inventory failures are `ArtifactTransaction` (while a nested
+`RelativePath` failure remains `InvalidPath`). Domain manifest validators remap a
+well-formed but semantically invalid manifest field to `InvalidManifest` before
+constructing these generic values, so public-constructor kinds do not blur CLI
+schema diagnostics.
+
+Every public type in the trait table with `Deserialize` uses a private
+`#[serde(deny_unknown_fields)]` raw representation and calls the same checked
+constructor; it never derives field-wise deserialization that can bypass an
+invariant. `ManifestVersion`, `SourceRevision`, `PinnedSource`,
+`CaseDispositionRecord`, `Sha256Digest`, `ArtifactProvenance`, `ReportArtifact`,
+`GenerationCounts`, and `GenerationReport` all follow this rule, and
+`GenerationReport` recursively revalidates its nested values and aggregate
+inventory. Raw struct visitors reject a repeated field, and provenance maps use
+a custom map visitor that rejects a repeated decoded key instead of allowing
+`BTreeMap` last-value-wins behavior. Constructor failures become deterministic `serde::de::Error::custom`
+messages prefixed by the semantic kind. Domain manifest parsing maps any such
+error to `InvalidManifest`; generated report/expectation parsing maps it to
+`Verification`. Direct callers of Serde receive the Serde error, as required by
+that trait rather than a `GeneratorError`.
 
 ## SG-04 Semantic core types
 
@@ -670,27 +701,53 @@ files are generator state, have no generated extension, and are excluded from
 domain artifact/report inventories; recursive domain walks do not enter any
 directory with that exact component name.
 
-Those namespace rules use filesystem equivalence, not Rust string equality.
-Before a mutation lease, the rooted capability derives a private name-equivalence
-policy for every candidate component pair by exclusive create/open probes inside
-its private probe directory on the same mount. Two component spellings are
-equivalent when the filesystem resolves them to one entry, covering case folding,
-Unicode normalization, and other volume-specific aliases. Namespace equality
-and ancestor tests compare components with that policy; therefore
-`.SURGEIST-GENERATOR` or a normalization variant is reserved whenever the volume
-aliases it to `.surgeist-generator`, and two case-only manifest roots collide on
-a case-insensitive volume. An exact-text conflict remains `InvalidManifest` at
-semantic validation; a filesystem-only alias is `InvalidPath` after private
-probe cleanup and before lease/domain writes. If equivalence cannot be proven,
-mutation fails closed as `UnsupportedPlatform`.
+Those namespace rules use filesystem equivalence, not Rust string equality, and
+the proof is local to the actual held parent directory. No result is inferred
+from another directory merely because it has the same mount identity. Before a
+planned component is opened, created, compared with a sibling namespace, or used
+as a transaction destination, the rooted capability establishes the exact pair
+relationships needed in that component's parent descriptor:
 
-Before creating that private probe, a read-only descriptor walk of the already
-existing owner/corpus ancestry tries the exact reserved name in each component's
-parent and compares object identity with the actual component. If an existing
-case/normalization alias places either root at or beneath a coordination name,
-preflight returns `InvalidPath` without creating `.surgeist-generator`. Only an
-ancestry that passes this bootstrap check may create/adopt the exact coordination
-directory and run candidate-name probes inside it.
+1. it opens every existing spelling without following, reads the directory
+   entry's exact on-disk name, and compares descriptor identity;
+2. when exactly one spelling is absent it records a synced private probe journal
+   and attempts that exact missing spelling with `NOREPLACE`; when both are absent
+   it journal-creates the first exact spelling and then attempts the second.
+   Lookup and descriptor identity distinguish an alias from two entries;
+3. it removes only its verified single-link probes, then rechecks the parent
+   identity and mount before accepting the pair result.
+
+The result applies only to that candidate pair in that parent. A newly created
+directory is reopened, mount-checked, and receives its own direct-parent probes
+before any descendant is planned; differing policies in parent and child are
+therefore not conflated. Final `NOREPLACE` creation remains authoritative and a
+surprising collision fails closed without replacing the encountered object. An
+inconclusive probe, cleanup failure, parent-identity change, or inability to
+represent either exact pair is `UnsupportedPlatform`. A crash leaves a journaled
+single-link probe identity that the next gate holder removes before continuing;
+an unjournaled or identity-mismatched entry is never treated as a probe.
+
+Thus `.SURGEIST-GENERATOR` or a normalization variant is reserved only when the
+actual relevant parent aliases it to `.surgeist-generator`, and two case-only
+manifest roots collide only where their actual shared parent aliases them. An
+exact-text conflict remains `InvalidManifest` at semantic validation; a
+filesystem-only alias is `InvalidPath` after verified private-probe cleanup and
+before lease/domain writes.
+
+Coordination bootstrap avoids a journal circularity. First, a read-only
+descriptor walk of the already existing owner/corpus ancestry tries the exact
+reserved name in each component's actual parent and compares identity plus the
+entry's on-disk spelling with the actual component. If an existing alias places
+either root at or beneath coordination, preflight returns `InvalidPath` without
+creating it. At the corpus root, opening the exact reserved spelling either finds
+an exact existing directory or exposes an aliased on-disk spelling, which is
+rejected. When it is absent, the implementation atomically creates and syncs the
+exact persistent coordination directory with `RENAME_EXCL`, reopens it, and
+requires the exact on-disk spelling. Only then can it publish a probe journal
+inside that directory and test any candidate pair directly in the corpus parent.
+A bootstrap failure may therefore leave only an exact empty generator-owned
+coordination directory; it never leaves an unjournaled alias or domain file.
+Every deeper coordination parent is independently checked before use.
 
 ### SG-04.2 Strict relative paths
 
@@ -728,6 +785,13 @@ that at least one source matches before a lease is acquired or any output is
 written. Layout permits filters only for `generate-existing`; CSS permits them
 only for `generate`. Empty filters are invalid rather than aliases for full runs.
 
+Here and in SG-09, “does not write/prune” is a logical content-and-inventory
+guarantee. A one-root atomic swap may replace the inode of an unchanged report,
+stale artifact, or authored fixture with a staged regular file having identical
+bytes and mode; inode number and modification time are not corpus contracts.
+Digest, path, type, mode, inclusion, and exclusion are contracts, and filtered
+runs preserve all report bytes exactly.
+
 ## SG-05 Manifest and version contracts
 
 ### SG-05.1 Shared rules
@@ -757,9 +821,30 @@ formats remain compatible:
 
 The refactored driver removes hard-coded Taffy repository, revision, directory,
 and count values. It validates agreement between the existing source-root and
-import sections, then derives the pin and cache location from the manifest.
+import sections, then derives the pin from the manifest. Cache placement is
+fully specified rather than invented by a worker:
+
+- schema 2 requires the existing `browser.cache_root` value
+  `target/surgeist-browser`; its canonical root is
+  `<owner-root>/target/surgeist-browser`;
+- the Taffy object cache is
+  `<owner-root>/target/surgeist-sources/taffy/<exact-revision>`, preserving the
+  copied generator's fixed prefix while deriving the terminal component from the
+  manifest pin. It is a generator-owned bare object repository, not a checkout;
+- `owner_root/target` must already be a same-mount ordinary directory. Browser
+  acquisition stages are complete-root siblings named
+  `target/._surgeist-browser-stage-<lease-token>` and publish
+  `target/surgeist-browser`; Taffy stages are complete-root siblings named
+  `target/._surgeist-sources-stage-<lease-token>` and publish
+  `target/surgeist-sources`. Per-run browser profiles alone live at
+  `<browser-cache>/._surgeist-profile-<lease-token>`. Tokens are random 128-bit
+  lowercase hex and are registered before creation.
+
 The fixed domain names (`chrome-for-testing`, `taffy`, `surgeist`, and
-`constrained-html`) remain layout schema semantics.
+`constrained-html`) remain layout schema semantics. The two source roots and
+`imports.taffy.destination` must continue to resolve to the one corpus-relative
+`html` tree; XML and every generation report remain beneath the fixed `xml`
+publication root, with reports beneath `xml/generation-reports`.
 
 The helper JavaScript and base CSS are loaded from
 `scripts/gentest/test_helper.js` and
@@ -767,6 +852,49 @@ The helper JavaScript and base CSS are loaded from
 directory must contain exactly those two regular files. Their bytes remain
 layout-owned and feed the same hashes, browser document, XML provenance, and
 report metadata as before.
+
+Layout applies one complete namespace matrix before cache or corpus mutation.
+Exact-text relationships are rejected in manifest/location validation; SG-04's
+per-parent equivalence and SG-09 mount/identity checks run while the acquisition
+gate is held and before a cache/domain write:
+
+- both owner-relative publication caches and their fixed `target` parent must
+  remain canonically beneath `owner_root`; the cache roots are pairwise disjoint
+  and every cache/stage/profile namespace is disjoint in both ancestor directions
+  from the whole canonical corpus root;
+- corpus `html`, `xml`, `corpus.toml`, `scripts/gentest`, and coordination roots
+  are pairwise disjoint. The two named helper files are the only permitted helper
+  children, and `xml/generation-reports` is the intentional report child of
+  `xml`; neither cache may alias any of these namespaces;
+- browser stages, profiles, and executables may occur only beneath the browser
+  cache. Taffy stages, its bare Git administration/object paths, and its final
+  revision cache may occur only beneath the Taffy cache parent. The two cache
+  families may not alias each other;
+- the Taffy cache's verified protection set may overlap its own acquisition root
+  only. Before snapshot bytes can feed publication it must be disjoint from the
+  browser cache, corpus `html`/`xml`, manifest, helpers, and coordination roots;
+- layout generation mutates only the complete `xml` publication root. Taffy
+  import mutates the complete `html` publication root while copying every
+  validated Surgeist-authored fixture unchanged and replacing/pruning only the
+  manifest-classified Taffy portion. No helper or manifest byte enters either
+  transaction.
+
+Equality, either ancestor direction, per-parent case/normalization equivalence,
+descriptor-ancestry identity, or a mount crossing outside an explicitly allowed
+containment is `InvalidPath`. The planned roots are known before acquisition, so
+a conflict cannot be deferred until after fetch. Acquisition-private stages are
+cleaned or journaled residues; no manifest/cache/helper/HTML/XML/report final is
+changed on a failed matrix check.
+
+Managed Chromium fetch points the feature-gated fetcher only at the unique
+browser stage. Before publication, a rooted inventory rejects absolute/escaped
+archive paths, symlinks, hard links, special files, mount crossings, unexpected
+executables, and any path outside that stage; the one platform executable must
+be a regular single-link executable whose sanitized `--version` output exactly
+matches `browser.version_output`. The complete validated version directory is
+then one SG-09 cache publication unit. `generate-existing` performs the same
+inventory, containment, executable, and version checks on an already published
+manifest-cache child and never fetches.
 
 ### SG-05.3 CSS schema 1
 
@@ -780,13 +908,13 @@ kind = "csstree"
 repository = "https://github.com/csstree/csstree.git"
 revision = "<exact 40- or 64-lowercase-hex Git object id>"
 fixture_root = "fixtures/ast"
-import_root = "source/csstree"
+import_root = "source"
 expected_files = 1
 expected_cases = 1
 
 [artifacts]
 expectation_root = "expectations"
-report_file = "generation-reports/all.json"
+report_file = "expectations/generation-reports/all.json"
 
 [[cases]]
 id = "declaration/Declaration.json#/error/0"
@@ -802,19 +930,24 @@ counts.
 URL ending in `.git`; it is data used for verification, not an acquisition
 instruction. `revision` is an exact lowercase 40- or 64-hex object ID.
 `fixture_root`, `import_root`, `expectation_root`, and `report_file` are strict
-relative paths. The report path must be one JSON file under
-`generation-reports`. File and case counts are positive and exact.
+relative paths. `import_root` and `expectation_root` are each exactly one
+component, so their complete trees can be swapped from the existing corpus-root
+parent without pre-commit parent creation. The report path must equal
+`<expectation_root>/generation-reports/all.json`; placing it inside the one
+generator-owned expectation publication tree gives a full generation one atomic
+root commit. File and case counts are positive and exact.
 
 Manifest semantic validation treats namespace relationships as part of schema 1.
 Two paths overlap when they are equal or either is a component-wise ancestor of
 the other; string-prefix matches inside one component do not overlap. Exact-text
 overlap is rejected during manifest validation, and SG-04 filesystem-equivalent
 component overlap is rejected during capability preflight. The
-corpus-absolute `import_root`, `expectation_root`, and `report_file` must be
-pairwise non-overlapping under both comparisons, and neither generated root may
-overlap the protected `corpus.toml` manifest path. Equal, ancestor, and
-descendant configurations fail
-with `InvalidManifest` before source verification, lease acquisition, directory
+corpus-absolute `import_root` and `expectation_root` must be pairwise
+non-overlapping under both comparisons, and neither generated root may overlap
+the protected `corpus.toml` manifest path. `report_file` has only the one required
+containment above and may not equal/contain `expectation_root` or escape into any
+other namespace. Other equal, ancestor, and descendant configurations fail with
+`InvalidManifest` before source verification, lease acquisition, directory
 creation, or writes.
 
 After `CorpusLocation` construction, the driver also forms the canonical
@@ -844,7 +977,8 @@ returns `VerifiedSource` only when:
 3. the crate-private raw cleanliness proof below establishes that the index
    equals the exact HEAD tree, every materialized tracked entry equals its index
    blob and type, and no nonignored untracked path exists;
-4. `git remote get-url origin` exactly equals the manifest repository URL;
+4. the sanitized raw local-config inventory below contains exactly one
+   `remote.origin.url` whose unrewritten value equals the manifest repository URL;
 5. the requested source subdirectory is a directory inside the canonical
    checkout without a symlink escape.
 
@@ -883,8 +1017,9 @@ with normal clean-worktree semantics.
 
 Verification performs no fetch, checkout, remote mutation, configuration change,
 or network access. Every Git subprocess used by shared verification or snapshot
-construction uses one crate-private sanitized read-only runner; layout's
-separately authorized acquisition commands do not use this restricted runner.
+construction uses one crate-private sanitized read-only runner. Layout
+acquisition uses the separate sanitized bare-fetch runner defined below; neither
+path invokes ambient Git configuration.
 It clears the inherited environment, preserves only `PATH` plus the Windows
 process-loader variables `SystemRoot`, `WINDIR`, and `PATHEXT` and temporary-path
 variables `TEMP` and `TMP` when those variables exist, sets `LC_ALL=C`, and sets
@@ -896,12 +1031,13 @@ credential, transport, prompt, or trace override survives; with no `HOME` or
 `XDG_CONFIG_HOME`, no global user config is read.
 
 Every invocation also supplies the equivalent explicit global options
-`--no-optional-locks --no-replace-objects --no-lazy-fetch
+`--no-pager --no-optional-locks --no-replace-objects --no-lazy-fetch
 --literal-pathspecs`, followed by `-c core.fsmonitor=false`,
 `-c core.untrackedCache=false`, `-c core.attributesFile=<platform-null>`,
 `-c core.excludesFile=<platform-null>`, and `-c submodule.recurse=false`, before
 the built-in subcommand. The runner permits only the required `rev-parse`,
-`ls-tree`, `ls-files`, `remote get-url`, and `cat-file` operations.
+`ls-tree`, `ls-files`, `cat-file`, and
+`config --local --null --list --show-origin --no-includes` operations.
 Repository-local configuration remains readable only where Git needs repository
 identity, but it cannot enable a filesystem-monitor helper, external attributes
 or excludes, optional index update, replacement object, pathspec magic,
@@ -910,6 +1046,64 @@ requests Git worktree conversion, repository-local filter, diff, textconv, and
 credential commands are inert. A Git version that does not accept the required
 global options fails closed as `SourceVerification`; the driver does not retry
 with a weaker invocation.
+
+The NUL-delimited local-config inventory is read without includes. Every reported
+origin must be the already protected canonical common config or per-worktree
+config file. Any `include.*`, `includeIf.*`, `url.*`, custom remote-helper,
+remote upload/receive-pack, credential helper, `core.sshCommand`, or protocol/ext
+configuration fails `SourceVerification`. Exactly one raw
+`remote.origin.url` must equal the pin; no `remote get-url` expansion is used.
+Filter/diff/textconv entries may remain because the closed read-only command set
+never invokes them, and the sentinel tests prove that property.
+
+The acquisition runner begins with the same cleared environment, locale,
+no-prompt, no-replacement, no-lazy-fetch, and no-system/global-config baseline.
+It additionally clears proxy, askpass, SSH, template, hook, config-include,
+worktree, object-directory, alternate-object, and credential environment
+variables; sets `GIT_CONFIG_GLOBAL=<platform-null>`; and supplies command-line
+configuration that fixes `core.hooksPath` and `init.templateDir` to one verified
+empty run-owned directory, empties `credential.helper`, disables HTTP redirects,
+and permits only the HTTPS protocol. The manifest repository URL has the SG-03.4
+grammar and is passed literally, never through a remote name. There is no SCP,
+SSH, `git://`, HTTP, file, ext, or custom remote-helper production path.
+
+Each acquisition starts in a new descriptor-rooted unique Taffy stage and runs
+only this closed command sequence:
+
+```text
+git <sanitized-global-options> init --bare --template=<verified-empty-dir> \
+    --object-format=<sha1-for-40-bytes|sha256-for-64-bytes> <stage>
+git <sanitized-global-options> --git-dir=<stage> fetch \
+    --no-tags --no-write-fetch-head --recurse-submodules=no --refmap= \
+    <literal-https-url> \
+    <exact-revision>:refs/surgeist-acquire/<lease-token>
+```
+
+Rust reads the newly written bare config without following links and accepts
+only Git's known non-executable `core.repositoryformatversion`, `core.filemode`,
+`core.bare`, `core.logallrefupdates`, `core.ignorecase`, and
+`core.precomposeunicode` keys plus the revision-derived
+`extensions.objectformat` value with their expected scalar forms. Any include,
+remote, URL, protocol, hook, filter, diff, credential, fsmonitor, extension, or
+unknown config is `SourceVerification`; repository config is never reused from a
+prior cache. The command-line empty hooks directory suppresses reference-
+transaction and every other hook even while fetch writes the private ref.
+
+The fetched ref must resolve to the exact full object ID. The sanitized read-only
+runner then enumerates the pinned commit tree and reads raw blobs directly; no
+worktree, index, checkout, submodule, smudge/clean/process filter, LFS program, or
+post-checkout hook exists in this acquisition. Only after snapshot verification
+does the rooted publication transaction make the complete bare cache visible.
+An existing cache is verification input, never an acquisition stage to update in
+place.
+
+Focused tests use a crate-private test-only local-file transport capability with
+an exact canonical source directory; production has no such branch. With
+sentinel system/global/home/local includes, templates, hooks, URL rewrites,
+credential/filter helpers, askpass, proxies, and Git environment variables
+configured, the local fetch succeeds while no sentinel executes or target is
+rewritten. The tests need no network and separately assert the production runner
+rejects a file URL and emits the exact HTTPS-only argv/environment.
 
 `VerifiedSource` retains the canonical worktree root and exact revision and
 cannot be constructed publicly without verification. It also privately retains
@@ -955,23 +1149,26 @@ exact source revision, normalized path, and SHA-256 digest.
 CSS constructs this snapshot after the clean worktree/origin/HEAD check and
 before capability preflight, then imports only retained snapshot bytes after the
 lease. A checkout path change after snapshot creation cannot alter imported
-bytes. Layout acquisition occurs beneath its lease; after checkout and exact-pin
-verification it uses the same commit-tree snapshot for Taffy import. Expected
-file counts are checked against the snapshot before any corpus mutation.
+bytes. Layout acquisition occurs beneath its lease; after its fresh bare fetch
+and exact-pin verification it uses the same commit-tree snapshot for Taffy
+import. Expected file counts are checked against the snapshot before any corpus
+mutation.
 
 Every snapshot consumer validates the complete source-protection set against its
 downstream writable namespaces. CSS performs the SG-07.2 check before its lease
-or any mutation. Layout may create/update its manifest-owned checkout only after
-its lease, but after verification it requires that checkout's protected set to
-be disjoint from the Taffy import destination, layout artifact/report roots, and
+or any mutation. Layout may create and publish its manifest-derived bare cache
+only after its lease, but its planned cache namespace is checked before
+acquisition and its verified bare Git/object protection set must be disjoint from
+the Taffy import destination, layout artifact/report roots, browser cache, and
 coordination namespace before snapshotting or mutating any destination; a
-conflict is `InvalidPath`. The manifest-owned checkout cache itself is the only
-source-side namespace layout may mutate.
+conflict is `InvalidPath`. The exact Taffy cache and its private stage are the
+only source-side namespaces layout may mutate.
 
-The layout `import-taffy` command retains its existing explicitly
-acquisition-capable fetch/checkout behavior in domain code after the SG-10
-capability preflight and lease, then passes the result through this verifier. No
-test or verification gate invokes that command.
+The layout `import-taffy` command remains explicitly acquisition-capable after
+the SG-10 capability preflight and lease, but uses the closed bare-fetch sequence
+above instead of the copied checkout workflow, then passes raw snapshot bytes
+through this verifier. No test or verification gate contacts the real remote or
+invokes the real acquisition path.
 
 CSS `import-csstree` never acquires a source: it requires
 `--source-root <path>` and verifies that user-supplied checkout.
@@ -1036,8 +1233,8 @@ canonical protected directories and owner/corpus roots plus checked relative-pat
 joins. It also compares descriptor `(device, inode)` ancestry sets for every
 existing protected and nearest-existing writable directory in both directions;
 this detects case aliases, bind/null mounts, firmlinks, and other pathname aliases
-that canonical text does not collapse. A filesystem-equivalent component policy
-is used for not-yet-created writable suffixes. Thus an external ordinary or
+that canonical text does not collapse. SG-04 exact-pair probes run independently
+in each actual parent needed by a not-yet-created writable suffix. Thus an external ordinary or
 linked checkout and every object store it uses remain strictly read-only even
 when the user supplies an aliased owner or corpus nested within one of those
 locations.
@@ -1071,10 +1268,27 @@ JSON Pointer escaping replaces `~` with `~0` and `/` with `~1`. The driver does
 not copy AST values, CSSTree error messages, offsets, comments, or recovery ASTs.
 Those are upstream implementation details, not Surgeist expectations.
 
-Malformed top-level shapes, nonobject ordinary cases, missing/nonstring `source`,
-ordinary cases without `ast`, nonarray `error`, nonobject error entries, invalid
-`options`, invalid `generate`, duplicate derived IDs, and unmatched manifest
-overrides fail before any expectation or report write.
+Preserved `options` are recursively canonicalized: object keys use decoded
+Unicode scalar lexicographic order at every depth, arrays retain source order,
+strings retain decoded values, and booleans/null/numbers use Serde JSON's one
+deterministic serialization. Source member order and insignificant whitespace
+therefore cannot change expectation bytes.
+
+Before typed interpretation, a crate-private streaming JSON visitor consumes the
+entire raw byte slice and rejects a duplicate member name in every object at any
+depth. This applies to top-level fixture labels, ordinary-case members such as
+`source`, `options`, `generate`, and `ast`, each object inside `error`, and nested
+`options` objects. Member identity is the decoded JSON string, so escaped and
+literal spellings of the same key collide. The visitor rejects trailing values
+and malformed UTF-8/JSON and only then permits the typed CSSTree conversion; no
+last-member-wins parser behavior is observable. Generated CSS expectations and
+reports use the same duplicate-rejecting reader during offline verification.
+
+Malformed top-level shapes, duplicate object members, nonobject ordinary cases,
+missing/nonstring `source`, ordinary cases without `ast`, nonarray `error`,
+nonobject error entries, invalid `options`, invalid `generate`, duplicate derived
+IDs, and unmatched manifest overrides fail `InvalidInventory` before any
+expectation or report write.
 
 ## SG-08 Hashes and provenance
 
@@ -1107,104 +1321,181 @@ their distinct schema relationships described above.
 ## SG-09 Atomic installation and stale-output behavior
 
 `ArtifactPlan` owns the supplied `CorpusLocation`'s canonical corpus-root
-identity, a `BTreeMap` of unique corpus-relative output paths to bytes, and the
-exact retained output inventory for a full run. Construction hashes content and
-rejects path collisions before touching disk. There is no public plan rooted at
-an independently supplied path.
+identity, validated domain, a `BTreeMap` of unique corpus-relative output paths to
+bytes, and the exact retained output inventory for a full run. Construction
+hashes content and rejects path collisions before touching disk. There is no
+public plan rooted at an independently supplied path, and internal installation
+requires its matching live lease.
 
-On Linux and macOS, an internal rooted-filesystem capability opens the plan's
-bound corpus root (or a crate-private cache root) once and performs every
-traversal, create, open, rename, and remove relative to held directory
-descriptors with non-following `rustix` filesystem operations.
-It opens each directory component separately and refuses symbolic links. An
-attacker rename may detach an already-held directory, but it cannot redirect an
-operation to another object or outside the held root. Construction compares the
-opened root identity with the supplied canonical path before adopting the
-capability. Pathname validation alone is never mutation authority. No OS
-descriptor is public.
+The only mutation target claimed and verified in this cycle is
+`aarch64-apple-darwin`. On that target an internal rooted-filesystem capability
+opens the plan's bound corpus root (or a crate-private owner-cache root) once and
+performs every traversal, create, open, rename, sync, and remove relative to held
+directory descriptors with non-following safe `rustix` operations. It opens each
+component separately, refuses symbolic links, and compares the opened root
+identity with the supplied canonical path before adoption. Pathname validation
+alone is never mutation authority and no OS descriptor is public.
 
-The capability never crosses a mount boundary. On Linux it requires `statx`
-`STATX_MNT_ID` for the held root and every opened existing component and rejects
-a missing mount-ID result or any change; this detects bind mounts even when
-`st_dev` is equal. On macOS it requires both `fstat().st_dev` and
-`fstatfs().f_fsid` to match the held root for every component. A platform or
-filesystem that cannot supply the required identity fails mutation preflight as
+Every opened or newly created component must have both the root's
+`fstat().st_dev` and `fstatfs().f_fsid`; a missing value or change is
 `UnsupportedPlatform`. Newly created directories are reopened and checked before
-use. Collection and stale walks do not enter a mount point, and source/writable
-alias comparisons use the descriptor ancestry identities in SG-07.2. This
-prevents a held corpus/cache descriptor from being used as authority over a
-mounted alias to another tree.
+use. Collection, clone, and stale walks do not enter a mount point, and
+source/writable aliases use descriptor ancestry plus the per-parent SG-04 proof.
+This prevents a held corpus/cache descriptor from authorizing a mounted or
+firmlinked alias to another tree.
 
-Safe descriptor-relative mutation is unavailable from this implementation on
-every target other than Linux and macOS, including other `cfg(unix)` targets.
-Those targets fail with `UnsupportedPlatform` before creating or opening any
-coordination, cache, import, artifact, or report path for write. Read-only
-manifest, inventory, hash, provenance, and corpus checks remain portable. The
-binaries compile on unsupported targets and report the semantic failure;
-operator documentation states this exact target boundary.
+Every other target is outside this cycle's mutation and binary-support claim.
+When its default shared core is built, each mutation-capable entry point returns
+`UnsupportedPlatform` before coordination, cache, import, artifact, or report
+writes; read-only value, manifest, inventory, hash, provenance, and corpus logic
+remains available. The already-installed `wasm32-unknown-unknown` standard
+library provides the explicit nonmutation compile check in SG-13.3. Linux and
+other native driver support are a bounded future handoff, not an unverified
+promise in this candidate.
 
-Supported Linux requires runtime `renameat2` `NOREPLACE` and `EXCHANGE`; macOS
-requires `renameatx_np` with the equivalent flags. Before a mutation-capable
-command acquires its lease or changes domain state, a descriptor-rooted private
-probe beneath `<corpus-root>/.surgeist-generator/` creates two exclusive
-files, exercises both flags, and removes them. `ENOSYS`, `EINVAL`, or
-`EOPNOTSUPP` maps to `UnsupportedPlatform`; probe residue is best-effort removed
-and reported, and no cache, import, artifact, or report mutation follows. Direct
-`ArtifactPlan::install` performs the same probe inside its bound canonical corpus
-root before it backs up or installs a final target.
+Supported macOS requires runtime `renameatx_np` `RENAME_EXCL` and `RENAME_SWAP`.
+While the acquisition gate is held and before a lease is returned, a
+descriptor-rooted journaled probe beneath the coordination root exercises both
+flags, syncs the parent, removes only its verified objects, and syncs again.
+`ENOSYS`, `EINVAL`, `EOPNOTSUPP`, an identity change, or uncleanable probe is
+`UnsupportedPlatform`; no cache/import/artifact/report mutation follows. Lease
+acquisition records successful recovery/probing, so internal plan installation
+rejects an unmatched lease rather than probing outside exclusivity.
 
-The transaction namespace has an explicit exclusivity contract. The output and
-coordination roots are generator-owned, and callers must not mutate them outside
-this generator while a generation lease is held. Cooperating generator processes
-obey that lease. Pre-existing names, links, special entries, and residue remain
-untrusted and are rejected. A non-cooperating same-user process that rewrites
-names after lease acquisition is outside the supported contract; descriptor
-rooting still prevents an ancestor rename from escaping the held root, but the
-generator does not claim a conditional-unlink primitive the OS does not provide.
+The transaction namespace has an explicit exclusivity contract. The publication
+and coordination roots are generator-managed for the duration of a live lease;
+cooperating generator processes obey it. Pre-existing names, hard links,
+symlinks, special entries, mounts, and unjournaled residue are untrusted and
+rejected. A non-cooperating same-user process that changes those namespaces while
+leased is outside the supported contract, while descriptor rooting still
+prevents escape or overwrite of an unexpected object.
 
-Within that exclusive namespace, every destination transition is collision-safe.
-New files use exclusive descriptor-relative create. Backup, install, and rollback
-renames use `renameat_with(NOREPLACE)`. Existing targets must be regular and
-single-link before backup. Cleanup moves the already-verified object to a unique
-transaction tombstone without replacement, rechecks the moved descriptor, then
-unlinks it. An observed identity/type/link mismatch leaves the disputed tombstone
-untouched, returns a terminal transaction error, and never deletes the disputed
-inode. No check-then-plain-rename, in-place truncate, or unrooted remove is
-mutation authority.
+### SG-09.1 One-root publication unit
 
-Installation follows one transaction:
+One transaction has exactly one final publication root. Layout generation uses
+`xml`, including `xml/generation-reports`; layout import uses the complete `html` tree;
+CSS import uses `import_root`; CSS generation uses `expectation_root`, including
+its required report child. A command never tries to commit two final roots.
+Owner-cache acquisition similarly publishes one complete version/revision
+directory. This closed unit makes one filesystem operation the real
+linearization point.
 
-1. create every parent beneath the output root;
-2. write every new artifact to a unique sibling file opened with `create_new`;
-3. flush and sync each staged file;
-4. rename existing replacement and stale generated files to unique sibling
-   backups in deterministic path order;
-5. install staged artifacts by rename in deterministic path order;
-6. on any failure, remove installed new files, restore every backup, and remove
-   remaining staged files;
-7. after success, delete backups and remove only now-empty generated directories.
+Before staging, a rooted walk inventories the current unit in normalized path
+order and accepts only ordinary single-link files and same-mount directories.
+It rejects links, special entries, reserved/transaction aliases, and mount
+crossings. A clean full run builds only the complete retained state plus
+explicitly domain-classified preserved files; an unknown regular file is
+`InvalidInventory`, not silently retained or deleted. Layout `xml` classifies
+only generated XML and structurally valid generation-report paths (including
+nonmanifest stale candidates), layout `html` additionally classifies
+validated Surgeist-authored fixtures, and both CSS publication roots classify
+only their generated JSON. A filtered or recoverable-diagnostic
+run safely clones the validated current tree into its stage, overlays successful
+artifacts, and deliberately retains stale/nonmanifest output. Layout HTML import
+clones every validated Surgeist-authored fixture byte-for-byte and replaces or
+prunes only manifest-classified Taffy files. No path is mutated in place.
 
-The transaction never removes a file outside the declared generated extension
-and roots. It never follows an output symlink. Residual temporary or backup names
-from another process are collisions, not files to overwrite. Every prospective
-stage and backup name is checked even when its final target does not exist.
-`ArtifactPlan` rejects any component filesystem-equivalent to
-`.surgeist-generator` in a generated root, artifact, retained path, or report
-path, at any nesting depth: exact spellings fail construction, and an alias
-known only through the private name probe fails install preflight before staging.
-Its stale collector never enters a directory whose
-descriptor/name is equivalent to that reservation. Together with the
-location-bound corpus root and SG-04 root rejection, callers cannot select the
-coordination directory as an output root, target the current root-level
-coordination files, or reach a nested corpus's coordination files through a
-parent-corpus plan.
+The new tree is created as a unique sibling of the final root on the same held
+parent. Every directory and exclusive-created regular file is synced bottom-up;
+the stage is reopened and its complete normalized `(path, type, mode, length,
+sha256)` inventory is hashed. Before any final transition, an immutable schema-1
+journal is exclusively published and synced beneath
+`.surgeist-generator/transactions/<domain>/<transaction-id>/`. It records the
+domain, corpus/cache root identity and mount, final parent identity, final/stage
+names, expected old-tree digest or `absent`, expected new-tree digest, operation
+mode, and outcome class. Synced immutable old/new inventory sidecars record each
+entry's relative path, type, mode, device/inode identity, link count where
+applicable, length, and content digest; their own digests are in the journal.
+The transaction ID is random 128-bit lowercase hex and all recorded relative
+paths are revalidated on read.
 
-The public `ArtifactPlan` commits one coherent artifact group. Each domain driver
-uses a crate-private composite publication plan in the same module to combine
-all run artifacts, authorized stale removals, the canonical report, and
-authorized nonmanifest-report removals into one staged commit/rollback boundary.
-No domain run commits one group and then starts another. Outcomes are classified
-before that publication boundary:
+On the supported target, every lease/stage/profile/transaction token is an exact
+16-byte read from `/dev/urandom`, rendered as 32 lowercase hex bytes. Failure to
+open/read the device is `UnsupportedPlatform`; there is no clock/PID fallback.
+An exclusive-create collision retries with a fresh token at most 16 times, then
+fails without adopting the colliding name.
+
+A corpus publication journal is recoverable through any valid owner ancestor
+because its final root is beneath the canonical corpus. An owner-cache journal
+also records the exact canonical owner and cache capability identities; recovery
+is allowed only when the recorded cache remains beneath the invocation's current
+owner and repeats the namespace matrix. Otherwise acquisition fails closed with
+`ArtifactTransaction` and identifies that recovery requires the recorded owner;
+it never reaches outside current owner authority.
+
+The sole commit operation is:
+
+- final absent: rename the complete stage to the final name with `RENAME_EXCL`;
+- final present: atomically exchange the complete stage and final root with
+  `RENAME_SWAP`.
+
+The held parent is then synced. At no instant does a cooperating reader observe a
+partially renamed file set: it sees the complete old tree or complete new tree.
+For an exchange the stage name now designates the complete old tree. The
+transaction publishes and syncs an immutable `committed` marker only after the
+final path is reopened and its digest equals the journal's new-tree digest.
+
+### SG-09.2 Recovery and cleanup states
+
+Lease acquisition, while holding the domain mutex and before returning the
+lease, recovers every journal for that domain in transaction-ID order. Recovery
+opens all names descriptor-relatively, recomputes inventories, and has this
+closed state machine:
+
+| Observed durable state | Classification and action |
+| --- | --- |
+| final = old/absent; stage = complete new; no marker | pre-commit; publish `aborted` marker, keep final, clean stage |
+| final = old/absent; stage = new-inventory subset/absent; `aborted` marker | aborted cleanup; keep final, continue stage then journal-tombstone cleanup |
+| final = complete new; stage = complete old/absent; no marker | commit occurred; publish `committed` marker, keep final, clean old stage |
+| final = complete new; stage = old-inventory subset/absent; `committed` marker | committed cleanup; keep final, continue stage then journal-tombstone cleanup |
+| final/stage/marker differs from journal | disputed; return `ArtifactTransaction` without removing or renaming either tree |
+
+Removal is descriptor-rooted and postorder. Each remaining entry's mount,
+identity, type, and mode—and, for a regular file, its single-link count, length,
+and digest—are rechecked against the applicable sidecar immediately before
+unlink. Once an `aborted` or
+`committed` marker is durable, a crash-partially-deleted stage is accepted only
+when its remaining names and identities are an exact subset of that sidecar;
+this makes stage cleanup itself restartable. A mismatch leaves the residue and
+journal untouched.
+
+After the stage is gone, recovery publishes a synced immutable `cleanup-complete`
+receipt, renames the validated journal directory with `RENAME_EXCL` to its unique
+`completed-<transaction-id>` name, and syncs the transactions parent. Tombstone
+cleanup removes validated sidecars/markers while retaining that receipt until
+last. A crash therefore leaves either a tombstone with its valid receipt or an
+empty tombstone; recovery continues the former and may remove the latter only
+with descriptor-relative `rmdir`, which fails if any entry appeared. Any
+receipt-less nonempty or identity-mismatched tombstone is disputed. The parent is
+synced after final `rmdir`. Unjournaled stage/tombstone names are collisions,
+never cleanup candidates.
+
+A staging or pre-commit failure removes its verified stage/journal and leaves the
+old final unchanged; inability to complete that cleanup returns
+`ArtifactTransaction` and the next lease retries from the journal. Process death
+before the swap therefore leaves old final plus new stage; death after the swap
+leaves new final plus old stage. Recovery distinguishes them by full-tree digest
+even if death occurred before the marker write.
+
+The swap is the irreversible commit point. A failure to sync, mark, or delete the
+old stage after it returns successfully does **not** attempt an impossible
+rollback: the complete new final remains visible, the durable journal identifies
+it as committed, and the call returns `ArtifactTransaction`. Such a result is not
+final verification evidence; read-only checks report the unresolved journal as
+`Verification`, and the next mutation lease retries cleanup. Once post-commit
+cleanup succeeds, the same coherent new final remains and the journal disappears.
+
+Every internal artifact plan rejects any component filesystem-equivalent to the
+reserved coordination or transaction names in a generated root, artifact,
+retained path, or report path at any depth. Exact spellings fail construction; SG-04 probes fail
+aliases before staging. Together with its location-bound root, callers cannot
+select, contain, or reach current or nested coordination state. Stale selection
+is limited to the declared generated extension and full retained inventory; root
+cloning preserves every other authorized file.
+
+### SG-09.3 Domain outcomes
+
+Outcomes are classified before staging:
 
 - A clean full success has no `failed_to_generate` cases. It atomically installs
   the complete artifact set, prunes stale generated artifacts from the complete
@@ -1221,18 +1512,17 @@ before that publication boundary:
   returns `Generation`. This diagnostic state is not final verification evidence.
 - A fatal lifecycle failure is any manifest/source/capability/lease/acquisition,
   invariant/serialization, unassigned generation, browser/task/profile cleanup,
-  or publication transaction failure. It publishes no artifact or report and
-  removes no stale output: a publication failure rolls the entire composite plan
-  back before returning. It never emits a diagnostic report merely because the
-  fatal path failed.
+  or pre-commit publication failure. It publishes no artifact or report and
+  removes no stale output. It never emits a diagnostic report merely because the
+  fatal path failed. A post-commit cleanup failure is the explicit SG-09.2
+  exception: it returns `ArtifactTransaction` with the complete new tree and
+  recovery journal intact, never a mixed tree.
 
 CSS has no recoverable per-case execution in this cycle: malformed or
 unconvertible neutral input is a fatal pre-publication error. Layout's
 recoverable behavior preserves the copied generator's externally useful
 partial-success/failed-case report contract, but deliberately buffers successful
 XML until resource cleanup instead of writing it incrementally.
-
-The canonical report itself uses the same staged replace-and-rollback primitive.
 
 ## SG-10 Generation leases and lifecycle
 
@@ -1241,10 +1531,14 @@ domain plus canonical corpus-root digest, so full and filtered runs for the same
 domain/corpus contend while unrelated layout and CSS corpora may run concurrently.
 The immutable lease and acquisition-gate files plus mutable owner record live
 beneath the single reserved
-`<canonical-corpus-root>/.surgeist-generator/` directory. The owner record
-includes generator, PID, owner root, corpus root, scope, command, and Unix start
-time. Because placement depends only on the canonical corpus, distinct valid
-owner ancestors acquire the same gate and mutex.
+`<canonical-corpus-root>/.surgeist-generator/` directory. The corpus-wide gate is
+`acquisition.lock`; each validated domain has
+`leases/<domain>/mutex.lock` and `leases/<domain>/owner.json`, and its transaction
+journals use `transactions/<domain>/`. The owner record includes generator, PID,
+owner root, corpus root, scope, command, and Unix start time. Because placement
+depends only on the canonical corpus and domain, distinct valid owner ancestors
+acquire the same gate and domain mutex, while different domains share only the
+short-lived gate.
 
 The acquisition gate is locked while a complete owner stage is written, synced,
 and atomically installed, preventing a contender from observing stale, empty, or
@@ -1252,8 +1546,22 @@ partial ownership. A held lease returns a semantic `LeaseActive` error with the
 recorded owner. Dropping the lease releases it. Coordination files may remain on
 disk for reuse; they are not generated corpus artifacts.
 
-On Linux and macOS, coordination directories and lock files are reached through
-the same safe descriptor-relative, non-following capability described in SG-09.
+Immediately after locking the gate, acquisition resolves only coordination-
+bootstrap probe journals, then opens and tries the domain mutex without touching
+a domain/cache namespace. If the mutex is contended, it reads the last complete
+owner record and returns `LeaseActive` without probing or replacing it. Once the
+mutex is acquired, it resolves that domain's SG-04 probe journals, owner-record
+journal, and SG-09 domain/cache journals; performs the actual-parent namespace
+and capability probes; publishes the new owner record; then releases the gate and
+returns the mutex-backed lease. A complete probe is removed only by its recorded
+descriptor identities; a crash-partially-cleaned probe is continued from its
+immutable expected-entry sidecar, and a disputed entry fails closed. No contender
+can observe or reuse an intermediate coordination state, and no probe runs beside
+an active same-domain generator.
+
+On supported Apple Silicon macOS, coordination directories and lock files are
+reached through the same safe descriptor-relative, non-following capability
+described in SG-09.
 An existing coordination directory is adopted only when its directory entry has
 the exact on-disk name `.surgeist-generator`, not merely a filesystem-equivalent
 spelling, and its opened identity/mount matches the expected corpus child.
@@ -1274,7 +1582,8 @@ not direct final-name creation:
    type/one link, acquire its lock, and reread/recheck the same descriptor before
    adoption.
 
-A crash before publication can leave only a uniquely named unpublished stage;
+A final gate/mutex name is adopted only when its on-disk spelling is exact. A
+crash before publication can leave only a uniquely named unpublished stage;
 it cannot expose a partial final file or block a later unique publisher. A crash
 after publication leaves a complete synced immutable final inode and releases
 its advisory lock. Pre-existing empty, partial, multi-link, special, aliased-name,
@@ -1283,17 +1592,20 @@ and held while the lease mutex and owner metadata are created/adopted. A hard
 link added later cannot expose a content mutation because these two final inodes
 remain immutable.
 
-Mutable owner metadata lives in a separate owner file. Acquisition writes a new
-single-link, exclusively created and synced stage file, then uses an atomic
-descriptor-relative exchange with the owner name. The displaced owner is
-accepted for deletion only after its open descriptor proves the previously
-observed identity, single-link count, regular type, and magic header; otherwise
-the exchange is reversed without overwriting either inode and acquisition fails.
-The first owner install uses `NOREPLACE`. A contender holds the immutable gate
-lock while reading the owner file, so it observes one complete header-plus-owner
-record. No existing lock or owner inode is truncated or written in place. On
-targets other than Linux and macOS, acquisition returns `UnsupportedPlatform`
-before coordination writes.
+Mutable owner metadata lives in a separate owner file and uses the SG-09.2
+single-file journal while the immutable gate is held. Acquisition validates and
+hashes any existing regular single-link owner record, writes and syncs a complete
+new stage, publishes the journal, then uses `RENAME_EXCL` for first install or
+`RENAME_SWAP` for replacement. The final name therefore changes at one commit
+point; a displaced old record is removed only after identity/hash recheck, and a
+post-commit cleanup failure leaves the complete new owner plus its recovery
+journal. A contender holding the gate resolves that journal before reading the
+owner file, so it observes one complete header-plus-owner record. No existing
+lock or owner inode is truncated or written in place. The internal lease is
+returned only when no unresolved journal remains. A disputed journal releases
+the mutex and returns `ArtifactTransaction`. On every
+target other than `aarch64-apple-darwin`, acquisition returns
+`UnsupportedPlatform` before coordination writes.
 
 Layout's synchronous worker owns one private resource set beneath the lease. A
 newly launched browser, page, handler `JoinHandle`, acquisition stage, generated
@@ -1317,20 +1629,23 @@ scheduling jobs and run the same terminal sequence before the worker can return:
    profile is retained under its collision-safe run name and returned as a
    `Generation` cleanup error, never recursively removed through an untrusted
    path;
-5. remove or roll back every incomplete browser/Taffy acquisition stage while
-   preserving any pre-existing or fully atomically installed cache entry;
+5. remove every verified pre-commit browser/Taffy acquisition stage while
+   preserving any pre-existing cache; a cache root already committed by the
+   SG-09 swap remains coherent and its journal is retained if old-stage cleanup
+   cannot complete;
 6. drop the lease only after all active child/task work has terminated and every
    remaining run-owned path is either removed or reported as terminal residue.
 
 Layout collects all XML and report bytes in memory. It does not install an
 artifact, prune stale output, or publish a report until measurement and the
 browser/task/profile terminal sequence have succeeded. Once publication begins,
-the synchronous SG-09 transaction runs to success or complete rollback without
-an async cancellation point. A fatal browser, handler, unassigned measurement,
-profile, or cache cleanup error therefore leaves final artifacts, stale outputs,
-and canonical reports unchanged; only an SG-09 recoverable case-assigned
-measurement failure authorizes the exact diagnostic publication described
-there. The private worker thread is joined by the public function,
+the synchronous SG-09 transaction reaches either its pre-commit unchanged state
+or its one atomic commit without an async cancellation point. A fatal browser,
+handler, unassigned measurement, profile, or pre-commit cache cleanup error
+therefore leaves final artifacts, stale outputs, and canonical reports unchanged;
+only an SG-09 recoverable case-assigned measurement failure authorizes the exact
+diagnostic publication described there. Post-commit cleanup follows SG-09.2 and
+never exposes a partial tree. The private worker thread is joined by the public function,
 so dropping a Rust future is not an API operation and returning to the caller
 means no browser or handler work remains.
 
@@ -1373,11 +1688,11 @@ CSSTree checkout read-only, validates its complete worktree/Git/object protectio
 set against every prospective writable namespace, and only then snapshots it,
 performs capability preflight, and acquires the lease for import. Layout validates
 manifest acquisition inputs before the lease; its mutable browser/cache and
-Taffy fetch/checkout work runs only after capability preflight and lease
+Taffy sanitized bare-fetch work runs only after capability preflight and lease
 acquisition, followed by exact-pin verification and protection-set validation
 before destination writes. Every mutation-capable command follows this ordering.
-Generation and install errors retain failure provenance and perform rollback as
-defined in SG-09.
+Generation and install errors retain failure provenance and follow the exact
+pre-commit, committed, recovery, and cleanup states in SG-09.
 
 ## SG-11 Domain commands and thin binaries
 
@@ -1471,18 +1786,18 @@ No binary remaps a semantic error independently.
 | Failure | Required kind | Mutation rule |
 | --- | --- | --- |
 | Missing/duplicate/unknown CLI argument | `Cli` | No filesystem mutation |
-| Root, relative path, symlink/mount escape, or textual/filesystem-equivalent protected/writable namespace overlap | `InvalidPath` | No domain mutation; private probe cleanup only |
+| Root, relative path, symlink/mount escape, or textual/filesystem-equivalent protected/writable namespace overlap | `InvalidPath` | No domain mutation; private probes cleaned, exact coordination bootstrap may remain |
 | TOML parse, version, or field contract | `InvalidManifest` | No corpus mutation |
 | Count, duplicate, unmatched override, or malformed CSSTree case | `InvalidInventory` | No artifact/report mutation |
 | Wrong/dirty Git source or origin, malformed Git storage, unsupported sanitized Git invocation, or missing promised object | `SourceVerification` | No import mutation |
-| Unsupported target or missing required rename, mount-identity, or name-equivalence capability | `UnsupportedPlatform` | No cache/import/artifact/report mutation; private probe cleanup only |
+| Non-Apple-Silicon-macOS mutation request, or missing required rename, mount-identity, or name-equivalence capability | `UnsupportedPlatform` | No cache/import/artifact/report mutation; supported-host probes cleaned and exact coordination bootstrap may remain |
 | Contended generation lease | `LeaseActive` | No corpus mutation |
 | Git/browser subprocess failure | `Process` | Domain cleanup; no stale pruning |
-| Read/write/canonicalize failure | `Io` | Transaction rollback where applicable |
-| Stage/backup/install/restore failure | `ArtifactTransaction` | Best-effort complete rollback with terminal diagnostic |
+| Read/write/canonicalize failure | `Io` | Pre-commit final unchanged; post-commit state follows journal |
+| Journal/stage/swap/recovery/cleanup failure | `ArtifactTransaction` | Pre-commit final unchanged, or post-commit complete new final plus durable recovery journal |
 | Recoverable case-assigned layout page/measurement/batch failure after successful resource cleanup | `Generation` | SG-09 diagnostic publication; no stale/nonmanifest pruning |
-| Unassigned layout generation/resource cleanup or CSS neutral conversion failure | `Generation` | Complete composite rollback; no artifact/report/stale mutation |
-| Offline hash/provenance/report mismatch | `Verification` | Check commands remain read-only |
+| Unassigned layout generation/resource cleanup or CSS neutral conversion failure | `Generation` | No publication commit; final artifact/report/stale state unchanged |
+| Offline hash/provenance/report mismatch or unresolved probe/owner/transaction journal | `Verification` | Check commands remain read-only |
 
 ## SG-13 Verification behavior
 
@@ -1491,7 +1806,7 @@ No binary remaps a semantic error independently.
 Layout `check-corpus` remains browser-free and validates the schema-2 manifest,
 helper-only asset directory, case/source inventory, report inventory and counts,
 XML inventory, and every provenance hash. `check-taffy-corpus` verifies the
-manifest-derived cached checkout and imported baseline without network access.
+manifest-derived bare object cache and imported baseline without network access.
 
 CSS `check-corpus` reads only the CSS-owned corpus. It validates schema 1, source
 and expectation inventories, exact counts, derived case IDs, disposition reasons,
@@ -1499,8 +1814,23 @@ source-to-expectation one-to-one paths, expectation provenance, report inventory
 all source/artifact hashes, case/report counts, and absence of stale generated
 JSON. It never requires the original CSSTree checkout after import.
 
-All check commands are read-only. A failing check reports the first deterministic
-violation and writes nothing.
+All check commands are read-only. They also inspect their domain's coordination
+inventory and fail on any unresolved probe, owner, transaction, or completed-
+tombstone state; they never recover it. A failing check reports the first
+deterministic violation and writes nothing.
+
+For a pre-existing exact coordination namespace, a check opens the immutable
+gate/mutex files read-only, validates their headers/identities, briefly takes the
+gate's shared advisory lock, then takes and holds the domain mutex's shared lock
+for the complete check before releasing the gate. Both acquisitions are
+nonblocking; contention releases what was acquired and returns `LeaseActive`.
+Mutation leases use exclusive locks, so verification observes one publication
+state without updating owner metadata. If coordination was absent at start, the check creates nothing and
+requires the exact name to remain absent at its final root-identity recheck; its
+later appearance returns `Verification`. If a valid coordination/gate exists but
+this domain has no mutex yet, the check holds the gate's shared lock for its whole
+run, preventing bootstrap; an existing but invalid mutex fails read-only rather
+than being repaired.
 
 ### SG-13.2 Focused test outlines
 
@@ -1525,6 +1855,11 @@ Shared-core tests shall prove:
    raw HEAD/index/worktree cleanliness proof, verification leaves the complete
    source/Git tree unchanged, and raw filtered-byte mismatch, skip-worktree,
    assume-unchanged, index/tree drift, and nonignored untracked paths fail closed;
+   the test-only local acquisition transport fetches an exact object into a fresh
+   bare stage while contaminated system/global/home/local config, templates,
+   hooks, includes, URL rewrites, credentials, filters, askpass, proxies, and Git
+   environment sentinel programs remain unexecuted, and production rejects the
+   same file URL without network access;
 5. dispositions require reasons exactly as SG-07 specifies, reject duplicate
    case IDs, accept repeated source paths for distinct case IDs, and return case-ID
    order;
@@ -1538,37 +1873,50 @@ Shared-core tests shall prove:
    a lock or owner file; concurrent first acquisition publishes only complete
    locked gate/mutex inodes, a race loser adopts the winner, and injected crashes
    before and after `NOREPLACE` leave respectively only an unpublished stage or
-   a complete adoptable final—never an empty/partial poisoned final;
-8. artifact installation is deterministic, replaces atomically, removes stale
-   files only when authorized, and restores every prior file after injected
-   staging, installation, or cleanup failure; descriptor-bound tests replace
-   roots, components, and destination names before each atomic transition and
-   prove no escape, overwrite, or removal of a colliding inode under the SG-09
-   exclusive-namespace contract; a domain composite plan restores artifacts,
-   stale files, canonical report, and nonmanifest reports together after every
-   injected commit point; public plans have no arbitrary output-root
-   constructor, a `CorpusLocation` rooted at/below a coordination directory is
-   rejected, and generated, retained, artifact, report, and stale-walk paths
-   reject or skip filesystem-equivalent `.surgeist-generator` names at the root
-   and at nested depths, proving the equal-root, parent-root-plus-target, and
-   direct-relative bypasses closed; injected case-folding and Unicode-normalizing
-   name policies reject aliased reserved/CSS components before domain writes,
-   and injected Linux mount-ID/macOS device-plus-fsid changes stop traversal;
+   a complete adoptable final—never an empty/partial poisoned final; plan install
+   accepts only a still-live matching corpus/domain lease and rejects a released,
+   foreign-domain, or foreign-corpus lease before probes or writes; read-only
+   verification takes/contends on the shared gate/mutex without creating state,
+   and holds a pre-bootstrap shared gate for the complete check;
+8. artifact publication deterministically builds and syncs one complete staged
+   root, removes stale files only in a clean full staged state, and changes the
+   final namespace with exactly one root swap; injected failures before the swap
+   leave the complete old final, process termination immediately before/after the
+   swap recovers respectively to old/new, and termination during aborted-stage,
+   committed-old-stage, or completed-journal-tombstone cleanup resumes from the
+   exact recorded subset. Marker or old-stage cleanup failure after the swap
+   preserves the complete new final plus a read-only-detectable journal that the
+   next lease clears; no test expects rollback after commit and no observed state
+   is a mixed generation. Descriptor-bound tests replace roots,
+   components, stage/final names, journals, and destination identities before
+   each transition and prove no escape, overwrite, or disputed-object removal;
+   no public plan or lease exists, internal plans have no arbitrary output-root
+   constructor, a `CorpusLocation` rooted at/below coordination is rejected, and generated, retained, artifact,
+   report, clone, and stale paths reject filesystem-equivalent coordination or
+   transaction names at all depths. Exact-parent case/normalization probes use
+   different injected policies in a parent and child and reject only where the
+   actual parent aliases the pair; injected macOS device/fsid changes stop
+   traversal;
 9. hash text validation and report counts/provenance detect drift, shared reports
    accept structurally valid failed/unsupported counts without fictitious
    artifacts while domain validators enforce their own artifact/count mapping,
    and every `GeneratorErrorKind` has the exact SG-12 exit code;
-10. a residual deterministic backup is rejected even when its final target is
-    absent; compile-time target selection is exactly Linux/macOS; every
-    mutation-capable entry point on other targets fails before a coordination,
-    cache, import, artifact, or report mutation; supported-target probe failure
-    leaves no domain mutation and reports any probe residue; test documentation
-    states that non-cooperating namespace mutation while leased is unsupported;
-    missing Linux `STATX_MNT_ID`, missing macOS fs identity, and an inconclusive
-    name-equivalence probe fail `UnsupportedPlatform` after private-probe cleanup;
+10. an unjournaled stage/tombstone is rejected even when its final target is
+    absent; compile-time mutation selection is exactly
+    `aarch64-apple-darwin`; every mutation entry point in the already-installed
+    WASM nonmutation build fails before coordination/cache/import/artifact/report
+    mutation; supported-host rename probe failure leaves no domain mutation and
+    reports any private residue; test documentation states that non-cooperating
+    namespace mutation while leased is unsupported; missing macOS device/fsid or
+    an inconclusive exact-parent name probe fails `UnsupportedPlatform` after
+    private-probe cleanup;
 11. `tests/public_api.rs` type-checks the exact SG-03.4 root reexports,
     constructors, getters, free functions, operation signatures, enum variants,
-    explicit traits, and Serde round trips under default features; the layout,
+    explicit traits, and Serde round trips under default features; invalid public
+    API and raw-Serde values exercise every SG-03.4 identifier, case-ID, reason,
+    URL, revision, extension, count, provenance, and report invariant plus exact
+    constructor kind/context mapping, proving deserialization cannot bypass one;
+    the layout,
     CSS, and combined feature test builds type-check the exact SG-03.3 driver
     additions, including request structs' private construction boundary and
     `Clone + Debug + Eq + PartialEq` commitments. No alternative public module
@@ -1582,21 +1930,24 @@ measurements, and artifacts to prove:
    including a call made from a thread already inside a Tokio runtime without a
    nested-runtime panic;
 3. schema-2 parsing, unknown/duplicate and reserved-coordination overlap
-   rejection, and manifest-derived Taffy pin;
+   rejection, manifest-derived Taffy pin, exact owner-relative browser/Taffy
+   cache derivation, and the complete cache/corpus/helper/HTML/XML namespace
+   matrix before acquisition;
 4. helper/base-style loading and hashes from the supplied corpus;
 5. managed/existing browser validation through injected fetch/version boundaries
-   without launching or acquiring a browser;
+   and sanitized fresh-bare Taffy acquisition through the local sentinel boundary,
+   without launching a browser, using the network, or checking out a worktree;
 6. representative XML shape, four variants, numeric formatting, layout fields,
    and unchanged generated-by provenance;
 7. disposition accounting, full/filtered isolation, and offline drift rejection;
    recoverable case-assigned failures publish successful artifacts plus the
    full-only failed-case diagnostic report, preserve stale/nonmanifest outputs,
    and return `Generation`, while fatal launch/acquisition/cleanup/serialization
-   and composite-publication failures roll back artifacts, report, and stale
-   state together;
-8. a verified Taffy checkout's worktree, linked-worktree administration, common
-   Git directory, primary object directory, and recursive alternates cannot
-   overlap import, artifact/report, or coordination writes;
+   and pre-commit publication failures leave the old complete XML tree; a forced
+   post-commit cleanup failure returns `ArtifactTransaction` with the complete
+   new XML/report tree and recoverable journal, never mixed state;
+8. the planned/fetched Taffy bare cache and object store cannot overlap browser
+   cache, import, artifact/report, helper/manifest, or coordination writes;
 9. injected fatal launch, unassigned-generation, browser-close, handler-join,
    profile, and acquisition-stage failures, plus an injected operation panic
    after all synthetic resources are registered, a successful close with delayed
@@ -1617,13 +1968,19 @@ repositories to prove:
 3. multiple ordinary and error-array cases from one JSON file, multiple
    disposition overrides for that same source, JSON Pointer IDs, sorted cases,
    options, canonical CSS, and omission of AST/error/offset data;
-4. malformed source structures and unmatched overrides fail before writes;
+4. malformed source structures, unmatched overrides, and duplicate decoded JSON
+   members at the top-level ordinary label, ordinary `source`, `options`,
+   `generate`, or `ast`, error-entry, and nested-options levels fail
+   `InvalidInventory` before writes; escaped and literal duplicate-key spellings
+   collide;
 5. equal and component-wise ancestor/descendant overlaps among import,
-   expectation, report, manifest, and coordination namespaces fail with the
-   specified `InvalidManifest` or `InvalidPath` before lease acquisition or any
-   domain directory creation (only a cleaned private alias probe is allowed);
-   case-folded and Unicode-normalized aliases receive the same matrix; a
-   verified checkout equal to, above, or below every CSS
+   expectation, manifest, and coordination namespaces fail with the specified
+   `InvalidManifest` or `InvalidPath`, while the report accepts only its exact
+   required child position within expectation; failures occur before lease
+   acquisition or domain directory creation (only a cleaned private alias probe
+   is allowed). Case-folded and Unicode-normalized aliases receive the same
+   actual-parent matrix, including injected sibling directories with different
+   policies; a verified checkout equal to, above, or below every CSS
    writable/coordination namespace fails with `InvalidPath` while leaving both
    the checkout and owner/corpus trees unchanged; linked-worktree administrative
    and common directories, primary object storage, and a recursively configured
@@ -1631,8 +1988,9 @@ repositories to prove:
    canonical worktree root itself is textually disjoint, including an injected
    mount/path alias with matching descriptor ancestry;
 6. active/default and non-active reason accounting;
-7. full generation writes expectations/report and removes stale outputs only
-   after success;
+7. full generation publishes the complete expectation/report root and removes
+   stale outputs at its single root-swap commit; pre-commit failures retain the
+   old tree and post-commit cleanup failures retain the new tree plus journal;
 8. filtered generation updates only matches and writes/prunes no report;
 9. offline verification detects imported-source, expectation, report, hash,
    provenance, count, and stale-inventory drift.
@@ -1647,6 +2005,7 @@ The final implementation is verified with already-present tooling only:
 cargo check --locked --offline -p surgeist-generator --no-default-features
 cargo test --locked --offline -p surgeist-generator --no-default-features
 cargo clippy --locked --offline -p surgeist-generator --no-default-features --all-targets -- -F unsafe-code -D warnings
+cargo check --locked --offline -p surgeist-generator --target wasm32-unknown-unknown --no-default-features --lib
 cargo check --locked --offline -p surgeist-generator --no-default-features --features layout-browser --all-targets
 cargo test --locked --offline -p surgeist-generator --no-default-features --features layout-browser --all-targets
 cargo clippy --locked --offline -p surgeist-generator --no-default-features --features layout-browser --all-targets -- -F unsafe-code -D warnings
@@ -1659,17 +2018,23 @@ cargo clippy --locked --offline -p surgeist-generator --no-default-features --fe
 cargo fmt --check
 ```
 
-The final gate also builds the tracked/nonignored Surgeist-owned Rust manifest and
-runs the canonical repository-wide unsafe scan. It does not run either binary's
-acquisition or real-corpus generation paths and does not run commands in
-`surgeist-layout` or `surgeist-css`.
+The native matrix runs on and records `rustc -vV` evidence for
+`aarch64-apple-darwin`; a compile-time target assertion in focused tests prevents
+a different host from being presented as supported evidence. The WASM check uses
+the already-installed standard library and compiles the explicit nonmutation
+shared-core branch. No target is installed. The final gate also builds the
+tracked/nonignored Surgeist-owned Rust manifest and runs the canonical
+repository-wide unsafe scan. It does not run either binary's acquisition or
+real-corpus generation paths and does not run commands in `surgeist-layout` or
+`surgeist-css`.
 
 ## SG-14 Documentation, compatibility, and handoff
 
 `README.md` shall describe the shared-core ownership, feature matrix, exact CLI
-syntax, acquisition-capable commands, offline checks, the Linux/macOS-only
-mutation-capability boundary, and the fact that consumer corpora remain in
-layout/CSS. `AGENTS.md` shall cease describing an empty scaffold and shall point
+syntax, acquisition-capable commands, offline checks, the
+Apple-Silicon-macOS-only mutation-capability boundary, the already-verified WASM
+nonmutation core, and the fact that consumer corpora remain in layout/CSS.
+`AGENTS.md` shall cease describing an empty scaffold and shall point
 discovery at the new modules, features, binaries, tests, and offline command
 matrix. No copied workflow is added.
 
@@ -1682,8 +2047,9 @@ Compatibility classification:
   of environment/default state;
 - layout manifest/XML/report schema: compatible schema 2;
 - CSS manifest/expectation/report schema: new schema 1;
-- generator mutation lifecycle: descriptor-confined on Linux/macOS and
-  fail-closed before writes everywhere else;
+- generator mutation lifecycle: descriptor-confined and runtime-verified on
+  `aarch64-apple-darwin`; Linux and other native targets are explicitly deferred,
+  while the already-present WASM target verifies the nonmutation core branch;
 - MSRV: unchanged at 1.97;
 - production dependency graph: unchanged because no production crate is wired.
 
@@ -1698,7 +2064,10 @@ cycles to:
 3. create the CSS-owned schema-1 manifest/corpus, invoke the CSS binary, and add
    CSS consumer tests;
 4. refresh root-owned API audit artifacts only after root integrates the
-   published source.
+   published source;
+5. add Linux or other native mutation support only in an environment that already
+   has the relevant target/tooling, with its own descriptor, mount-identity,
+   atomic-swap, crash-recovery, and full feature-matrix evidence.
 
 Those handoffs do not block this leaf candidate when its synthetic contract and
 feature matrix are clean.
