@@ -281,13 +281,38 @@ impl RunScope {
 
 /// Recursively inventories regular files with `extension`, without following symlinks.
 pub fn collect_regular_files(root: impl AsRef<Path>, extension: &str) -> Result<Vec<RelativePath>> {
+    collect_regular_files_with_device_probe(root.as_ref(), extension, &directory_device)
+}
+
+fn collect_regular_files_with_device_probe<F>(
+    root: &Path,
+    extension: &str,
+    device_probe: &F,
+) -> Result<Vec<RelativePath>>
+where
+    F: Fn(&Path) -> std::io::Result<Option<u64>> + ?Sized,
+{
     if !validate_generated_extension(extension) {
         return Err(invalid_inventory("validate inventory extension", extension));
     }
-    let root = canonical_directory(root.as_ref(), "canonicalize inventory root")?;
-    let root_device = directory_device(&root)?;
+    let root = canonical_directory(root, "canonicalize inventory root")?;
+    let root_device = device_probe(&root).map_err(|error| {
+        GeneratorError::with_source(
+            GeneratorErrorKind::Io,
+            "inspect inventory root",
+            root.display().to_string(),
+            error,
+        )
+    })?;
     let mut files = Vec::new();
-    collect_directory(&root, &root, root_device, extension, &mut files)?;
+    collect_directory(
+        &root,
+        &root,
+        root_device,
+        extension,
+        device_probe,
+        &mut files,
+    )?;
     files.sort();
     if files.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(GeneratorError::new(
@@ -299,13 +324,17 @@ pub fn collect_regular_files(root: impl AsRef<Path>, extension: &str) -> Result<
     Ok(files)
 }
 
-fn collect_directory(
+fn collect_directory<F>(
     root: &Path,
     directory: &Path,
     root_device: Option<u64>,
     extension: &str,
+    device_probe: &F,
     files: &mut Vec<RelativePath>,
-) -> Result<()> {
+) -> Result<()>
+where
+    F: Fn(&Path) -> std::io::Result<Option<u64>> + ?Sized,
+{
     let entries = fs::read_dir(directory).map_err(|error| {
         GeneratorError::with_source(
             GeneratorErrorKind::Io,
@@ -343,7 +372,7 @@ fn collect_directory(
                 format!("symlink is not allowed: {}", entry.path().display()),
             ));
         }
-        require_same_device(&entry.path(), root_device)?;
+        require_same_device(&entry.path(), root_device, device_probe)?;
         if file_type.is_dir() {
             if entry.file_name() == OsStr::new(COORDINATION_COMPONENT) {
                 return Err(invalid_path(
@@ -351,7 +380,14 @@ fn collect_directory(
                     "reserved coordination directory is not inventory input",
                 ));
             }
-            collect_directory(root, &entry.path(), root_device, extension, files)?;
+            collect_directory(
+                root,
+                &entry.path(),
+                root_device,
+                extension,
+                device_probe,
+                files,
+            )?;
         } else if file_type.is_file() {
             let entry_path = entry.path();
             if entry_path.extension() == Some(OsStr::new(extension)) {
@@ -411,31 +447,22 @@ fn contains_coordination_component(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn directory_device(path: &Path) -> Result<Option<u64>> {
+fn directory_device(path: &Path) -> std::io::Result<Option<u64>> {
     use std::os::unix::fs::MetadataExt;
 
-    fs::metadata(path)
-        .map(|metadata| Some(metadata.dev()))
-        .map_err(|error| {
-            GeneratorError::with_source(
-                GeneratorErrorKind::Io,
-                "inspect inventory root",
-                path.display().to_string(),
-                error,
-            )
-        })
+    fs::symlink_metadata(path).map(|metadata| Some(metadata.dev()))
 }
 
 #[cfg(not(unix))]
-fn directory_device(_path: &Path) -> Result<Option<u64>> {
+fn directory_device(_path: &Path) -> std::io::Result<Option<u64>> {
     Ok(None)
 }
 
-#[cfg(unix)]
-fn require_same_device(path: &Path, root_device: Option<u64>) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
+fn require_same_device<F>(path: &Path, root_device: Option<u64>, device_probe: &F) -> Result<()>
+where
+    F: Fn(&Path) -> std::io::Result<Option<u64>> + ?Sized,
+{
+    let entry_device = device_probe(path).map_err(|error| {
         GeneratorError::with_source(
             GeneratorErrorKind::Io,
             "inspect inventory entry mount",
@@ -443,17 +470,12 @@ fn require_same_device(path: &Path, root_device: Option<u64>) -> Result<()> {
             error,
         )
     })?;
-    if Some(metadata.dev()) != root_device {
+    if entry_device != root_device {
         return Err(invalid_path(
             "collect regular files",
             format!("mount crossing is not allowed: {}", path.display()),
         ));
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn require_same_device(_path: &Path, _root_device: Option<u64>) -> Result<()> {
     Ok(())
 }
 
@@ -492,7 +514,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{CorpusLocation, RelativePath, RunScope, collect_regular_files};
+    use super::{
+        CorpusLocation, RelativePath, RunScope, collect_regular_files,
+        collect_regular_files_with_device_probe,
+    };
     use crate::GeneratorErrorKind;
 
     struct TestDirectory(PathBuf);
@@ -615,5 +640,26 @@ mod tests {
         let root = TestDirectory::new_short();
         let _socket = UnixListener::bind(root.path().join("case.json")).expect("create socket");
         assert!(collect_regular_files(root.path(), "json").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collection_rejects_injected_device_mismatch_as_invalid_path() {
+        let root = TestDirectory::new("device-mismatch");
+        fs::write(root.path().join("case.json"), b"{}\n").expect("fixture");
+        let canonical_root = fs::canonicalize(root.path()).expect("canonical test root");
+        let root_device = super::directory_device(&canonical_root).expect("root device");
+        let different_device = root_device.map(|device| device.wrapping_add(1));
+        assert_ne!(different_device, root_device);
+
+        let error = collect_regular_files_with_device_probe(&canonical_root, "json", &|path| {
+            Ok(if path == canonical_root {
+                root_device
+            } else {
+                different_device
+            })
+        })
+        .expect_err("injected mount crossing must fail");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
     }
 }

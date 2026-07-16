@@ -284,16 +284,16 @@ pub(crate) struct ProtectionEntry {
     pub(crate) identity: ObjectIdentity,
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    not(all(target_os = "macos", target_arch = "aarch64")),
-    allow(dead_code)
-)]
 enum InstallEntryKind {
     Directory,
     Regular,
     Symlink(PathBuf),
 }
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+type InstallEntryKind = std::convert::Infallible;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct InstallEntry {
@@ -1103,18 +1103,14 @@ impl GitRunner {
     }
 
     fn run(&self, arguments: &[OsString]) -> Result<Output> {
-        let subcommand = arguments
-            .first()
-            .and_then(|argument| argument.to_str())
-            .ok_or_else(|| invalid_source("sanitized Git command has no UTF-8 subcommand"))?;
-        if !matches!(
-            subcommand,
-            "rev-parse" | "ls-tree" | "ls-files" | "cat-file" | "config"
-        ) {
-            return Err(invalid_source(format!(
-                "sanitized Git runner rejected subcommand {subcommand}"
-            )));
-        }
+        self.run_with(arguments, |command| command.output())
+    }
+
+    fn run_with<F>(&self, arguments: &[OsString], execute: F) -> Result<Output>
+    where
+        F: FnOnce(&mut Command) -> std::io::Result<Output>,
+    {
+        let subcommand = validate_read_only_git_arguments(arguments)?;
         self.trust.revalidate()?;
         let mut command = Command::new(&self.trust.program_path);
         command
@@ -1149,7 +1145,7 @@ impl GitRunner {
             ])
             .arg(&self.checkout)
             .args(arguments);
-        let result = command.output();
+        let result = execute(&mut command);
         let identity_result = self.trust.revalidate();
         let output = result.map_err(|error| {
             GeneratorError::with_source(
@@ -1176,6 +1172,84 @@ impl GitRunner {
         }
         Ok(output)
     }
+}
+
+fn validate_read_only_git_arguments(arguments: &[OsString]) -> Result<&'static str> {
+    let arguments = arguments
+        .iter()
+        .map(|argument| {
+            argument
+                .to_str()
+                .ok_or_else(|| invalid_source("sanitized Git argv contains a non-UTF-8 token"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let allowed_subcommand = match arguments.as_slice() {
+        ["rev-parse", option]
+            if matches!(
+                *option,
+                "--is-inside-work-tree"
+                    | "--show-toplevel"
+                    | "--absolute-git-dir"
+                    | "--show-object-format=storage"
+            ) =>
+        {
+            Some("rev-parse")
+        }
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"]
+        | [
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ]
+        | ["rev-parse", "--verify", "HEAD^{commit}"] => Some("rev-parse"),
+        ["rev-parse", "--verify", expression] if is_full_commit_expression(expression) => {
+            Some("rev-parse")
+        }
+        ["ls-tree", "-r", "-z", "--full-tree", revision] if is_full_object_id(revision) => {
+            Some("ls-tree")
+        }
+        ["ls-tree", "-r", "-z", "--full-tree", revision, "--", path]
+            if is_full_object_id(revision) && RelativePath::new(path).is_ok() =>
+        {
+            Some("ls-tree")
+        }
+        ["ls-files", "--stage", "-z"]
+        | ["ls-files", "-v", "-z"]
+        | ["ls-files", "--others", "--exclude-standard", "-z"] => Some("ls-files"),
+        ["cat-file", "-t", object_id] | ["cat-file", "blob", object_id]
+            if is_full_object_id(object_id) =>
+        {
+            Some("cat-file")
+        }
+        [
+            "config",
+            "--null",
+            "--list",
+            "--show-origin",
+            "--show-scope",
+            "--no-includes",
+        ] => Some("config"),
+        _ => None,
+    };
+    allowed_subcommand.ok_or_else(|| {
+        invalid_source(format!(
+            "sanitized Git runner rejected unlisted argv shape: {arguments:?}"
+        ))
+    })
+}
+
+fn is_full_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_full_commit_expression(value: &str) -> bool {
+    value
+        .strip_suffix("^{commit}")
+        .is_some_and(is_full_object_id)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1929,6 +2003,7 @@ fn invalid_checkout_path(detail: impl Into<String>) -> GeneratorError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1936,7 +2011,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{PinnedSource, SourceRevision, TrustedGit, verify_git_source};
+    use super::{
+        GitRunner, PinnedSource, SourceRevision, TrustedGit, validate_read_only_git_arguments,
+        verify_git_source,
+    };
     use crate::{GeneratorErrorKind, RelativePath, Sha256Digest};
 
     struct TestDirectory(PathBuf);
@@ -2066,6 +2144,167 @@ mod tests {
             RelativePath::new(source).expect("strict path"),
         )
         .expect("valid pin")
+    }
+
+    fn different_full_revision(revision: &SourceRevision) -> SourceRevision {
+        let mut different = revision.as_str().to_owned();
+        let replacement = if different.ends_with('0') { "1" } else { "0" };
+        different.replace_range(different.len() - 1.., replacement);
+        SourceRevision::new(different).expect("guaranteed-different full revision")
+    }
+
+    fn os_arguments(arguments: &[&str]) -> Vec<OsString> {
+        arguments.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn wrong_revision_fixture_is_distinct_when_revision_ends_in_zero() {
+        let revision = SourceRevision::new(format!("{}0", "a".repeat(39)))
+            .expect("synthetic full revision ending in zero");
+        assert_ne!(different_full_revision(&revision), revision);
+    }
+
+    #[test]
+    fn sanitized_runner_rejects_unlisted_mutating_and_helper_capable_argv_before_spawn() {
+        const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
+        let (directory, _origin, _revision) = repository();
+        let runner = GitRunner::new(
+            TrustedGit::discover().expect("supported installed Apple Git"),
+            fs::canonicalize(directory.path()).expect("canonical checkout"),
+        );
+        let config_path = directory.path().join(".git/config");
+        let config_before = fs::read(&config_path).expect("read config before rejection probes");
+        let spawn_attempts = Cell::new(0_u32);
+        let spawn_marker = directory.path().join("invalid-command-spawned");
+        let rejected: &[&[&str]] = &[
+            &["config", "core.fsmonitor", "true"],
+            &["config", "--local", "credential.helper", "sentinel"],
+            &["cat-file", "--filters", SHA1],
+            &["cat-file", "--textconv", SHA1],
+            &["rev-parse", "--exec-path"],
+            &["ls-files", "--debug"],
+        ];
+        for arguments in rejected {
+            let error = runner
+                .run_with(&os_arguments(arguments), |_| {
+                    spawn_attempts.set(spawn_attempts.get() + 1);
+                    fs::write(&spawn_marker, b"spawned\n")?;
+                    Err(std::io::Error::other("invalid command reached spawn"))
+                })
+                .expect_err("unlisted Git argv must fail before spawn");
+            assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+        }
+        assert_eq!(spawn_attempts.get(), 0, "invalid Git argv reached spawn");
+        assert!(!spawn_marker.exists(), "invalid Git argv ran a helper path");
+        assert_eq!(
+            fs::read(config_path).expect("read config after rejection probes"),
+            config_before,
+            "invalid Git argv mutated repository configuration"
+        );
+    }
+
+    #[test]
+    fn sanitized_runner_binds_every_dynamic_revision_object_and_path_token() {
+        const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
+        const SHA1_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567^{commit}";
+        const SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const SHA256_COMMIT: &str =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef^{commit}";
+
+        let allowed: &[&[&str]] = &[
+            &["rev-parse", "--is-inside-work-tree"],
+            &["rev-parse", "--show-toplevel"],
+            &["rev-parse", "--absolute-git-dir"],
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects",
+            ],
+            &["rev-parse", "--show-object-format=storage"],
+            &["rev-parse", "--verify", "HEAD^{commit}"],
+            &["rev-parse", "--verify", SHA1_COMMIT],
+            &["rev-parse", "--verify", SHA256_COMMIT],
+            &["ls-tree", "-r", "-z", "--full-tree", SHA1],
+            &["ls-tree", "-r", "-z", "--full-tree", SHA256],
+            &[
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                SHA1,
+                "--",
+                "fixtures/[literal]",
+            ],
+            &["ls-files", "--stage", "-z"],
+            &["ls-files", "-v", "-z"],
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+            &["cat-file", "-t", SHA1],
+            &["cat-file", "-t", SHA256],
+            &["cat-file", "blob", SHA1],
+            &["cat-file", "blob", SHA256],
+            &[
+                "config",
+                "--null",
+                "--list",
+                "--show-origin",
+                "--show-scope",
+                "--no-includes",
+            ],
+        ];
+        for arguments in allowed {
+            assert!(
+                validate_read_only_git_arguments(&os_arguments(arguments)).is_ok(),
+                "rejected required Git argv {arguments:?}"
+            );
+        }
+
+        let rejected: &[&[&str]] = &[
+            &["rev-parse", "--verify", "0123456789ab^{commit}"],
+            &["rev-parse", "--verify", "HEAD~1^{commit}"],
+            &["rev-parse", "--verify", "HEAD^{tree}"],
+            &["cat-file", "-t", "0123456789ABCDEF0123456789ABCDEF01234567"],
+            &[
+                "cat-file",
+                "blob",
+                "0123456789abcdef0123456789abcdef0123456g",
+            ],
+            &[
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                SHA1,
+                "--",
+                "../fixtures",
+            ],
+            &[
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                SHA1,
+                "--",
+                "fixtures\\ast",
+            ],
+            &[
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                SHA1,
+                "--",
+                "fixtures",
+                "other",
+            ],
+        ];
+        for arguments in rejected {
+            assert!(
+                validate_read_only_git_arguments(&os_arguments(arguments)).is_err(),
+                "accepted unbound Git argv {arguments:?}"
+            );
+        }
     }
 
     #[test]
@@ -2631,8 +2870,8 @@ mod tests {
         .expect("exact clean source");
         assert_eq!(verified.revision(), &revision);
 
-        let prefix = SourceRevision::new(format!("{}0", &revision.as_str()[..39]))
-            .expect("full but incorrect revision");
+        let prefix = different_full_revision(&revision);
+        assert_ne!(prefix, revision, "wrong revision fixture must be distinct");
         assert_eq!(
             verify_git_source(directory.path(), &pin(&origin, prefix, "fixtures"))
                 .expect_err("wrong revision")

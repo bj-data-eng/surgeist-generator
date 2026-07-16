@@ -1,10 +1,6 @@
-#[allow(dead_code)]
-pub(crate) mod artifact;
 mod case;
 mod corpus;
 mod hash;
-#[allow(dead_code)]
-pub(crate) mod lease;
 mod manifest;
 mod report;
 mod source;
