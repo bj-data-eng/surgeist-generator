@@ -53,12 +53,17 @@
   `serde`/`serde_json`/`sha2`/`toml` plus empty layout/CSS features; its correction
   adds only target-specific `rustix`. Optional layout dependencies and binaries
   wait for C02/C03.
-- Recorded read-only baseline, compared again after every C01 task and at close:
-  - layout HEAD `c8abd4a056b9c9ab74d109d5494736e8196e514b`, empty porcelain status. A
+- Read-only sibling evidence:
+  - layout was observed at HEAD `c8abd4a056b9c9ab74d109d5494736e8196e514b`
+    with empty porcelain status during planning. A
     read-only audit of former baseline `fe1178e9..c8abd4a0` found four commits
     changing only its cycle plan and `src/{grid_tests,lib,lib_tests,node_input,scroll}.rs`;
-    the generator path did not change and the copied prefix remains
-    `d2f5ca87cea6b36826e9172e2d7ba7a99196c375e2ca53f8a84a075200e70a9f`;
+    that range did not change its generator path. The invariant is the immutable
+    `92054de…` source-prefix proof and generator-repository copy hash
+    `d2f5ca87cea6b36826e9172e2d7ba7a99196c375e2ca53f8a84a075200e70a9f`,
+    not layout's live HEAD/status. Each task records live layout state read-only;
+    unrelated concurrent layout drift is observational and never authorizes a
+    layout write/test or blocks C01 while the immutable proof still matches;
   - CSS HEAD `ae44d858308e4f73c17e91c4c8768c43ce6ceb82`, sole status
     `?? plans/specs/`, whose only file is
     `plans/specs/css-snapshot-2026-remediation.md`, mode `0644`, size `156722`,
@@ -117,7 +122,8 @@
   - `cargo fmt --check`
   - `cargo deny --all-features --locked --offline list --format tsv --layout license`
   - `cargo audit --no-fetch --stale`
-  - compare all three read-only baselines above exactly.
+  - reprove the immutable layout source/copy hash, record live layout HEAD/status,
+    and compare CSS/root baselines exactly.
 - Dependencies: reviewed sequence/C01 plan and preserved clean T01 evidence.
 - Intended correction commit: `feat(core): reconcile shared source contracts`.
 
@@ -148,7 +154,8 @@
   - `cargo clippy --locked --offline -p surgeist-generator --no-default-features --all-targets -- -F unsafe-code -D warnings`
   - `cargo check --locked --offline -p surgeist-generator --target wasm32-unknown-unknown --no-default-features --lib`
   - `cargo fmt --check`
-  - compare all three read-only baselines above exactly.
+  - reprove the immutable layout source/copy hash, record live layout HEAD/status,
+    and compare CSS/root baselines exactly.
 - Dependencies: fresh `CLEAN` complete-packet review for T02.
 - Intended correction commit: `feat(core): reconcile rooted transactions`.
 
@@ -157,18 +164,20 @@
 1. Complete the external task-evidence files and obtain fresh `CLEAN` complete-
    packet reviews for T02/T03; retain T01's exact clean proof.
 2. Make only the header status transition to `complete`. Run both task gates,
-   license/audit commands, owned-Rust manifest plus canonical unsafe scan, exact
-   baselines, and clean-HEAD/status verification.
+   license/audit commands, owned-Rust manifest plus canonical unsafe scan, the
+   immutable layout proof/live observation, exact CSS/root baselines, and
+   clean-HEAD/status verification.
 3. Obtain a fresh holistic `CLEAN` review of exact `cycle_base..cycle_head`, the
    semantic pair, task packets/reviews, and evidence. An owned finding reopens
    T02/T03. A cross-task finding first requires a fresh reviewed plan revision
    adding one bounded integration-fix packet; no edit precedes that review.
-4. After holistic `CLEAN`, rerun the complete step-2 gate and clean-HEAD/baseline
+4. After holistic `CLEAN`, rerun the complete step-2 gate and clean-HEAD/evidence
    verification at the unchanged reviewed SHA.
 5. Apply the canonical Surgeist exact-range reconciliation, re-review, automated
    landing/publication, immutable-SHA remote readback, and cleanup workflow; hand
    the published C01 SHA to C02 and only then plan C02 from it.
 
 Stop for coordinator adjudication on an authority-remote change, unavailable
-cached dependency/installed target, sibling baseline change, safety finding, or
-review failure. Do not gain network/install authority or widen scope.
+cache/target, CSS/root baseline change, layout pinned-source/copy mismatch,
+evidence of a sibling write/test by this cycle, safety finding, or review failure.
+Do not gain network/install authority or widen scope.
