@@ -16,7 +16,10 @@
     `a8db3583cca978eaa6154977bb12e4e7601076b1a87b144df21bf8c101c2ed1f`.
 - Reviewed sequence:
   `plans/sequences/2026-07-16-surgeist-generator-shared-corpus-drivers.md`
-  at `5b2ee3c`, independent review `CLEAN`.
+  C01 entry, SHA-256
+  `760dfe56ac1fd57eef6b1cb5ac99bfc51e4a3d236b1e7280d6c164ac7e8b69c1`,
+  exact revision `5b2ee3cc01c237f64713925aaad83b14855690ab`, independent
+  review `CLEAN`.
 - Outcome: preserve the audited layout copy and make the default-feature shared
   API, pinned-source verifier, rooted coordination, and durable transaction core
   satisfy the final pair. No domain driver is implemented in C01.
@@ -46,10 +49,16 @@
   acquisition path. Use only installed tooling and cached sources with
   locked/offline or no-fetch commands. Install/acquire nothing.
 - Keep Rust 1.97, edition 2024, `default = []`, tracked `Cargo.lock`, and no
-  executable `unsafe`. C01 may add only SG-03.2's target-specific `rustix`; all
-  optional layout dependencies and binary targets wait for C02/C03.
+  executable `unsafe`. The retained T02 range already adds exact shared
+  `serde`/`serde_json`/`sha2`/`toml` plus empty layout/CSS features; its correction
+  adds only target-specific `rustix`. Optional layout dependencies and binaries
+  wait for C02/C03.
 - Recorded read-only baseline, compared again after every C01 task and at close:
-  - layout HEAD `fe1178e99ec567c3f887b595700c2ca6b2e75133`, empty porcelain status;
+  - layout HEAD `c8abd4a056b9c9ab74d109d5494736e8196e514b`, empty porcelain status. A
+    read-only audit of former baseline `fe1178e9..c8abd4a0` found four commits
+    changing only its cycle plan and `src/{grid_tests,lib,lib_tests,node_input,scroll}.rs`;
+    the generator path did not change and the copied prefix remains
+    `d2f5ca87cea6b36826e9172e2d7ba7a99196c375e2ca53f8a84a075200e70a9f`;
   - CSS HEAD `ae44d858308e4f73c17e91c4c8768c43ce6ceb82`, sole status
     `?? plans/specs/`, whose only file is
     `plans/specs/css-snapshot-2026-remediation.md`, mode `0644`, size `156722`,
@@ -59,8 +68,10 @@
 ## Impacts
 
 - API: additive exact default shared surface; feature APIs remain deferred.
-- Dependencies/features: add only target-specific exact `rustix`; refresh the
-  tracked lockfile offline; keep empty domain features and `default = []`.
+- Dependencies/features: retained range adds exact `serde` with derive,
+  `serde_json`, `sha2`, `toml`, the `default`/`layout-browser`/`css-corpus` feature
+  table, `.gitignore` lockfile tracking, and `Cargo.lock`; correction adds exact
+  target-specific `rustix` and refreshes that lockfile offline.
 - Artifacts/docs: no generated corpus artifact, binary, README, or AGENTS change.
 - Compatibility: Rust 1.97/edition 2024 and `CRATE_NAME` remain unchanged.
 - Root/siblings: no integration or mutation; published C01 SHA is C02 input.
