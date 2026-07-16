@@ -192,7 +192,7 @@ The dependency matrix is:
 | `serde_json` | `=1.0.145` | yes | inherited | inherited | Reports, layout measurements, CSSTree fixtures |
 | `sha2` | `=0.10.9` | yes | inherited | inherited | Source and artifact SHA-256 |
 | `toml` | `=0.9.8` | yes | inherited | inherited | Domain manifest parsing |
-| `rustix` | `=1.1.4`, `fs`, Apple Silicon macOS only | yes on the supported target | inherited | inherited | Safe descriptor-relative, non-following filesystem transactions |
+| `rustix` | `=1.1.4`, `fs`, `process`, Apple Silicon macOS only | yes on the supported target | inherited | inherited | Safe descriptor-relative filesystem transactions and process/group lifecycle |
 | `chromiumoxide` | `=0.9.1`, no defaults, `bytes` | no | yes | no | Chromium measurement without its unsafe path-based fetcher |
 | `futures` | `=0.3.31` | no | yes | no | Chromium handler stream |
 | `tokio` | `=1.48.0`, `fs`, `io-util`, `macros`, `rt-multi-thread`, `time` | no | yes | no | Private Chromium runtime, bounded download, handler lifecycle, and timed cleanup |
@@ -207,7 +207,7 @@ and `css-corpus = []`. `layout-browser` also gates the layout module/binary;
 `css-corpus` gates the CSS module/binary and activates no dependency. Both
 features may be enabled together. The two binaries use
 `required-features` so an unrequested driver cannot compile accidentally.
-`rustix = { version = "=1.1.4", features = ["fs"] }` is declared under
+`rustix = { version = "=1.1.4", features = ["fs", "process"] }` is declared under
 `[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]`;
 it is a shared lifecycle dependency, not a domain or default feature switch.
 
@@ -1347,24 +1347,33 @@ acquisition uses the separate sanitized bare-fetch runner defined below; neither
 path invokes ambient Git configuration.
 
 The runner never resolves `git` or a helper through `PATH`. On the one supported
-host it opens and identity-checks the exact `/usr/bin/git` entry before entering
+host it opens and identity-checks the exact `/usr/bin/git` developer-tool shim before entering
 any checkout, corpus, owner, cache, or temporary directory. It must be a
 root-owned regular executable whose mode has no group/other write bit; hard-link
-count is not an integrity signal for the platform binary. From the trusted `/`
+count is not an integrity signal for the shim. From the trusted `/`
 working directory and an otherwise empty environment it invokes only
 `/usr/bin/git --exec-path`, requires one absolute canonical directory, and
-descriptor-checks every component as root-owned and not group/other writable.
-That directory is the trusted Git installation unit: a no-follow recursive
-inventory requires every directory, regular entry, and symlink to be root-owned
-and not group/other writable, and every symlink target to remain inside the unit.
+requires its shape to be `<developer-usr>/libexec/git-core`. The canonical
+`<developer-usr>` directory, every ancestry component, and
+`<developer-usr>/bin/git` are descriptor-checked as root-owned and not group/
+other writable; the actual `bin/git` must be a regular executable. Invoking that
+actual binary from `/` with the same empty environment must return the identical
+exec path. The developer `usr` root is then the trusted Git installation unit: a
+no-follow recursive inventory of `bin/git` and `libexec/git-core` requires every
+directory, regular entry, and symlink to be root-owned and not group/other
+writable, and every symlink target to remain inside that `usr` root. This
+deliberately accepts the supported Apple layout's root-owned
+`libexec/git-core/git-cat-file -> ../../bin/git`-shaped links without allowing an
+escape from the developer unit.
 Any Git-dispatched executable actually used by read-only commands or fetch,
 including HTTPS and pack helpers, must resolve to a regular executable inside
-that inventory; no helper outside it may execute. The checked canonical
-directory is then fixed as `GIT_EXEC_PATH`. Executable/unit identities are
+that unit/inventory; no helper outside it may execute. The checked canonical
+exec directory is then fixed as `GIT_EXEC_PATH`. Shim, actual executable, and unit identities are
 rechecked immediately before and after each spawn. Any mismatch is
 `SourceVerification`.
 
-Every subsequent invocation uses the absolute `/usr/bin/git`, trusted working
+Every subsequent invocation uses the discovered absolute
+`<developer-usr>/bin/git`, trusted working
 directory `/`, and either `-C <canonical-checkout>` or an absolute
 `--git-dir=<held-stage-path>`; no child process has an untrusted current working
 directory. It clears the inherited environment and `PATH` entirely, sets the
@@ -1423,9 +1432,9 @@ Each acquisition starts in a new descriptor-rooted unique Taffy stage and runs
 only this closed command sequence:
 
 ```text
-/usr/bin/git <sanitized-global-options> init --bare --template=<verified-empty-dir> \
+<developer-usr>/bin/git <sanitized-global-options> init --bare --template=<verified-empty-dir> \
     --object-format=<sha1-for-40-bytes|sha256-for-64-bytes> <stage>
-/usr/bin/git <sanitized-global-options> --git-dir=<stage> fetch \
+<developer-usr>/bin/git <sanitized-global-options> --git-dir=<stage> fetch \
     --no-tags --no-auto-maintenance --no-write-fetch-head \
     --recurse-submodules=no --refmap= \
     <literal-https-url> \
@@ -1995,16 +2004,23 @@ even if death precedes `intent.json`. Recovery probes that PID without signallin
 it and never touches the directory while the PID exists or the probe is
 inconclusive; PID reuse is conservatively live. Once `ESRCH` proves the creating
 process is absent, only recognized internal bootstrap residue may be cleaned.
-The bootstrapper publishes `intent.json`, creates the empty regular stage inside
-that intent, publishes its identity in `stage-created`, writes/syncs the exact
+The bootstrapper publishes `intent.json`, exclusively creates the fixed internal
+`lock.stage` as a mode-`0600`, zero-length regular single-link file, publishes
+its identity in `stage-created`, writes/syncs the exact
 header, and acquires the advisory lock on that still-open stage. It then attempts
 `RENAME_EXCL` directly from the intent to the exact final lock name and syncs both
 directories. A winner keeps that same descriptor; on `EEXIST`, a loser validates
 and locks the complete final inode before journal-cleaning its own stage. A live
-bootstrap intent's stage lock is never cleaned. Recovery of an unlocked intent
-accepts only: final absent plus the registered internal stage (abort); a valid
-matching final plus absent stage (winner cleanup); or a valid final plus the
-registered loser stage (loser cleanup). Other identities are disputed. Intent
+bootstrap intent's stage lock is never cleaned. Recovery of a dead-owner,
+unlocked intent accepts only: complete intent plus final absent and no stage;
+complete intent plus final absent and an unregistered exact `lock.stage` that is
+still mode `0600`, zero length, regular, single-link, and same-mount (death before
+`stage-created`); final absent plus the registered internal stage with any
+prefix of the expected header (abort); a valid matching final plus absent stage
+(winner cleanup); or a valid final plus the registered loser stage (loser
+cleanup). Header writing is forbidden before `stage-created`, so a nonempty
+unregistered stage is disputed. Wrong names/types/identities or final/header
+combinations are also disputed. Intent
 cleanup uses SG-09.2's receipt/tombstone order, so no unpublished unjournaled lock
 stage exists. Final lock files are exact-name, regular, single-link, immutable,
 never truncated, and rejected on an unknown header or identity change.
@@ -2085,12 +2101,17 @@ panic use this exact monotonic-clock terminal sequence:
 1. Each page receives one close attempt with a two-second `tokio::time::timeout`.
    Failure/timeout is recorded; that page is not retried.
 2. Browser close receives one five-second attempt. Whether it succeeds or fails,
-   the owned child then receives one five-second wait. If not reaped, the
-   supervisor sends kill to the recorded process group exactly once and performs
-   an intentionally unbounded blocking wait for the owned child plus process-
-   group `ESRCH`. A browser is terminal only when wait returns its exit status
-   and no member of its group remains; there is no return/detach deadline after
-   kill.
+   the supervisor observes child exit for five seconds with safe `waitid`
+   `WEXITED|WNOHANG|WNOWAIT`; it deliberately does not reap the group leader, so
+   its PID/PGID cannot be reused while group signalling remains possible. At the
+   end of that grace interval it attempts `SIGKILL` on the still-owned process
+   group exactly once, even when the leader is already a zombie (`ESRCH` means no
+   signalable member and is accepted), then performs an
+   intentionally unbounded blocking reap of the leader. It sends no further
+   signal and waits until the process-group probe returns `ESRCH`; an ID reused
+   after leader reap therefore causes conservative waiting, never signalling an
+   unrelated group. A browser is terminal only after the owned wait status and
+   group `ESRCH`; there is no return/detach deadline after the one signal.
 3. Each registered CDP/stderr task receives one five-second normal join interval. If still pending,
    abort is requested exactly once and cancellation join receives five seconds.
    If still pending, the supervisor keeps the handle and waits without a terminal
@@ -2314,7 +2335,9 @@ Shared-core tests shall prove:
    length mismatch, dirty/untracked state, wrong origins, and escaped source
    roots; absolute executable/exec-unit identity replacement and a PATH shadow
    sentinel (including empty and relative PATH components) fail without running
-   the sentinel; its recursively enumerated commit-tree snapshot includes fixtures below
+   the sentinel; a supported-host inventory test accepts the real developer-
+   `usr`-confined `libexec/git-core/* -> ../../bin/git` links without fetching or
+   allowing a unit escape; its recursively enumerated commit-tree snapshot includes fixtures below
    nested directories, treats pathspec metacharacters literally, ignores a
    replacement ref, and retains pinned original blob bytes when checkout paths
    change afterward; a synthetic promisor repository with a locally missing blob
@@ -2448,7 +2471,10 @@ measurements, and artifacts to prove:
    profile, cache-transaction, and acquisition-stage failures, plus an injected operation panic
    after all synthetic resources are registered, a successful close with delayed
    child exit, a hung page close, and a hung handler exercise the exact 2/5-second
-   graceful deadlines, one kill/abort, and unbounded terminal wait. The test
+   graceful deadlines, one kill/abort, and unbounded terminal wait. A synthetic
+   group whose leader exits before a surviving descendant proves the non-reaping
+   leader reservation, one group signal, leader reap, and final group `ESRCH`.
+   The test
    proves the public call remains blocked past the forced grace interval, then
    releases the synthetic resource and observes child reap and a resolved join.
    Every handler is completed or aborted-and-joined, the profile is removed or
