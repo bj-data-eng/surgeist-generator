@@ -1433,8 +1433,9 @@ returns `VerifiedSource` only when:
 3. the crate-private raw cleanliness proof below establishes that the index
    equals the exact HEAD tree, every materialized tracked entry equals its index
    blob and type, and no nonignored untracked path exists;
-4. the sanitized raw local-config inventory below contains exactly one
-   `remote.origin.url` whose unrewritten value equals the manifest repository URL;
+4. the sanitized raw common-local plus enabled worktree configuration union
+   below contains exactly one `remote.origin.url` whose unrewritten value equals
+   the manifest repository URL;
 5. the requested source subdirectory is a directory inside the canonical
    checkout without a symlink escape.
 
@@ -1523,8 +1524,8 @@ Every invocation also supplies the equivalent explicit global options
 `-c core.untrackedCache=false`, `-c core.attributesFile=<platform-null>`,
 `-c core.excludesFile=<platform-null>`, and `-c submodule.recurse=false`, before
 the built-in subcommand. The runner permits only the required `rev-parse`,
-`ls-tree`, `ls-files`, `cat-file`, and
-`config --local --null --list --show-origin --no-includes` operations.
+`ls-tree`, `ls-files`, `cat-file`, and combined
+`config --null --list --show-origin --show-scope --no-includes` operations.
 Repository-local configuration remains readable only where Git needs repository
 identity, but it cannot enable a filesystem-monitor helper, external attributes
 or excludes, optional index update, replacement object, pathspec magic,
@@ -1539,14 +1540,43 @@ Before accepting a checkout or bare repository, the runner requires
 pin or `sha256` for a 64-byte pin. A pin length/object-storage-format mismatch is
 `SourceVerification` even when another algorithm could spell an object prefix.
 
-The NUL-delimited local-config inventory is read without includes. Every reported
-origin must be the already protected canonical common config or per-worktree
-config file. Any `include.*`, `includeIf.*`, `url.*`, custom remote-helper,
-remote upload/receive-pack, credential helper, `core.sshCommand`, or protocol/ext
-configuration fails `SourceVerification`. Exactly one raw
-`remote.origin.url` must equal the pin; no `remote get-url` expansion is used.
-Filter/diff/textconv entries may remain because the closed read-only command set
-never invokes them, and the sentinel tests prove that property.
+The NUL-delimited combined configuration inventory is read without expanding
+includes after resolving and protecting the per-worktree and common
+administrative directories, but before cleanliness, tree, or object commands.
+The cleared environment makes its only admissible scopes `command`, `local`, and
+`worktree`. Every `command` record must exactly match one of the fixed sanitizer
+options above. Every `local` `file:` origin is resolved only within the already
+trusted repository context and must no-follow-open to the protected canonical
+`<common-git-dir>/config` identity; every `worktree` `file:` origin must likewise
+resolve to the protected canonical
+`<per-worktree-git-dir>/config.worktree` identity. A relative display spelling
+such as Git's ordinary `file:.git/config` is accepted only when this independent
+resolution and identity check reaches that exact expected file; the origin text
+itself is never mutation authority. System, global, unknown, duplicate-origin,
+escaping, and any other file origin fail `SourceVerification`.
+
+The common file may contain at most one `extensions.worktreeConfig`, whose value
+is exactly Git boolean `true` or `false`. When absent or false, the protected
+per-worktree `config.worktree` path must be absent and no `worktree`-scope record
+is accepted. When true, that path may be absent or a no-follow-opened regular,
+single-link, owner-readable file inside the already protected per-worktree
+administrative directory; if present, every one of its records must appear with
+that exact worktree scope/origin. The union of local and worktree records is the
+repository configuration contract. Across that union, any `include.*`,
+`includeIf.*`, `url.*`, custom remote-helper, remote upload/receive-pack,
+credential helper, `core.sshCommand`, or protocol/ext configuration fails
+`SourceVerification`. Exactly one raw `remote.origin.url` must occur in the
+union and equal the pin; a worktree override or duplicate is rejected and no
+`remote get-url` expansion is used. Filter/diff/textconv entries may remain
+because the closed read-only command set never invokes them, and the sentinel
+tests prove that property. The preliminary path-resolution commands use the
+same inert command-line overrides; no executable configuration is consulted
+before this union is accepted. Source verification records both protected file
+identities/absence states and the exact NUL inventory. After the last
+cleanliness/tree/object read and before returning `VerifiedSourceSnapshot`, it
+reopens the same paths without following, reruns the combined inventory, and
+requires byte-identical records, origins, scopes, and identities. A change is
+`SourceVerification`; the complete sequence is read-only.
 
 The acquisition runner begins with the same cleared environment, locale,
 no-prompt, no-replacement, no-lazy-fetch, and no-system/global-config baseline.
@@ -1717,10 +1747,11 @@ exact source revision, normalized path, and SHA-256 digest.
 
 CSS constructs this snapshot after the clean worktree/origin/HEAD proof and the
 read-only existing-path overlap checks, but before the corpus lease and every
-writable capability probe. It imports only retained snapshot bytes after the
-lease. A checkout content change after snapshot creation cannot alter imported
-bytes; a protected-directory identity change is caught by the under-lease
-revalidation below. Layout performs any fresh bare fetch as an SG-05 cache-key
+writable capability probe. After the lease it imports only retained snapshot
+fixture bytes plus the canonical sidecar computed from that same snapshot. A
+checkout content change after snapshot creation cannot alter imported bytes; a
+protected-directory identity change is caught by the under-lease revalidation
+below. Layout performs any fresh bare fetch as an SG-05 cache-key
 transaction before taking a corpus lease, proves the fetched object is a commit,
 and builds the same commit-tree snapshot for Taffy import. Count enforcement is
 domain-specific: Taffy import checks its complete layout manifest
@@ -1762,8 +1793,11 @@ artifacts or reports.
 
 Layout HTML and XML collection remains lexicographically deterministic. CSS
 import collects only JSON beneath the verified `fixture_root`; generation
-collects only JSON beneath the corpus-owned `import_root`. Exact manifest counts
-are checked before mutation.
+requires the exact root-relative `.surgeist-source.json` described below and
+collects every other JSON beneath the corpus-owned `import_root` as a fixture.
+That reserved sidecar is never a fixture or case source, and any other
+non-fixture entry is rejected. Exact manifest counts count fixtures only and are
+checked before mutation.
 
 ## SG-07 Case dispositions and neutral CSS expectations
 
@@ -1804,7 +1838,8 @@ number of ordinary and error-array case IDs to reference one imported JSON file.
 7. while that mutex is held but before the lease is returned, reopen every protected directory without following links,
    require its recorded device/inode/fsid identity, and repeat the complete
    disjointness matrix against the probed writable descriptors; and
-8. finish lease acquisition and atomically mirror only the retained snapshot bytes beneath the CSS-owned
+8. finish lease acquisition and atomically mirror the retained snapshot bytes
+   plus their canonical import-provenance sidecar beneath the CSS-owned
    `import_root`.
 
 Steps 1 through 5 are read-only. No private probe, coordination bootstrap, lease,
@@ -1815,6 +1850,37 @@ step 7 with `InvalidPath`. The import preserves relative paths, rejects all
 non-JSON and special snapshot entries, checks the exact source-file count, and
 removes stale imported JSON only as part of a successful complete transaction.
 It writes no expectations or generation report.
+
+The private import-provenance file is exactly
+`<import_root>/.surgeist-source.json`; that root-relative name is reserved, and
+a verified upstream snapshot containing it fails `SourceVerification` before
+lease acquisition or mutation. Its mode is `0644`, its compact canonical JSON
+has exactly one final LF, rejects duplicate/unknown fields, and has fields in
+this order:
+
+```json
+{"schema_version":1,"source":{"label":"csstree","repository_url":"https://example.invalid/csstree.git","revision":"<full-object-id>","source_subdirectory":"fixtures/ast"},"object_format":"sha1","file_count":1,"files":[{"path":"declaration/Declaration.json","git_mode":"100644","blob_object_id":"<full-blob-id>","sha256":"<raw-byte-sha256>"}]}
+```
+
+The example values are grammar illustrations, not repository facts. `source` is
+the complete canonical manifest-derived `PinnedSource`: label `csstree`, exact
+repository URL/revision, and `fixture_root` as `source_subdirectory`.
+`object_format` is exactly `sha1` or `sha256` and agrees with the revision and
+every object-ID width. `file_count` is positive and equals both `files.len()` and
+manifest `expected_files`. Entries are strictly increasing by unique
+`RelativePath`; each path is fixture-relative JSON and not the reserved root
+name, `git_mode` is exactly `100644`, `blob_object_id` is the exact lowercase
+40- or 64-hex commit-tree blob ID in the declared format, and `sha256` is the
+digest of the raw copied bytes. The SHA-256 of the complete canonical sidecar
+bytes, including its final LF, is the `import_provenance_digest`.
+
+Step 5 constructs these bytes solely from the immutable verified snapshot. Step
+8 publishes the sidecar and all listed fixtures in the same complete
+`import_root` transaction; its tree inventory/digest covers the sidecar, and a
+successful reimport atomically replaces stale fixtures and stale provenance
+together. `expected_files` excludes the sidecar, so a valid unit contains
+exactly `expected_files + 1` regular files. Generation and checking never rewrite
+it, and an old pin cannot be relabeled without a new verified import.
 
 Source verification first yields the complete crate-private SG-06 protection
 set, not only the canonical checkout root. Before the commit-tree snapshot is
@@ -1844,6 +1910,7 @@ same relative path beneath `expectation_root`. Its object has:
 - `generator: "surgeist-css-generate"`;
 - `source`, the corpus-relative imported JSON path;
 - `source_sha256` and exact `source_revision`;
+- `import_provenance_sha256`, the validated sidecar digest;
 - `cases`, sorted by derived case ID.
 
 Each case has:
@@ -1863,6 +1930,14 @@ Each case has:
 JSON Pointer escaping replaces `~` with `~0` and `/` with `~1`. The driver does
 not copy AST values, CSSTree error messages, offsets, comments, or recovery ASTs.
 Those are upstream implementation details, not Surgeist expectations.
+
+Generation obtains `source_revision` and the report source repository/revision
+from the validated import sidecar, not independently from the mutable manifest;
+the complete sidecar source must first equal that manifest. Every CSS report
+artifact's `domain_provenance` is exactly
+`{"csstree-import": <import_provenance_digest>}`. Thus filtered expectations,
+which have no report, and full-report artifacts both retain the same durable
+full-pin import proof.
 
 Preserved `options` are recursively canonicalized: object keys use decoded
 Unicode scalar lexicographic order at every depth, arrays retain source order,
@@ -2017,10 +2092,14 @@ While the applicable coordination gate and exclusive corpus-domain or cache-key
 mutex are held and before that mutation authority is returned, a descriptor-
 rooted journaled probe beneath that authority's coordination root exercises both
 flags, syncs the parent, removes only its verified objects, and syncs again.
-`ENOSYS`, `EINVAL`, `EOPNOTSUPP`, an identity change, or uncleanable probe is
-`UnsupportedPlatform`; no cache/import/artifact/report mutation follows. Lease
-or cache-guard acquisition records successful recovery/probing, so internal plan
-installation rejects unmatched authority rather than probing outside exclusivity.
+`ENOSYS`, `EINVAL`, `EOPNOTSUPP`, or another conclusive unsupported result is
+`UnsupportedPlatform` only after every verified probe object and journal has
+been removed and the parent synced; no cache/import/artifact/report mutation
+follows. A parent/probe identity change, cleanup failure, or durable unresolved
+probe journal is instead `ArtifactTransaction` under SG-12 precedence and is
+preserved for the next matching exclusive authority. Lease or cache-guard
+acquisition records successful recovery/probing, so internal plan installation
+rejects unmatched authority rather than probing outside exclusivity.
 
 The transaction namespace has an explicit exclusivity contract. The publication
 and coordination roots are generator-managed for the duration of a live lease;
@@ -2054,7 +2133,9 @@ domain-classified preserved files; an unknown regular file is `InvalidInventory`
 not silently retained or deleted. Layout `xml` classifies only generated XML and
 structurally valid generation-report paths (including nonmanifest stale
 candidates), layout `html` additionally classifies validated Surgeist-authored
-fixtures, and both CSS publication roots classify only their generated JSON. A
+fixtures, CSS `expectation_root` classifies only generated JSON, and CSS
+`import_root` classifies exactly its root `.surgeist-source.json` plus the
+sidecar-listed fixture JSON. A
 filtered or recoverable-diagnostic run clones the validated current tree into its
 stage, overlays successful artifacts, and deliberately retains stale/nonmanifest
 output. Layout HTML import clones every validated Surgeist-authored fixture byte-
@@ -2118,7 +2199,7 @@ unparseable or unreferenced child is disputed.
 Every metadata/marker/receipt publication uses a unique regular single-link
 temporary file inside the active directory, flush/sync, `RENAME_EXCL` to its one
 fixed final name, and an active-directory sync. A crash-partial temporary file
-therefore remains inside already-reserved intent state; recovery never interprets
+therefore remains inside the already-reserved active directory; recovery never interprets
 it as a final marker. Unknown names or wrong identities/types are disputed.
 
 On the supported target, every lease/stage/profile/transaction token is an exact
@@ -2157,14 +2238,44 @@ construction, it resolves each process slot in command order under SG-06.1. A
 nonterminal/uncertain slot blocks every stage unlink and outcome marker; only
 `spawn-failed`, `reaped`, `owner-terminal-unrecorded`, or
 `orphan-group-absent` permits the ordinary table to resume. Process-slot sidecars/markers remain receipt-accounted transaction
-members through final cleanup. It then follows this closed state machine; `old` includes the
-cache-required absent state:
+members through final cleanup.
+
+The only content transaction construction can place before complete intent is
+one recognized partial temporary for `intent.json`: step 3 cannot start an
+`old-inventory.json` temporary before
+the complete intent rename and directory sync. An empty active directory is
+removed with descriptor `rmdir` and a transaction-parent sync. For a partial
+intent temporary, recovery first publishes an immutable schema-1
+`internal-cleanup.json` receipt through its own unique temporary, flush, sync,
+`RENAME_EXCL`, and directory sync. The receipt binds the active-directory and
+authority identities, transaction ID, and the exact name/type/mode/device/inode/
+link-count/length/digest inventory of the partial intent temporary. Only then
+may recovery unlink that exact temporary and sync; it unlinks and syncs the
+receipt last, then descriptor-removes the empty active directory and syncs the
+transaction parent. A crash-partial cleanup-receipt temporary proves that no
+intent temporary was removed: recovery may remove and sync that receipt
+temporary only while the exact original partial-intent inventory is still
+present, then restart. A complete receipt authorizes only its exact remaining
+inventory subset and is resumed to completion. Any missing/replaced receipt-
+listed entry or additional name is disputed. This private prefix cleanup does
+not manufacture transaction intent or registration authority.
+
+With a complete intent but absent or partial old sidecar and no registration,
+recovery recomputes the unchanged final inventory, requires its canonical bytes
+and digest to match every old value committed by the intent, publishes the
+complete immutable `old-inventory.json`, then publishes `aborted` and uses the
+ordinary `cleanup-complete` receipt path. The prior partial old-sidecar temporary
+is merely a receipt-listed metadata member; it is never interpreted as the
+sidecar. A mismatch is disputed. It then follows this closed state machine;
+`old` includes the cache-required absent state:
 
 | Observed durable state | Classification and action |
 | --- | --- |
-| active directory empty or containing only recognized partial metadata temporaries; no complete intent | abandoned internal intent; because registration was forbidden, remove only the active directory's verified internal entries |
-| complete intent; old sidecar absent/partial; registration absent | pre-sidecar intent; recompute the unchanged final inventory, require its canonical bytes/digests to equal every old value committed by the intent, then remove only internal metadata; a mismatch is disputed |
-| complete old sidecar but no complete intent | unreachable publication order; disputed without cleanup |
+| active directory empty; no complete intent, old-sidecar temporary/final, or cleanup receipt | abandoned reservation; descriptor-remove the still-empty directory and sync its parent |
+| only one recognized partial intent temporary, optionally plus its partial cleanup-receipt temporary; no complete intent or old-sidecar temporary/final | abandoned intent prefix; apply the private receipt protocol above |
+| complete private internal-cleanup receipt and an exact receipt-listed remaining subset; no complete intent or old-sidecar temporary/final | interrupted prefix cleanup; resume exact target removal, receipt-last cleanup, and directory removal |
+| complete intent; old sidecar absent/partial; registration absent | pre-sidecar intent; reconstruct the bound complete sidecar, publish `aborted`, and enter ordinary receipt cleanup as specified above |
+| any partial or complete old sidecar but no complete intent | unreachable publication order; disputed without cleanup |
 | complete intent/old sidecar; registration absent or its exact reservation remains internal; final = old | unregistered intent; remove only internal reservation/metadata |
 | complete registration; internal reservation absent; external registered stage is absent or a construction-policy subset; no durable `prepared`; final = old | interrupted construction; publish `aborted`, keep final, descriptor-clean the recorded stage if present |
 | durable `prepared`; final = old; external stage = complete new; no outcome marker | prepared pre-commit; publish `aborted`, keep final, clean stage |
@@ -2174,7 +2285,7 @@ cache-required absent state:
 | active journal has valid `cleanup-complete`; terminal final digest matches and external stage is absent | rename active journal to its completed name and continue metadata cleanup |
 | completed journal has valid receipt and remaining members are an exact receipt-listed subset | remove remaining metadata in receipt order, with receipt last |
 | completed journal is empty | descriptor-`rmdir` it and sync the transaction parent |
-| incomplete intent/old metadata with any reservation/registration, internal and external registration both exist, a prepared tree is incomplete, an outcome conflicts with final digest, or any identity/type/name/digest differs | disputed; return `ArtifactTransaction` without removing or renaming final or disputed external state |
+| an incomplete intent with any old-sidecar temporary/final or reservation/registration, incomplete old metadata with any reservation/registration, internal and external registration both exist, a prepared tree is incomplete, an outcome conflicts with final digest, or any identity/type/name/digest differs | disputed; return `ArtifactTransaction` without removing or renaming final or disputed external state |
 
 For an interrupted construction without a new sidecar, cleanup first rechecks
 the registered stage-root identity and permits only same-mount entries allowed by
@@ -2304,7 +2415,8 @@ lock descriptor before relinquishment. A would-be cleaner whose nonblocking
 stage lock contends does not claim; one that loses the name rename closes its
 newly acquired stage descriptor without mutation. The claim winner retains that
 lock through internal-stage removal. Thus two recoverers can never both
-remove an empty pre-intent directory, partial metadata, or a stage, and a crashed
+remove an empty pre-intent directory, a receipt-bound partial intent temporary,
+or a stage, and a crashed
 recoverer leaves a newly claimable name rather than an unowned cleanup race.
 Merely opening a directory before another claimant moves it grants no authority;
 a losing descriptor is closed without mutation.
@@ -2528,21 +2640,29 @@ Mutation lifecycles are command-specific and closed:
   publish no corpus unit.
 - CSS `generate` may use a read-only preliminary inventory only to reject an
   obvious filter miss. After taking the exclusive `css` mutex it authoritatively
-  reopens/recollects the complete import tree, rechecks `expected_files` and the
-  filter, duplicate-checks and interprets every JSON file, requires at least one
-  derived case per file, applies every override, and requires the complete case
-  count to equal `expected_cases`. Full and filtered generation validate the same
-  complete inventory; filtering selects outputs only afterward. A mismatch is
-  `InvalidInventory` before transaction intent.
+  reopens/recollects the complete import tree and requires exactly one canonical
+  `.surgeist-source.json`. It requires the sidecar's complete source to equal the
+  current manifest, validates object format/object IDs, recomputes the sidecar
+  digest, and matches every other file one-to-one by path, `0644` mode, raw-byte
+  digest, and fixture-only count against its sorted entries. It then rechecks the
+  filter, duplicate-checks and interprets every fixture JSON, requires at least
+  one derived case per file, applies every override, and requires the complete
+  case count to equal `expected_cases`. Full and filtered generation validate
+  the same complete provenance/inventory before filtering selects outputs. A
+  manifest/source-pin disagreement is `SourceVerification`; a missing,
+  malformed, noncanonical, or file/count/mode/digest-mismatched sidecar/import
+  unit is `InvalidInventory`. Either occurs before transaction intent, and
+  generation never updates the import sidecar.
 - Layout/CSS checks take shared locks in global order and remain read-only.
   Persisted corpus defects map to `Verification`; `check-taffy-corpus` takes its
   cache key shared before its corpus-domain shared lock.
 
-`import-csstree` validates the pinned Git/JSON snapshot and exact file count but
-does not interpret CSSTree cases or enforce `expected_cases`; that belongs to
-generation and offline corpus verification. Generation and install errors retain
-failure provenance and follow SG-09's exact construction, commit, recovery, and
-cleanup states.
+`import-csstree` validates the pinned Git/JSON snapshot and exact fixture count,
+then atomically persists its complete pin/blob/digest inventory; it does not
+interpret CSSTree cases or enforce `expected_cases`. That belongs to generation
+and offline corpus verification. Generation and install errors retain failure
+provenance and follow SG-09's exact construction, commit, recovery, and cleanup
+states.
 
 ## SG-11 Domain commands and thin binaries
 
@@ -2652,8 +2772,8 @@ the domain runner and is not changed by a binary.
 | Missing/non-directory/non-UTF-8 caller root; caller-root canonicalization/resolution failure; invalid relative path; symlink/mount escape; or textual/filesystem-equivalent namespace overlap | `InvalidPath` | No domain mutation; private probes cleaned, exact coordination bootstrap may remain |
 | Opening/reading an already validated manifest/helper/source/artifact path fails without semantic drift and outside a durable transaction | `Io` | No commit; any private cleanable state is removed |
 | TOML read succeeds but parse, version, field, count-scalar, or domain-namespace contract fails | `InvalidManifest` | No corpus mutation |
-| Count, duplicate, unmatched override, or malformed CSSTree case | `InvalidInventory` | No artifact/report mutation |
-| Wrong/dirty Git source or origin, malformed Git storage, disallowed Git config/helper/executable inventory, unsupported required preflight option, a read-only verification command's nonzero/malformed result, missing promised object, or snapshot tree-mode/hash mismatch | `SourceVerification` | No import mutation |
+| Count, duplicate, unmatched override, malformed CSSTree case, or missing/malformed/noncanonical/path-mode-digest-mismatched CSS import sidecar during generation | `InvalidInventory` | No artifact/report mutation; generation never rewrites import provenance |
+| Wrong/dirty Git source or origin, malformed Git storage, disallowed Git config/helper/executable inventory, unsupported required preflight option, a read-only verification command's nonzero/malformed result, missing promised object, snapshot tree-mode/hash mismatch, reserved CSS sidecar collision, or CSS import-sidecar source pin differing from the current manifest during generation | `SourceVerification` | No import or artifact mutation |
 | Reqwest client/TLS/connect/request timeout or response-body read error | `Io` | Abort/clean cache stage; no cache final or corpus mutation |
 | Browser redirect/non-200 response, download-response URL/policy violation, declared/streamed size limit, ZIP syntax/CRC/path/type/mode/limit defect, logical-tree/content-pin mismatch, or invalid existing cache unit/provenance | `SourceVerification` | Abort/clean cache stage when possible; never replace an invalid final unit |
 | Non-Apple-Silicon-macOS mutation request, or missing required rename, mount-identity, or name-equivalence capability with all private probes cleaned | `UnsupportedPlatform` | No cache/import/artifact/report mutation; exact coordination bootstrap may remain, but no unresolved probe journal |
@@ -2679,7 +2799,13 @@ CSS `check-corpus` reads only the CSS-owned corpus. It validates schema 1, sourc
 and expectation inventories, exact counts, derived case IDs, disposition reasons,
 source-to-expectation one-to-one paths, expectation provenance, report inventory,
 all source/artifact hashes, case/report counts, and absence of stale generated
-JSON. It never requires the original CSSTree checkout after import.
+JSON. It requires the one canonical import sidecar, its complete source to equal
+the manifest pin, its object format/blob IDs/count/sorted paths to be valid, and
+every listed `0644` fixture digest to match with no missing or unlisted import
+JSON. It recomputes `import_provenance_digest` and requires every expectation's
+source revision/source digest/import-provenance digest and every report artifact's
+exact `csstree-import` domain-provenance value plus report repository/revision to
+match. It never requires the original CSSTree checkout after import.
 
 All check commands are read-only. They also inspect their domain's coordination
 inventory and fail on any unresolved probe, owner, transaction, or completed-

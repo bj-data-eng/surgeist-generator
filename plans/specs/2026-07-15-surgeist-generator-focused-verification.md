@@ -34,7 +34,15 @@ Shared-core tests shall prove:
    raw HEAD/index/worktree cleanliness proof, verification leaves the complete
    source/Git tree unchanged, and raw filtered-byte mismatch, skip-worktree,
    assume-unchanged, index/tree drift, and nonignored untracked paths fail closed;
-   the test-only local acquisition transport fetches an exact object into a fresh
+   an accepted linked worktree inventories benign `config.worktree` records
+   under the exact worktree scope/origin while leaving filter/diff/textconv
+   sentinel programs unexecuted; with `extensions.worktreeConfig=true`, each
+   worktree-scoped include/includeIf, URL rewrite, duplicate or wrong origin,
+   credential helper, SSH command, custom helper, and protocol/ext sentinel is
+   rejected before the sentinel runs, while a `config.worktree` file with the
+   extension absent/false, a forged origin, or a config identity/inventory change
+   before the closing recheck also fails closed. The test-only
+   local acquisition transport fetches an exact object into a fresh
    bare stage while contaminated system/global/home/local config, templates,
    hooks, includes, URL rewrites, credentials, filters, askpass, proxies, and Git
    environment sentinel programs remain unexecuted, auto-maintenance does not
@@ -92,8 +100,14 @@ Shared-core tests shall prove:
    committed-old-stage, or completed-journal-tombstone cleanup resumes from the
    exact recorded subset. Active `cleanup-complete`, completed rename, every
    metadata deletion, receipt deletion, and final `rmdir` are independently
-   resumed. A complete old sidecar without intent is rejected as unreachable;
-   the intent-only state recomputes/binds old inventory and cleans internally.
+   resumed. A partial or complete old sidecar without complete intent is rejected
+   as unreachable and preserved. Empty pre-intent cleanup and a lone partial
+   intent temporary cover death before/after the private cleanup-receipt
+   temporary, receipt rename/sync, intent-temporary unlink/sync, receipt unlink/
+   sync, directory removal, and parent sync; only a complete receipt can
+   authorize removal of its exact listed subset. The intent-only or
+   intent-plus-partial-old state recomputes/binds and publishes the complete old
+   inventory, then records `aborted` and follows ordinary receipt cleanup.
    Marker or old-stage cleanup failure after the swap
    preserves the complete new final plus a read-only-detectable journal that the
    next lease clears; no test expects rollback after commit and no observed state
@@ -138,10 +152,11 @@ Shared-core tests shall prove:
     `aarch64-apple-darwin`; every mutation entry point in the already-installed
     WASM nonmutation build fails before coordination/cache/import/artifact/report
     mutation; supported-host rename probe failure leaves no domain mutation and
-    reports any private residue; test documentation states that non-cooperating
-    namespace mutation while leased is unsupported; missing macOS device/fsid or
-    an inconclusive exact-parent name probe fails `UnsupportedPlatform` after
-    private-probe cleanup;
+   reports any private residue; test documentation states that non-cooperating
+   namespace mutation while leased is unsupported; missing macOS device/fsid or
+   an inconclusive exact-parent name probe fails `UnsupportedPlatform` after
+   verified private-probe cleanup, while an identity change, cleanup failure, or
+   durable probe journal returns `ArtifactTransaction` and preserves the residue;
 11. `tests/public_api.rs` type-checks the exact SG-03.4 root reexports,
     constructors, getters, free functions, operation signatures, enum variants,
     and explicit traits. It asserts exact compact JSON bytes for every public
@@ -266,11 +281,15 @@ measurements, and artifacts to prove:
 CSS tests shall use official-shaped synthetic fixture JSON and local temporary Git
 repositories to prove:
 
-1. exact-pin snapshot import, deterministic JSON-only copying, a same-directory-
-   identity content change after snapshotting that cannot change imported bytes,
+1. exact-pin snapshot import, deterministic JSON-only copying, and the exact
+   canonical `.surgeist-source.json` golden with complete source/object format,
+   fixture-only count, sorted paths, `100644` modes, blob IDs, and raw-byte
+   SHA-256 values; a root-sidecar-name collision fails before lease/write. A same-directory-
+   identity content change after snapshotting cannot change imported bytes,
    a protected-directory identity replacement before final revalidation that
    returns `InvalidPath` and publishes nothing, count validation, and stale source
-   removal;
+   removal; crash injection around the root swap proves old fixtures never
+   coexist with new provenance or conversely, and exact reimport is deterministic;
 2. the exact public request constructor/getter and synchronous `run` signatures;
 3. multiple ordinary and error-array cases from one JSON file, multiple
    disposition overrides for that same source, JSON Pointer IDs, sorted cases,
@@ -306,6 +325,16 @@ repositories to prove:
    old tree and post-commit cleanup failures retain the new tree plus journal;
 8. filtered generation updates only matches and writes/prunes no report;
 9. offline verification detects imported-source, expectation, report, hash,
-   provenance, count, and stale-inventory drift.
+   provenance, count, and stale-inventory drift. After import, changing any
+   manifest repository/revision/fixture-root pin makes full and filtered
+   generation fail `SourceVerification` and checking fail `Verification` without
+   writes. Editing any imported byte then asking generation to run fails
+   `InvalidInventory`; generation cannot bless or rewrite the sidecar, including
+   when the edited fixture is outside a filter. A verified reimport atomically
+   repairs/replaces the unit before generation/check can pass. Missing,
+   noncanonical, duplicate/unknown-field sidecars and wrong source, object
+   format, count, order, path, mode, blob-ID width, digest, missing/extra entry,
+   expectation import-provenance digest, or report `csstree-import` digest each
+   fail with the phase-specific SG-12 kind.
 
 No focused test reads or executes the real layout or CSS repository corpus.
