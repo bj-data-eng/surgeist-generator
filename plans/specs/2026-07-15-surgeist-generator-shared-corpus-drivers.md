@@ -195,7 +195,7 @@ The dependency matrix is:
 | `rustix` | `=1.1.4`, `fs`, `process`, Apple Silicon macOS only | yes on the supported target | inherited | inherited | Safe descriptor-relative filesystem transactions and process/group lifecycle |
 | `chromiumoxide` | `=0.9.1`, no defaults, `bytes` | no | yes | no | Chromium measurement without its unsafe path-based fetcher |
 | `futures` | `=0.3.31` | no | yes | no | Chromium handler stream |
-| `tokio` | `=1.48.0`, `fs`, `io-util`, `macros`, `rt-multi-thread`, `time` | no | yes | no | Private Chromium runtime, bounded download, handler lifecycle, and timed cleanup |
+| `tokio` | `=1.48.0`, `fs`, `io-util`, `macros`, `rt-multi-thread`, `test-util`, `time` | no | yes | no | Private Chromium runtime, bounded download, handler lifecycle, timed cleanup, and deterministic paused-time lifecycle tests |
 | `url` | `=2.5.7` | no | yes | no | Fixture and base URL handling |
 | `reqwest` | `=0.13.4`, no defaults, `rustls` | no | yes | no | HTTPS-only pinned browser archive download |
 | `zip` | package `zip`, `=8.6.0`, no defaults, `deflate-flate2-zlib-rs` | no | yes | no | Entry-level browser archive reading for rooted extraction |
@@ -216,6 +216,28 @@ the local Cargo registry. `Cargo.lock` is already tracked and `.gitignore` does
 not ignore it. The final lockfile resolves the exact manifest entirely from the
 local cache and is committed before the locked verification matrix. No dependency
 acquisition occurs; the current cycle plan owns lockfile-refresh mechanics.
+
+The cached direct package manifests provide this reviewed license evidence:
+`serde`, `serde_json`, `sha2`, `toml`, `chromiumoxide`, `futures`, `url`, and
+`reqwest` are `MIT OR Apache-2.0`; `rustix` is
+`Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`; and `tokio` and `zip` are
+`MIT`. Every direct dependency therefore includes an MIT-compatible grant. The
+reviewed lockfile-refresh task must record
+`CARGO_NET_OFFLINE=true cargo deny list --format tsv --layout license` for the
+complete resolved graph; an absent/unknown expression or a license not accepted
+by the repository's MIT distribution boundary stops that task for coordinator
+and independent-reviewer adjudication rather than being silently accepted.
+
+There is no repository-configured advisory policy or fresher authorized
+advisory source. The already-installed `cargo-audit-audit 0.22.1` database is at
+commit `831c50f4a4304068f125e603add6a8839f08b3eb`, authored
+`2026-05-23T18:31:49-04:00`, and is stale relative to this cycle. Its 1,098
+locally available advisories report no finding for the pre-feature scaffold
+lockfile under `cargo audit --no-fetch --stale`; that is not evidence about the
+eventual graph and is not represented as current online advice. After the
+reviewed offline lockfile refresh, the same no-fetch command is a mandatory final
+gate over the actual candidate lockfile. Any reported vulnerability fails the
+candidate, and the final handoff discloses the database revision and staleness.
 
 ### SG-03.3 Public front door
 
@@ -957,7 +979,8 @@ use-mock-keychain
   `<owner-root>/target/surgeist-sources/taffy/<exact-revision>`, preserving the
   copied generator's fixed prefix while deriving the terminal component from the
   manifest pin. That exact revision directory is the one Taffy publication unit
-  and is a generator-owned bare object repository, not a checkout;
+  and is a generator-owned bare object repository, not a checkout. It contains
+  one additional generator file `.surgeist-source.json` described below;
 - `owner_root/target` must already be a same-mount ordinary directory. Browser
   and Taffy stages are unique siblings of their respective final version/revision
   unit, never stages for the whole cache family. Per-run browser profiles live
@@ -1021,26 +1044,50 @@ Taffy cache lock is retained until its immutable snapshot is no longer needed by
 import/check. Cache coordination bootstrap/recovery holds only the target-wide
 gate briefly. Different cache keys may run concurrently.
 
+Taffy cache reuse is bound to the complete source authority even though the
+single final path/key continues to derive from revision. Before prepare, the
+fresh bare stage writes one mode-`0644`, regular single-link
+`.surgeist-source.json` with exactly one final LF and compact JSON fields in this
+order: `schema_version: 1`, `source: <canonical PinnedSource wire object>`, and
+`object_format: "sha1"|"sha256"`. The nested source therefore binds label,
+repository URL, exact revision, and source subdirectory. Its bytes/digest are
+part of the cache inventory. The bare-config validator permits this one root
+sidecar but no remote/config URL. Reuse duplicate-key-parses and revalidates the
+sidecar, commit object, object format, and snapshot, and requires the complete
+source object to equal the current manifest pin before report provenance is
+formed. A different repository URL/subdirectory with the same revision still
+contends on this one path-based key, then fails `SourceVerification`; the
+immutable unit is never relabeled or replaced.
+
 Before creating a profile or launching Chrome, the exclusive browser cache guard
 creates and syncs
 `runtime/runs/<cache-key>/active-<token>/intent.json`. It records the cache key,
-unit and target identities, token, and exact `runtime/browser/<token>` profile
-name. The profile directory is registered with the same reservation-before-move
-protocol as SG-09.1. An immutable `launching` marker is durable before spawn;
-`child.json` records the returned PID immediately afterward, and `reaped` is
-published only after `wait` proves that exact owned child handle terminated and
-the child-created process-group probe returns `ESRCH`.
-Profile removal is descriptor-rooted and the run intent is tombstoned/removed
-only after durable reap proof and profile removal. If a process dies after
-`launching` but before recording the PID, a later acquirer cannot prove that no
-child survived and preserves the intent/profile as disputed
-`ArtifactTransaction`. With a recorded PID/process-group ID but no `reaped`,
-cleanup proceeds only when the safe process-group probe returns `ESRCH`; an
-existing/reused group or any
-inconclusive result is preserved. Merely mentioning residue in an error is never
-terminal accounting. An identity-matching profile cleanup failure retains the
-run intent for the next exclusive cache-key acquisition and returns `Generation`;
-wrong identity/type/mount returns `ArtifactTransaction` without removal.
+unit and target identities, creator PID, token, and exact
+`runtime/browser/<token>` profile name. The profile directory is registered with
+the same reservation-before-move protocol as SG-09.1. Run phase files use the
+same temp/sync/`RENAME_EXCL` publication and receipt/tombstone cleanup rules as
+transaction markers. The closed run state machine is:
+
+| Durable run state | Required action |
+| --- | --- |
+| intent/profile registration, no `launching` | no spawn was permitted; a dead owner descriptor-cleans the registered profile and tombstones the intent |
+| `launching`, then `spawn-failed` | `Command::spawn` returned failure and no child exists; clean profile/intent |
+| `launching` with neither `spawn-failed` nor `child.json` | spawn outcome is unknowable after owner death; preserve everything and return `ArtifactTransaction` |
+| `child.json` | records child PID and expected PGID equal to that PID immediately after successful spawn; no profile cleanup is yet authorized |
+| `child.json` plus `group-verified` | safe `getpgid` proved the expected group; the live owner may operate/terminate it |
+| `child.json` plus `group-mismatch` | owner attempts exact-child kill/reap but group ownership was not proved; preserve profile/intent as disputed even after child exit |
+| live owner publishes `reaped` | owned `wait` produced status and the verified group reached `ESRCH`; profile cleanup is authorized |
+| owner PID is `ESRCH`, child/expected-group probes are both `ESRCH`, and no `group-mismatch` | recovery publishes `orphan-group-absent`; absence, not a fabricated wait status, is alternative terminal evidence authorizing profile cleanup |
+| owner absent but child/group exists or any probe is inconclusive | never signal from recovery; preserve and return `ArtifactTransaction` |
+| terminal evidence plus registered profile | descriptor-clean the exact identity; publish `profile-cleaned`, then receipt/tombstone removal |
+
+An owner that is still present owns recovery; another process does not touch its
+run intent. A marker-publication crash is interpreted only through durable final
+markers, so `launching` without a spawn outcome intentionally fails closed.
+Merely mentioning residue in an error is never terminal accounting. An identity-
+matching profile removal failure retains terminal evidence plus the run intent
+for the next exclusive cache-key acquisition and returns `Generation`; wrong
+identity/type/mount returns `ArtifactTransaction` without removal.
 
 The global lock order is: cache keys in normalized key order, then the corpus
 gate/domain mutex, then browser/task resources; release is the reverse. No path
@@ -1120,10 +1167,14 @@ Another manifest version is `InvalidManifest` until a reviewed pin row is added.
 The logical tree SHA-256 starts with
 `b"surgeist-browser-tree-v1\0"` and, for every non-root entry sorted by UTF-8
 relative-path bytes, hashes: a big-endian `u32` path length, path bytes, one type
-byte (`D`, `F`, or `L`), and a big-endian `u16` sanitized mode. A regular file
+byte (`D`, `F`, or `L`), and a big-endian `u16` containing exactly
+`lstat.st_mode & 0o777`, with no file-type bits. The only accepted logical modes
+are `0755` for `D`, `0644` or `0755` for `F`, and `0755` for `L`. A regular file
 then contributes its big-endian `u64` length and raw 32-byte SHA-256; a symlink
-contributes a big-endian `u32` target-byte length and target bytes. The final
-version directory retains the archive's one `chrome-mac-arm64` top-level tree.
+contributes a big-endian `u32` target-byte length and target bytes. Thus archive
+external attributes, rooted post-extraction `lstat`, and cache-reuse validation
+all normalize to the same explicit permission-bit domain. The final version
+directory retains the archive's one `chrome-mac-arm64` top-level tree.
 This complete logical inventory digest—not mutable URL/version text—is the
 trusted content pin; harmless ZIP metadata/recompression may differ only when it
 extracts to exactly the same pinned bytes, modes, paths, and links. The observed
@@ -1145,7 +1196,7 @@ The ZIP reader performs a complete validation pass before extraction: at most
 relative forward-slash paths; one `chrome-mac-arm64` top-level tree; no duplicate
 decoded path, file/directory conflict, unsupported compression, encrypted entry,
 device, FIFO, socket, or hard-link representation; and modes exactly `0644` or
-`0755` for regular files, `0755` for directories, and `0120777` for the five
+`0755` for regular files, `0755` for directories, and `0120755` for the five
 symlink entries. Inferred parent directories
 receive the same checks. Symlink entry bodies are read during this pass and must
 be relative UTF-8 targets that contain no NUL/backslash, normalize within the
@@ -1170,10 +1221,16 @@ directories and regular files first using only held directory descriptors,
 exclusive create, no-follow component traversal, exact size accounting, flush,
 sync, and sanitized modes. It creates the five already-validated symlinks last
 with descriptor-relative `symlinkat`; no later archive write can traverse one.
-The extractor never calls `create_dir_all`, `File::create`, `ZipArchive::extract`,
-or another pathname-based write.
+On the supported target, each new link is immediately re-opened by rooted
+`lstat` and must expose exactly permission bits `0755`; another mode is
+`UnsupportedPlatform` before prepare, and no attempt is made to chmod through or
+follow the link. The extractor never calls `create_dir_all`, `File::create`,
+`ZipArchive::extract`, or another pathname-based write.
 
-A final rooted inventory repeats the exact type/mode/link graph and mount checks.
+A final rooted inventory repeats the exact type/mode/link graph and mount checks,
+including mode `0755` for every symlink; cache reuse applies the same validator
+and rejects a unit whose link permission bits differ rather than computing a
+different platform-dependent interpretation.
 The platform executable is exactly
 `chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`.
 It must be a regular single-link `0755` file. Its version probe uses only that
@@ -2010,16 +2067,25 @@ its identity in `stage-created`, writes/syncs the exact
 header, and acquires the advisory lock on that still-open stage. It then attempts
 `RENAME_EXCL` directly from the intent to the exact final lock name and syncs both
 directories. A winner keeps that same descriptor; on `EEXIST`, a loser validates
-and locks the complete final inode before journal-cleaning its own stage. A live
+the complete final inode/header without mutating it and tries its lock. If that
+nonblocking attempt contends, the loser publishes a synced `lost-contended`
+marker binding the observed final identity/header digest, cleans only its own
+internal stage/intent through the receipt protocol, and returns `LeaseActive`;
+it does not need the winner's lock to discard an unpublished private file. If the
+lock succeeds, it adopts the final and journal-cleans its loser stage. A live
 bootstrap intent's stage lock is never cleaned. Recovery of a dead-owner,
 unlocked intent accepts only: complete intent plus final absent and no stage;
 complete intent plus final absent and an unregistered exact `lock.stage` that is
 still mode `0600`, zero length, regular, single-link, and same-mount (death before
 `stage-created`); final absent plus the registered internal stage with any
 prefix of the expected header (abort); a valid matching final plus absent stage
-(winner cleanup); or a valid final plus the registered loser stage (loser
-cleanup). Header writing is forbidden before `stage-created`, so a nonempty
-unregistered stage is disputed. Wrong names/types/identities or final/header
+(winner cleanup); a valid final plus the same exact unregistered zero-length
+stage (another bootstrapper won); or a valid final plus the registered loser
+stage (loser cleanup). A durable `lost-contended` intent is recoverable once its
+stage lock is acquirable even if the creating PID still exists; recovery rechecks
+the bound final identity/header and cleans only the loser intent. Header writing
+is forbidden before `stage-created`, so a nonempty unregistered stage is
+disputed. Wrong names/types/identities or final/header
 combinations are also disputed. Intent
 cleanup uses SG-09.2's receipt/tombstone order, so no unpublished unjournaled lock
 stage exists. Final lock files are exact-name, regular, single-link, immutable,
@@ -2118,8 +2184,9 @@ panic use this exact monotonic-clock terminal sequence:
    deadline until it resolves completed, cancelled, or panicked. Abort request
    alone is not terminal. The public call may therefore remain blocked forever
    for a noncooperative task rather than detach it.
-4. Only after child reap publishes the run intent's `reaped` proof does rooted
-   profile cleanup run once. Success completes the run journal. An identity-
+4. Only `reaped` from the live owner or SG-05.2's later
+   `orphan-group-absent` proof authorizes rooted profile cleanup. Success
+   completes the run journal. An identity-
    matching removal failure keeps the durable pending intent/profile and returns
    `Generation`; a disputed identity returns `ArtifactTransaction` without
    removal. Cache transaction stages are handled only by SG-09 recovery, not an
@@ -2369,7 +2436,10 @@ Shared-core tests shall prove:
    locked gate/mutex inodes and journaled bootstrap intents, a race loser adopts
    the winner, and injected crashes before/after stage identity, header sync, and
    `RENAME_EXCL` recover only through the bootstrap intent or a complete adoptable
-   final—never an unjournaled/empty/partial poisoned final; plan install
+   final—never an unjournaled/empty/partial poisoned final. Exact interleavings
+   cover a winner publishing after a dead loser created but did not register its
+   zero stage, and a live loser observing a contended valid final, publishing
+   `lost-contended`, cleaning only itself, and returning `LeaseActive`; plan install
    accepts only a still-live matching corpus/domain lease and rejects a released,
    foreign-domain, or foreign-corpus lease before probes or writes; read-only
    verification takes/contends on the shared gate/mutex without creating state,
@@ -2403,7 +2473,10 @@ Shared-core tests shall prove:
    traversal. Cache tests repeat the state matrix under the matching key guard,
    verify immutable cache units publish only with `RENAME_EXCL`, reuse valid
    units, reject invalid units without replacement, accept only the browser's
-   exact five link targets, and prove a corpus lease never recovers cache state;
+   exact five link targets, and prove a corpus lease never recovers cache state.
+   Two Taffy pins with the same revision/subdirectory but different repository
+   URLs contend on one cache key; the second rejects the first unit's canonical
+   `.surgeist-source.json` and cannot report/relabel it as its own source;
 9. hash text validation and report counts/provenance detect drift, shared reports
    accept structurally valid failed/unsupported counts without fictitious
    artifacts while domain validators enforce their own artifact/count mapping,
@@ -2450,7 +2523,14 @@ measurements, and artifacts to prove:
    boundaries: exact retained top-level tree, logical content digest/counts,
    executable path/mode, five links/modes/targets, archive CRC/size/trailing-data
    rules, strict version stdout/stderr, and direct launch argv/environment/
-   DevTools parsing. Synthetic archives cover early links, descendants after
+   DevTools parsing. A byte-level logical-inventory golden hashes `dir` as
+   `D/0755`, `dir/file` as `F/0644` with bytes `abc`, and `dir/link` as
+   `L/0755 -> file` to exactly
+   `808368d7905aedc20e4b8cf50df818d1f18b01abbcfea5db08a4b58b3764aae6`;
+   substituting link mode `0777`, including file-type bits, or changing field
+   endianness must not match. The compiled pin table asserts its exact evidenced
+   `5ef8a535ec2e28729c989886a728517681a4f30c18819e98dd2cbe018bd3070a`
+   row. Synthetic archives cover early links, descendants after
    links, path escapes, duplicates/conflicts, cycles, special/hard-link modes,
    corrupt CRC, limits, and a byte change that misses the content pin without
    creating an outside sentinel. Sanitized fresh-bare Taffy acquisition crosses
@@ -2471,7 +2551,10 @@ measurements, and artifacts to prove:
    profile, cache-transaction, and acquisition-stage failures, plus an injected operation panic
    after all synthetic resources are registered, a successful close with delayed
    child exit, a hung page close, and a hung handler exercise the exact 2/5-second
-   graceful deadlines, one kill/abort, and unbounded terminal wait. A synthetic
+   graceful deadlines, one kill/abort, and unbounded terminal wait. Deadline
+   cases use Tokio's `test-util` support in a current-thread paused-time test
+   runtime; the production worker remains a private multi-thread runtime, and a
+   separate test retains the already-inside-a-runtime call coverage. A synthetic
    group whose leader exits before a surviving descendant proves the non-reaping
    leader reservation, one group signal, leader reap, and final group `ESRCH`.
    The test
@@ -2482,9 +2565,10 @@ measurements, and artifacts to prove:
    distinct-owner contender can acquire the released same-corpus lease; the
    panic maps to `Generation`, no final artifact, stale output, or report changes,
    and no detached-task counter remains. Death after run intent, profile
-   registration, `launching`, child PID, `reaped`, profile cleanup, and run-
-   tombstone transitions proves that uncertain child state is preserved while
-   proven-reaped state resumes cleanup. Item 7 separately covers recoverable
+   registration, `launching`, `spawn-failed`, child PID, `group-verified`,
+   `group-mismatch`, live-owner `reaped`, recovery `orphan-group-absent`, profile
+   cleanup, and run-tombstone transitions proves that uncertain child/group state
+   is preserved while either exact terminal proof resumes cleanup. Item 7 separately covers recoverable
    case-assigned page/measurement failures.
 
 CSS tests shall use official-shaped synthetic fixture JSON and local temporary Git
@@ -2553,6 +2637,8 @@ cargo check --locked --offline -p surgeist-generator --no-default-features --fea
 cargo test --locked --offline -p surgeist-generator --no-default-features --features layout-browser,css-corpus --all-targets
 cargo clippy --locked --offline -p surgeist-generator --no-default-features --features layout-browser,css-corpus --all-targets -- -F unsafe-code -D warnings
 cargo fmt --check
+CARGO_NET_OFFLINE=true cargo deny list --format tsv --layout license
+cargo audit --no-fetch --stale
 ```
 
 The native matrix runs on and records `rustc -vV` evidence for
@@ -2563,7 +2649,9 @@ shared-core branch. No target is installed. The final gate also builds the
 tracked/nonignored Surgeist-owned Rust manifest and runs the canonical
 repository-wide unsafe scan. It does not run either binary's acquisition or
 real-corpus generation paths and does not run commands in `surgeist-layout` or
-`surgeist-css`.
+`surgeist-css`. The license-list output is retained with final evidence and
+independently reviewed under SG-03.2; the audit evidence records the exact stale
+database revision and must contain no vulnerability finding.
 
 ## SG-14 Documentation, compatibility, and handoff
 
