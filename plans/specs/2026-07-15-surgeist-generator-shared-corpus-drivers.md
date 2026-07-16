@@ -32,9 +32,11 @@ Acceptance requires all of the following:
    offline.
 4. Both binaries contain interface plumbing only. Domain behavior and reusable
    contracts live in the library.
-5. No layout or CSS manifest, fixture, generated expectation, test, source file,
-   or repository configuration is copied into this repository. Generator tests
-   use synthetic temporary corpora and local temporary Git repositories.
+5. Apart from the one audited production-prefix copy required by item 1 and
+   SG-02.2, no layout or CSS manifest, fixture, generated expectation, test,
+   source file, or repository configuration is copied into this repository.
+   Generator tests use synthetic temporary corpora and local temporary Git
+   repositories.
 6. No production Surgeist crate depends on `surgeist-generator` during its normal
    build. Future layout, CSS, and root wiring are handoffs, not changes in this
    initiative.
@@ -82,6 +84,22 @@ The original ten-line binary wrapper has SHA-256
 The inline layout tests beginning at source line 4627 are not part of the copy.
 They remain owned and preserved by `surgeist-layout`. Generator-owned behavior
 shall receive focused synthetic tests in this repository.
+
+Copy-first is a distinct, auditable implementation step. Before changing any
+copied byte or introducing the refactored generator modules, one standalone
+implementation commit shall add only the production prefix as the tracked file
+`src/layout/legacy_generator.rs`. That file shall contain exactly source lines
+1 through 4626, including their final newline, and shall have SHA-256
+`d2f5ca87cea6b36826e9172e2d7ba7a99196c375e2ca53f8a84a075200e70a9f`.
+The cycle evidence shall record the copy commit SHA, its parent SHA, the source
+commit and path above, the destination path, a byte-for-byte comparison result,
+and a name-status diff proving that the destination is the commit's only file
+change. The file remains deliberately unreferenced at this step, so the copy is
+not transformed as a side effect of making it compile. A later reviewed task may
+split, adapt, and remove the transient legacy file while preserving behavior in
+the final modules. This exemption applies only to that identified production
+prefix; all other layout and CSS source, tests, manifests, corpora, helpers, and
+artifacts remain prohibited from copying.
 
 ### SG-02.3 CSS fixture evidence
 
