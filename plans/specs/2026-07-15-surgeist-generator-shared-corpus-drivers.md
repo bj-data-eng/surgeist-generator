@@ -236,6 +236,15 @@ from this signature outline:
 
 ```rust
 pub mod layout {
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct LayoutRequest {
+        location: CorpusLocation,
+        command: LayoutCommand,
+        browser_path: Option<RelativePath>,
+        filter: Option<RelativePath>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     #[non_exhaustive]
     pub enum LayoutCommand {
         Generate,
@@ -263,6 +272,15 @@ pub mod layout {
 }
 
 pub mod css {
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct CssRequest {
+        location: CorpusLocation,
+        command: CssCommand,
+        source_root: Option<std::path::PathBuf>,
+        filter: Option<RelativePath>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     #[non_exhaustive]
     pub enum CssCommand {
         ImportCsstree,
@@ -288,10 +306,13 @@ pub mod css {
 }
 ```
 
-Both command enums are `Clone + Copy + Debug + Eq + PartialEq`. Request
-constructors enforce the complete option matrix in SG-11 before any domain I/O;
-the CSS constructor canonicalizes the required import source root and rejects a
-missing, non-directory, non-UTF-8, or otherwise supplied source root. The layout
+Both request structs have private fields and exactly
+`Clone + Debug + Eq + PartialEq`; they have no Serde, default, conversion, or
+other explicit trait implementation and no `#[non_exhaustive]` attribute. Both
+command enums have exactly the traits and attribute shown. Request constructors
+enforce the complete option matrix in SG-11 before any domain I/O; the CSS
+constructor canonicalizes the required import source root and rejects a missing,
+non-directory, non-UTF-8, or otherwise supplied source root. The layout
 constructor retains the browser path as a checked owner-relative path for later
 manifest-cache containment validation.
 
@@ -478,6 +499,12 @@ impl Sha256Digest {
     pub fn as_str(&self) -> &str;
 }
 ```
+
+`validate_disposition_records` rejects duplicate case IDs and sorts the returned
+records by case ID. It deliberately permits repeated `source_path` values:
+multiple independently identified cases may derive from one source file. A
+domain that requires one case per source performs that stricter check in its
+manifest validator.
 
 Provenance, report, transaction, and lease operations are exactly:
 
@@ -758,8 +785,51 @@ returns `VerifiedSource` only when:
    checkout without a symlink escape.
 
 Verification performs no fetch, checkout, remote mutation, configuration change,
-or network access. `VerifiedSource` retains the canonical root and exact revision
-and cannot be constructed publicly without verification.
+or network access. Every Git subprocess uses one crate-private sanitized runner.
+It clears the inherited environment, preserves only `PATH` plus the Windows
+process-loader variables `SystemRoot`, `WINDIR`, and `PATHEXT` and temporary-path
+variables `TEMP` and `TMP` when those variables exist, sets `LC_ALL=C`, and sets
+`GIT_OPTIONAL_LOCKS=0`, `GIT_NO_REPLACE_OBJECTS=1`,
+`GIT_NO_LAZY_FETCH=1`, `GIT_LITERAL_PATHSPECS=1`,
+`GIT_TERMINAL_PROMPT=0`, and `GIT_CONFIG_NOSYSTEM=1`. Consequently no inherited
+Git directory, worktree, object, alternate, namespace, replacement, config,
+credential, transport, prompt, or trace override survives; with no `HOME` or
+`XDG_CONFIG_HOME`, no global user config is read.
+
+Every invocation also supplies the equivalent explicit global options
+`--no-optional-locks --no-replace-objects --no-lazy-fetch
+--literal-pathspecs`, followed by `-c core.fsmonitor=false`,
+`-c core.untrackedCache=false`, and `-c submodule.recurse=false`, before the
+built-in subcommand. Repository-local configuration remains readable only where
+Git needs repository identity, but it cannot enable a filesystem-monitor helper,
+optional index update, replacement object, pathspec magic, submodule recursion,
+or promisor fetch. A Git version that does not accept the required global
+options fails closed as `SourceVerification`; the driver does not retry with a
+weaker invocation.
+
+`VerifiedSource` retains the canonical worktree root and exact revision and
+cannot be constructed publicly without verification. It also privately retains
+a deduplicated source-protection set resolved by sanitized Git commands:
+
+- the canonical worktree root from `rev-parse --show-toplevel`;
+- the canonical per-worktree administrative directory from
+  `rev-parse --absolute-git-dir`;
+- the canonical common administrative directory from
+  `rev-parse --path-format=absolute --git-common-dir`;
+- the canonical primary object directory from
+  `rev-parse --path-format=absolute --git-path objects`;
+- every canonical alternate object directory recursively reachable through each
+  local `objects/info/alternates` file, resolving relative entries against the
+  object directory that contains the file, deduplicating repeated directory
+  identities, and failing a recursion cycle as `SourceVerification`.
+
+Each protection entry must be an existing UTF-8 directory. A missing, malformed,
+non-UTF-8, non-directory, or uncanonicalizable administrative/object/alternate
+path fails `SourceVerification`. Inherited object and alternate directories
+cannot affect this set because the runner cleared them. Worktree administration,
+the index, refs, packed objects, and loose objects are therefore all covered for
+ordinary repositories, linked worktrees, and local alternates without making
+these internal paths public.
 
 Imports never reread fixture bytes from mutable checkout pathnames after this
 verification. The shared source module immediately builds an internal immutable
@@ -768,10 +838,15 @@ verification. The shared source module immediately builds an internal immutable
 modes beneath the declared subdirectory, and `git cat-file blob <object-id>`
 supplies each file's bytes. Paths are normalized and sorted; blob object IDs,
 bytes, and SHA-256 digests are retained in memory. Symlink, submodule, tree,
-escaped, duplicate, non-UTF-8, and wrong-extension entries fail. Installed Git
-runs with optional locks disabled and never writes an object or index. The
-snapshot type and Git object details are crate-private; public provenance exposes
-only the exact source revision, normalized path, and SHA-256 digest.
+escaped, duplicate, non-UTF-8, and wrong-extension entries fail. The literal
+pathspec global option makes metacharacters in `source_subdirectory` ordinary
+filename bytes. The no-replacement option binds enumeration and reads to the
+commit's original object graph; the no-lazy-fetch option makes a locally absent
+promisor object fail `SourceVerification` without contacting its remote or
+writing an object. Output paths must have the exact declared subdirectory as a
+component prefix before that prefix is stripped. The snapshot type, protection
+set, and Git object details are crate-private; public provenance exposes only the
+exact source revision, normalized path, and SHA-256 digest.
 
 CSS constructs this snapshot after the clean worktree/origin/HEAD check and
 before capability preflight, then imports only retained snapshot bytes after the
@@ -779,6 +854,15 @@ lease. A checkout path change after snapshot creation cannot alter imported
 bytes. Layout acquisition occurs beneath its lease; after checkout and exact-pin
 verification it uses the same commit-tree snapshot for Taffy import. Expected
 file counts are checked against the snapshot before any corpus mutation.
+
+Every snapshot consumer validates the complete source-protection set against its
+downstream writable namespaces. CSS performs the SG-07.2 check before its lease
+or any mutation. Layout may create/update its manifest-owned checkout only after
+its lease, but after verification it requires that checkout's protected set to
+be disjoint from the Taffy import destination, layout artifact/report roots, and
+coordination namespace before snapshotting or mutating any destination; a
+conflict is `InvalidPath`. The manifest-owned checkout cache itself is the only
+source-side namespace layout may mutate.
 
 The layout `import-taffy` command retains its existing explicitly
 acquisition-capable fetch/checkout behavior in domain code after the SG-10
@@ -813,13 +897,16 @@ The invariant is:
 
 - `Active` has no reason;
 - every non-active disposition has a nonempty trimmed reason;
-- duplicate IDs or duplicate source identities fail validation;
+- duplicate case IDs fail shared validation, while repeated source paths are
+  valid when distinct case IDs identify multiple cases in one fixture;
 - `FailedToGenerate` is a runtime report outcome, not a manifest disposition.
 
 Layout semantics remain: active cases generate normally; expected-fail cases run
 and are accounted separately; unsupported and quarantined cases do not run and
 their old outputs are removed only during a successful full run. CSS applies the
-same accounting to derived neutral cases.
+same accounting to derived neutral cases. Layout's schema-2 validator retains
+its domain-specific unique source-fixture rule; CSS intentionally permits any
+number of ordinary and error-array case IDs to reference one imported JSON file.
 
 ### SG-07.2 CSSTree ingestion
 
@@ -831,15 +918,19 @@ entries, checks the exact source-file count, and removes stale imported JSON onl
 as part of a successful complete import transaction. It writes no expectations
 or generation report.
 
-Source verification first yields the canonical Git checkout root. Before the
-commit-tree snapshot is built, that checkout root must be component-wise
-disjoint in both directions from every prospective CSS mutation namespace: the
-absolute import root, expectation root, report path, and owner coordination
-root. Any equality, checkout-ancestor, or checkout-descendant relationship fails
-with `InvalidPath`; no capability probe, lease path, import path, expectation, or
-report is created. The comparison uses the canonical checkout and owner/corpus
-roots plus checked relative-path joins, so an external checkout remains strictly
-read-only even when the user supplies an owner or corpus nested within it.
+Source verification first yields the complete crate-private SG-06 protection
+set, not only the canonical checkout root. Before the commit-tree snapshot is
+built, every protected worktree, per-worktree Git directory, common Git
+directory, primary object directory, and recursive local alternate object
+directory must be component-wise disjoint in both directions from every
+prospective CSS mutation namespace: the absolute import root, expectation root,
+report path, and owner coordination root. Any equality, protected-ancestor, or
+protected-descendant relationship fails with `InvalidPath`; no capability probe,
+lease path, import path, expectation, or report is created. The comparison uses
+canonical protected directories and owner/corpus roots plus checked relative-path
+joins, so an external ordinary or linked checkout and every object store it uses
+remain strictly read-only even when the user supplies an owner or corpus nested
+within one of those locations.
 
 ### SG-07.3 Neutral expectation shape
 
@@ -1035,14 +1126,15 @@ CLI parse
 
 Manifest, source, filter, and unsupported-platform errors occur before the lease
 or writes. CSS validates manifest namespace separation, verifies the supplied
-CSSTree checkout read-only, validates that checkout against every prospective
-writable namespace, and only then snapshots it, performs capability preflight,
-and acquires the lease for import. Layout validates manifest acquisition inputs
-before the lease; its mutable browser/cache and Taffy fetch/checkout work runs
-only after capability preflight and lease acquisition, followed by exact-pin
-verification. Every mutation-capable command follows this ordering. Generation
-and install errors retain failure provenance and perform rollback as defined in
-SG-09.
+CSSTree checkout read-only, validates its complete worktree/Git/object protection
+set against every prospective writable namespace, and only then snapshots it,
+performs capability preflight, and acquires the lease for import. Layout validates
+manifest acquisition inputs before the lease; its mutable browser/cache and
+Taffy fetch/checkout work runs only after capability preflight and lease
+acquisition, followed by exact-pin verification and protection-set validation
+before destination writes. Every mutation-capable command follows this ordering.
+Generation and install errors retain failure provenance and perform rollback as
+defined in SG-09.
 
 ## SG-11 Domain commands and thin binaries
 
@@ -1136,10 +1228,10 @@ No binary remaps a semantic error independently.
 | Failure | Required kind | Mutation rule |
 | --- | --- | --- |
 | Missing/duplicate/unknown CLI argument | `Cli` | No filesystem mutation |
-| Root, relative path, or symlink escape | `InvalidPath` | No corpus mutation |
+| Root, relative path, symlink escape, or protected/writable namespace overlap | `InvalidPath` | No corpus mutation |
 | TOML parse, version, or field contract | `InvalidManifest` | No corpus mutation |
 | Count, duplicate, unmatched override, or malformed CSSTree case | `InvalidInventory` | No artifact/report mutation |
-| Wrong/dirty Git source or origin | `SourceVerification` | No import mutation |
+| Wrong/dirty Git source or origin, malformed Git storage, unsupported sanitized Git invocation, or missing promised object | `SourceVerification` | No import mutation |
 | Unsupported target or missing required rename flags | `UnsupportedPlatform` | No cache/import/artifact/report mutation; private probe cleanup only |
 | Contended generation lease | `LeaseActive` | No corpus mutation |
 | Git/browser subprocess failure | `Process` | Domain cleanup; no stale pruning |
@@ -1177,9 +1269,15 @@ Shared-core tests shall prove:
 4. local Git verification accepts the exact clean revision and rejects prefixes,
    wrong revisions, dirty/untracked state, wrong origins, and escaped source
    roots; its recursively enumerated commit-tree snapshot includes fixtures below
-   nested directories and retains pinned blob bytes when checkout paths change
-   afterward;
-5. dispositions require reasons exactly as SG-07 specifies and reject duplicates;
+   nested directories, treats pathspec metacharacters literally, ignores a
+   replacement ref, and retains pinned original blob bytes when checkout paths
+   change afterward; a synthetic promisor repository with a locally missing blob
+   fails without reading its available local promisor remote or repopulating the
+   object store, and linked-worktree/common/object plus recursive alternate
+   protection paths are resolved canonically;
+5. dispositions require reasons exactly as SG-07 specifies, reject duplicate
+   case IDs, accept repeated source paths for distinct case IDs, and return case-ID
+   order;
 6. filtered scope cannot authorize report or stale-output operations;
 7. full and filtered requests contend on one corpus lease, owner metadata is
    coherent, dropping releases the lease, and symlink, hard-link, unknown-header,
@@ -1204,7 +1302,9 @@ Shared-core tests shall prove:
     constructors, getters, free functions, operation signatures, enum variants,
     explicit traits, and Serde round trips under default features; the layout,
     CSS, and combined feature test builds type-check the exact SG-03.3 driver
-    additions. No alternative public module or compatibility alias is added.
+    additions, including request structs' private construction boundary and
+    `Clone + Debug + Eq + PartialEq` commitments. No alternative public module
+    or compatibility alias is added.
 
 Layout tests shall use synthetic temporary manifests, helpers, HTML, JSON
 measurements, and artifacts to prove:
@@ -1218,7 +1318,10 @@ measurements, and artifacts to prove:
 6. representative XML shape, four variants, numeric formatting, layout fields,
    and unchanged generated-by provenance;
 7. disposition accounting, report behavior, full/filtered isolation, and offline
-   drift rejection.
+   drift rejection;
+8. a verified Taffy checkout's worktree, linked-worktree administration, common
+   Git directory, primary object directory, and recursive alternates cannot
+   overlap import, artifact/report, or coordination writes.
 
 CSS tests shall use official-shaped synthetic fixture JSON and local temporary Git
 repositories to prove:
@@ -1226,15 +1329,19 @@ repositories to prove:
 1. exact-pin snapshot import, deterministic JSON-only copying, post-verification
    checkout-path swap immunity, count validation, and stale source removal;
 2. the exact public request constructor/getter and synchronous `run` signatures;
-3. ordinary and error-array flattening, JSON Pointer IDs, sorted cases, options,
-   canonical CSS, and omission of AST/error/offset data;
+3. multiple ordinary and error-array cases from one JSON file, multiple
+   disposition overrides for that same source, JSON Pointer IDs, sorted cases,
+   options, canonical CSS, and omission of AST/error/offset data;
 4. malformed source structures and unmatched overrides fail before writes;
 5. equal and component-wise ancestor/descendant overlaps among import,
    expectation, report, manifest, and coordination namespaces fail with the
    specified `InvalidManifest` or `InvalidPath` before lease acquisition or any
    directory creation; a verified checkout equal to, above, or below every CSS
    writable/coordination namespace fails with `InvalidPath` while leaving both
-   the checkout and owner/corpus trees unchanged;
+   the checkout and owner/corpus trees unchanged; linked-worktree administrative
+   and common directories, primary object storage, and a recursively configured
+   local alternate object store receive the same overlap matrix even when the
+   canonical worktree root itself is disjoint;
 6. active/default and non-active reason accounting;
 7. full generation writes expectations/report and removes stale outputs only
    after success;
