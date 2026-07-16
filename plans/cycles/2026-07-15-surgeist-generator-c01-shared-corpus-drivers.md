@@ -18,16 +18,16 @@
 
 ## Reviewed Multi-Cycle Sequence
 
-1. **C01, this plan:** SG-02; shared/core clauses of SG-03, SG-04, SG-06,
-   SG-07.1, SG-08–SG-10, SG-12, SG-13.1/13.2. Focused shared items 1–11.
-2. **C02, separately planned/reviewed after C01:** layout edges of SG-03.2/3.4,
-   SG-05.1–5.2, layout clauses of SG-06/8–10/12/13.1, SG-11.1, and focused
-   layout items 1–9. It owns optional layout dependencies, the exact at-most-15-
+1. **C01, this plan:** SG-02 closure and focused shared items 1–3 and 5–6;
+   other shared-core work is an explicitly named prerequisite for later closure.
+2. **C02, separately planned/reviewed after C01:** SG-03.2, SG-05.2, SG-11.1,
+   focused shared item 4, and focused layout items 1–9. It owns optional layout
+   dependencies, the exact at-most-15-
    physical-line binary, Taffy/Chromium lifecycle, XML, and legacy-copy removal.
-3. **C03, separately planned/reviewed after C02:** CSS edges of SG-03.4,
-   SG-05.3, SG-07.2–7.3, CSS clauses of SG-08–10/12/13.1, SG-11.2, and focused
-   CSS items 1–9. It owns CSS import provenance, neutral output, the exact
-   at-most-15-physical-line binary, and the combined-feature task gate.
+3. **C03, separately planned/reviewed after C02:** every remaining cross-driver
+   section, focused shared items 7–11, and focused CSS items 1–9. It owns CSS
+   import provenance, neutral output, the exact at-most-15-physical-line binary,
+   and the combined-feature task gate.
 4. **C04, separately planned/reviewed after C03:** remaining SG-01, SG-13.3, and
    SG-14 integration/docs/evidence; full matrix, holistic review, final canonical
    publication/readback, and cross-repository handoff. Each preceding cycle is
@@ -68,8 +68,9 @@
   `d2980f7`, plus the ordered corrective commit span recorded here before review.
   The prior clean review is historical; a fresh reviewer assesses the complete
   packet against the final pair.
-- Trace: shared/default clauses of SG-03.1–3.4 and SG-06; SG-07.1; SG-08;
-  static/path/source/report rows of SG-12; focused shared items 1–6 and 11.
+- Trace: C01 evidence owner for focused shared items 1–3 and 5. It implements
+  prerequisites from SG-03.4, SG-06–8, and SG-12 plus source/public-API cases
+  toward focused items 4 and 11, whose executable closure remains C02/C03.
 - Files: `Cargo.toml`, mechanically refreshed `Cargo.lock`, `src/lib.rs`,
   `src/error.rs`, `src/core/{mod,case,corpus,hash,manifest,report,source}.rs`, and
   focused public/source tests. The legacy copy remains untouched.
@@ -95,8 +96,9 @@
 - Complete review packet: initial implementation commits `b70dea3` and
   `d32e9f6`, plus the ordered corrective commit span recorded here before review.
   Its prior review was not clean; no finding or span is waived.
-- Trace: shared/core SG-04 and SG-09–10; transaction/lease/capability precedence
-  in SG-12; shared coordination clauses of SG-13.1; focused shared items 7–10.
+- Trace: C01 evidence owner for focused shared item 6. It implements prerequisite
+  shared mechanisms from SG-04, SG-09–10, SG-12, and SG-13.1 plus precursor
+  cases toward focused items 7–10, whose executable closure remains C03.
 - Files: `src/core/{artifact,lease}.rs`, private rooted-fs/coordination/
   transaction/inventory modules, related reexports, and crash/race tests.
 - RED: first record failures for bootstrap claim races, alias/mount/identity
@@ -107,7 +109,8 @@
   are clean while residue is `ArtifactTransaction`; lock files are never partial;
   checks create/recover nothing; pre-commit preserves old, post-commit preserves
   new plus resumable evidence; cleanup removes only receipt-bound identities;
-  every focused shared item has deterministic synthetic evidence.
+  focused item 6 and every named later-cycle prerequisite have deterministic
+  synthetic evidence without claiming focused items 7–10 complete.
 - Gate:
   - `cargo check --locked --offline -p surgeist-generator --no-default-features`
   - `cargo test --locked --offline -p surgeist-generator --no-default-features`
