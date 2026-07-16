@@ -627,6 +627,12 @@ crate-private. The two checked `const` constructors (`ReportArtifact::new` and
 inventory, and overflow checks occur in `GenerationReport::new` and
 `GenerationCounts::total`.
 
+`GenerationReport::new` validates count overflow, sorted unique output paths, and
+report header fields, but does not require summed `ReportArtifact::case_count` to
+equal `GenerationCounts::total()`. Layout can have failed/unsupported cases with
+no artifact, while a CSS expectation artifact can document non-active cases.
+Each domain report validator owns its exact artifact-to-case/count relationship.
+
 `ArtifactPlan` has no arbitrary output-root constructor: both constructors bind
 to the supplied location's canonical corpus root and privately retain that exact
 root identity. Domain cache acquisition outside the corpus uses crate-private
@@ -664,6 +670,28 @@ files are generator state, have no generated extension, and are excluded from
 domain artifact/report inventories; recursive domain walks do not enter any
 directory with that exact component name.
 
+Those namespace rules use filesystem equivalence, not Rust string equality.
+Before a mutation lease, the rooted capability derives a private name-equivalence
+policy for every candidate component pair by exclusive create/open probes inside
+its private probe directory on the same mount. Two component spellings are
+equivalent when the filesystem resolves them to one entry, covering case folding,
+Unicode normalization, and other volume-specific aliases. Namespace equality
+and ancestor tests compare components with that policy; therefore
+`.SURGEIST-GENERATOR` or a normalization variant is reserved whenever the volume
+aliases it to `.surgeist-generator`, and two case-only manifest roots collide on
+a case-insensitive volume. An exact-text conflict remains `InvalidManifest` at
+semantic validation; a filesystem-only alias is `InvalidPath` after private
+probe cleanup and before lease/domain writes. If equivalence cannot be proven,
+mutation fails closed as `UnsupportedPlatform`.
+
+Before creating that private probe, a read-only descriptor walk of the already
+existing owner/corpus ancestry tries the exact reserved name in each component's
+parent and compares object identity with the actual component. If an existing
+case/normalization alias places either root at or beneath a coordination name,
+preflight returns `InvalidPath` without creating `.surgeist-generator`. Only an
+ancestry that passes this bootstrap check may create/adopt the exact coordination
+directory and run candidate-name probes inside it.
+
 ### SG-04.2 Strict relative paths
 
 `RelativePath` is a normalized UTF-8, forward-slash representation. Its checked
@@ -686,9 +714,11 @@ Domain schemas may impose stricter extension, component-count, or prefix rules.
 
 `RunScope` is a closed enum:
 
-- `Full` is verification-capable and may install the complete artifact set,
-  write the canonical report, remove stale generated artifacts, and remove
-  non-manifest reports after every job succeeds;
+- `Full` is verification-capable. On clean success it may install the complete
+  artifact set, write the canonical report, remove stale generated artifacts,
+  and remove non-manifest reports. The recoverable layout-failure exception in
+  SG-09 may install successful artifacts plus a diagnostic canonical report but
+  must preserve stale artifacts and non-manifest reports;
 - `Filtered(RelativePath)` is iteration-only and may install only matching
   artifacts. It must not write or prune reports, remove stale nonmatching
   artifacts, or count as final verification evidence.
@@ -777,10 +807,13 @@ relative paths. The report path must be one JSON file under
 
 Manifest semantic validation treats namespace relationships as part of schema 1.
 Two paths overlap when they are equal or either is a component-wise ancestor of
-the other; string-prefix matches inside one component do not overlap. The
+the other; string-prefix matches inside one component do not overlap. Exact-text
+overlap is rejected during manifest validation, and SG-04 filesystem-equivalent
+component overlap is rejected during capability preflight. The
 corpus-absolute `import_root`, `expectation_root`, and `report_file` must be
-pairwise non-overlapping, and neither generated root may overlap the protected
-`corpus.toml` manifest path. Equal, ancestor, and descendant configurations fail
+pairwise non-overlapping under both comparisons, and neither generated root may
+overlap the protected `corpus.toml` manifest path. Equal, ancestor, and
+descendant configurations fail
 with `InvalidManifest` before source verification, lease acquisition, directory
 creation, or writes.
 
@@ -788,8 +821,9 @@ After `CorpusLocation` construction, the driver also forms the canonical
 corpus-absolute coordination namespace
 `<corpus-root>/.surgeist-generator/`. Each manifest-declared writable path
 must be component-wise disjoint from that coordination namespace. A conflict at
-this absolute-root boundary fails with `InvalidPath` before capability preflight,
-lease acquisition, or writes.
+this canonical/text boundary fails with `InvalidPath` before capability
+preflight, lease acquisition, or writes; a filesystem-only alias fails during
+the cleaned private preflight and before lease or domain writes.
 
 `[[cases]]` entries are disposition overrides keyed by a derived case ID. IDs
 are unique. An override must resolve to one collected case. Active is the
@@ -995,12 +1029,18 @@ directory, primary object directory, and recursive local alternate object
 directory must be component-wise disjoint in both directions from every
 prospective CSS mutation namespace: the absolute import root, expectation root,
 report path, and corpus coordination root. Any equality, protected-ancestor, or
-protected-descendant relationship fails with `InvalidPath`; no capability probe,
-lease path, import path, expectation, or report is created. The comparison uses
+protected-descendant relationship fails with `InvalidPath`; only the private
+name/capability probe may be created and cleaned, and no lease, import path,
+expectation, or report is created. The comparison uses
 canonical protected directories and owner/corpus roots plus checked relative-path
-joins, so an external ordinary or linked checkout and every object store it uses
-remain strictly read-only even when the user supplies an owner or corpus nested
-within one of those locations.
+joins. It also compares descriptor `(device, inode)` ancestry sets for every
+existing protected and nearest-existing writable directory in both directions;
+this detects case aliases, bind/null mounts, firmlinks, and other pathname aliases
+that canonical text does not collapse. A filesystem-equivalent component policy
+is used for not-yet-created writable suffixes. Thus an external ordinary or
+linked checkout and every object store it uses remain strictly read-only even
+when the user supplies an aliased owner or corpus nested within one of those
+locations.
 
 ### SG-07.3 Neutral expectation shape
 
@@ -1060,7 +1100,9 @@ and exactly one final newline. Its full report schema 1 records:
   counts and sorted case records with reasons where required.
 
 Report validation recomputes every digest and count. Generic `skipped` buckets
-are rejected.
+are rejected. The shared `GenerationReport` validates structural counts without
+assuming every counted case has an artifact; layout and CSS validators enforce
+their distinct schema relationships described above.
 
 ## SG-09 Atomic installation and stale-output behavior
 
@@ -1080,6 +1122,18 @@ operation to another object or outside the held root. Construction compares the
 opened root identity with the supplied canonical path before adopting the
 capability. Pathname validation alone is never mutation authority. No OS
 descriptor is public.
+
+The capability never crosses a mount boundary. On Linux it requires `statx`
+`STATX_MNT_ID` for the held root and every opened existing component and rejects
+a missing mount-ID result or any change; this detects bind mounts even when
+`st_dev` is equal. On macOS it requires both `fstat().st_dev` and
+`fstatfs().f_fsid` to match the held root for every component. A platform or
+filesystem that cannot supply the required identity fails mutation preflight as
+`UnsupportedPlatform`. Newly created directories are reopened and checked before
+use. Collection and stale walks do not enter a mount point, and source/writable
+alias comparisons use the descriptor ancestry identities in SG-07.2. This
+prevents a held corpus/cache descriptor from being used as authority over a
+mounted alias to another tree.
 
 Safe descriptor-relative mutation is unavailable from this implementation on
 every target other than Linux and macOS, including other `cfg(unix)` targets.
@@ -1134,19 +1188,49 @@ The transaction never removes a file outside the declared generated extension
 and roots. It never follows an output symlink. Residual temporary or backup names
 from another process are collisions, not files to overwrite. Every prospective
 stage and backup name is checked even when its final target does not exist.
-`ArtifactPlan` rejects `.surgeist-generator` as any component of a generated
-root, artifact, retained path, or report path, at any nesting depth. Its stale
-collector never enters a directory bearing that exact name. Together with the
+`ArtifactPlan` rejects any component filesystem-equivalent to
+`.surgeist-generator` in a generated root, artifact, retained path, or report
+path, at any nesting depth: exact spellings fail construction, and an alias
+known only through the private name probe fails install preflight before staging.
+Its stale collector never enters a directory whose
+descriptor/name is equivalent to that reservation. Together with the
 location-bound corpus root and SG-04 root rejection, callers cannot select the
 coordination directory as an output root, target the current root-level
 coordination files, or reach a nested corpus's coordination files through a
 parent-corpus plan.
 
-Domain generation may commit one coherent artifact group at a time, but each
-group uses this transaction. Full-run stale removal occurs only after every job
-succeeds and uses a complete retained inventory. A failed full run may write its
-diagnostic report, but it preserves stale artifacts and nonmanifest reports.
-Filtered runs never provide a stale inventory and cannot call stale removal.
+The public `ArtifactPlan` commits one coherent artifact group. Each domain driver
+uses a crate-private composite publication plan in the same module to combine
+all run artifacts, authorized stale removals, the canonical report, and
+authorized nonmanifest-report removals into one staged commit/rollback boundary.
+No domain run commits one group and then starts another. Outcomes are classified
+before that publication boundary:
+
+- A clean full success has no `failed_to_generate` cases. It atomically installs
+  the complete artifact set, prunes stale generated artifacts from the complete
+  retained inventory, installs the canonical report, prunes nonmanifest reports,
+  and returns `Ok(())`.
+- A recoverable layout job failure is a page/measurement/batch failure assigned
+  to one or more validated case IDs after acquisition succeeded and terminal
+  browser/task/profile cleanup itself succeeded. Successful case bytes are
+  installed as one coherent group. A full run atomically writes a canonical
+  diagnostic report containing those artifacts and the exact
+  `failed_to_generate` cases/reasons, preserves every stale artifact and
+  nonmanifest report, then returns `Generation`. A filtered run may install only
+  successful matched artifacts, writes/prunes no report or stale output, and
+  returns `Generation`. This diagnostic state is not final verification evidence.
+- A fatal lifecycle failure is any manifest/source/capability/lease/acquisition,
+  invariant/serialization, unassigned generation, browser/task/profile cleanup,
+  or publication transaction failure. It publishes no artifact or report and
+  removes no stale output: a publication failure rolls the entire composite plan
+  back before returning. It never emits a diagnostic report merely because the
+  fatal path failed.
+
+CSS has no recoverable per-case execution in this cycle: malformed or
+unconvertible neutral input is a fatal pre-publication error. Layout's
+recoverable behavior preserves the copied generator's externally useful
+partial-success/failed-case report contract, but deliberately buffers successful
+XML until resource cleanup instead of writing it incrementally.
 
 The canonical report itself uses the same staged replace-and-rollback primitive.
 
@@ -1170,12 +1254,34 @@ disk for reuse; they are not generated corpus artifacts.
 
 On Linux and macOS, coordination directories and lock files are reached through
 the same safe descriptor-relative, non-following capability described in SG-09.
-The immutable acquisition-gate and lease-mutex files are exclusively created or
-opened without following links, contain exactly the generator-owned schema-1
-magic header `surgeist-generator-lock-v1\n`, and are locked but never truncated
-or rewritten. Before use they must be regular, header-valid, and single-link;
-their already-open descriptors are rechecked after locking. A hard link added
-later cannot expose a content mutation because these two inodes remain immutable.
+An existing coordination directory is adopted only when its directory entry has
+the exact on-disk name `.surgeist-generator`, not merely a filesystem-equivalent
+spelling, and its opened identity/mount matches the expected corpus child.
+
+The immutable acquisition-gate and lease-mutex files contain exactly the
+generator-owned schema-1 magic header `surgeist-generator-lock-v1\n`, are locked,
+and are never truncated or rewritten. Their first creation uses atomic publish,
+not direct final-name creation:
+
+1. exclusively create a unique descriptor-rooted sibling stage;
+2. write the complete header, flush and sync it, verify regular type and one link,
+   then acquire the advisory lock on that already-open stage;
+3. publish the still-open, still-locked inode to the final name with `NOREPLACE`
+   and sync the coordination directory; the winning descriptor remains the lock
+   descriptor;
+4. on `EEXIST`, safely discard only the contender's own unpublished stage, open
+   the final name without following links, require a complete header/regular
+   type/one link, acquire its lock, and reread/recheck the same descriptor before
+   adoption.
+
+A crash before publication can leave only a uniquely named unpublished stage;
+it cannot expose a partial final file or block a later unique publisher. A crash
+after publication leaves a complete synced immutable final inode and releases
+its advisory lock. Pre-existing empty, partial, multi-link, special, aliased-name,
+or unknown-header finals fail without truncation. The gate is bootstrapped first
+and held while the lease mutex and owner metadata are created/adopted. A hard
+link added later cannot expose a content mutation because these two final inodes
+remain immutable.
 
 Mutable owner metadata lives in a separate owner file. Acquisition writes a new
 single-link, exclusively created and synced stage file, then uses an atomic
@@ -1195,12 +1301,17 @@ byte buffer, and profile directory are registered immediately; a task handle is
 never dropped to detach it. Normal success and every semantic error stop
 scheduling jobs and run the same terminal sequence before the worker can return:
 
-1. close each open page;
-2. request browser close with a bounded timeout, then force `kill` and wait/reap
-   when close fails or times out; the lease is not released while the child is
-   still observed alive;
-3. await a normally completed handler task, or abort and await it after browser
-   failure/timeout, and account for every registered task;
+1. close each open page with a bounded timeout; a failure/timeout is recorded and
+   cleanup proceeds to whole-browser termination rather than awaiting the page
+   again;
+2. request browser close with a bounded timeout, then always perform a bounded
+   post-close child `wait`; successful close is not treated as process exit. A
+   close failure/timeout or delayed exit forces `kill` followed by `wait/reap`;
+   the lease is not released while the child is still observed alive;
+3. await a normally completing handler only for a bounded interval, then abort
+   and await its `JoinHandle`; abort-and-join is also bounded but remains owned
+   and retried/fail-closed rather than detaching. Every registered task is
+   accounted before lease release;
 4. remove the run-owned browser profile with the SG-09 rooted, non-following
    cleanup primitive only after the child is reaped; a disputed or unremovable
    profile is retained under its collision-safe run name and returned as a
@@ -1215,9 +1326,11 @@ Layout collects all XML and report bytes in memory. It does not install an
 artifact, prune stale output, or publish a report until measurement and the
 browser/task/profile terminal sequence have succeeded. Once publication begins,
 the synchronous SG-09 transaction runs to success or complete rollback without
-an async cancellation point. A browser, handler, measurement, profile, or cache
-cleanup error therefore leaves final artifacts, stale outputs, and canonical
-reports unchanged. The private worker thread is joined by the public function,
+an async cancellation point. A fatal browser, handler, unassigned measurement,
+profile, or cache cleanup error therefore leaves final artifacts, stale outputs,
+and canonical reports unchanged; only an SG-09 recoverable case-assigned
+measurement failure authorizes the exact diagnostic publication described
+there. The private worker thread is joined by the public function,
 so dropping a Rust future is not an API operation and returning to the caller
 means no browser or handler work remains.
 
@@ -1249,8 +1362,8 @@ CLI parse
   -> optional browser/cache acquisition or source import
   -> deterministic collection and domain generation
   -> terminal browser/task/profile/acquisition-stage cleanup
-  -> atomic artifact groups
-  -> full-only report and stale cleanup
+  -> classify clean, recoverable-diagnostic, or fatal outcome
+  -> one composite artifact/report/stale publication or no publication
   -> success or semantic error
 ```
 
@@ -1358,16 +1471,17 @@ No binary remaps a semantic error independently.
 | Failure | Required kind | Mutation rule |
 | --- | --- | --- |
 | Missing/duplicate/unknown CLI argument | `Cli` | No filesystem mutation |
-| Root, relative path, symlink escape, or protected/writable namespace overlap | `InvalidPath` | No corpus mutation |
+| Root, relative path, symlink/mount escape, or textual/filesystem-equivalent protected/writable namespace overlap | `InvalidPath` | No domain mutation; private probe cleanup only |
 | TOML parse, version, or field contract | `InvalidManifest` | No corpus mutation |
 | Count, duplicate, unmatched override, or malformed CSSTree case | `InvalidInventory` | No artifact/report mutation |
 | Wrong/dirty Git source or origin, malformed Git storage, unsupported sanitized Git invocation, or missing promised object | `SourceVerification` | No import mutation |
-| Unsupported target or missing required rename flags | `UnsupportedPlatform` | No cache/import/artifact/report mutation; private probe cleanup only |
+| Unsupported target or missing required rename, mount-identity, or name-equivalence capability | `UnsupportedPlatform` | No cache/import/artifact/report mutation; private probe cleanup only |
 | Contended generation lease | `LeaseActive` | No corpus mutation |
 | Git/browser subprocess failure | `Process` | Domain cleanup; no stale pruning |
 | Read/write/canonicalize failure | `Io` | Transaction rollback where applicable |
 | Stage/backup/install/restore failure | `ArtifactTransaction` | Best-effort complete rollback with terminal diagnostic |
-| Browser measurement or neutral conversion failure | `Generation` | No stale pruning; full report may record failure |
+| Recoverable case-assigned layout page/measurement/batch failure after successful resource cleanup | `Generation` | SG-09 diagnostic publication; no stale/nonmanifest pruning |
+| Unassigned layout generation/resource cleanup or CSS neutral conversion failure | `Generation` | Complete composite rollback; no artifact/report/stale mutation |
 | Offline hash/provenance/report mismatch | `Verification` | Check commands remain read-only |
 
 ## SG-13 Verification behavior
@@ -1394,8 +1508,10 @@ Shared-core tests shall prove:
 
 1. strict paths reject absolute, dot, dotdot, backslash, empty-component,
    non-UTF-8-at-CLI, and symlink escapes;
-2. corpus locations reject roots outside the owner;
-3. collection is sorted and rejects symlinks/special entries;
+2. corpus locations reject roots outside the owner and roots whose canonical
+   components contain the exact reserved coordination name;
+3. collection is sorted and rejects symlinks, special entries, and mount
+   crossings;
 4. local Git verification accepts the exact clean revision and rejects prefixes,
    wrong revisions, dirty/untracked state, wrong origins, and escaped source
    roots; its recursively enumerated commit-tree snapshot includes fixtures below
@@ -1419,25 +1535,37 @@ Shared-core tests shall prove:
    coherently, dropping releases the lease, and symlink, hard-link,
    unknown-header, owner-exchange collision, and coordination-component swaps
    observed before an atomic transition cannot redirect, overwrite, or truncate
-   a lock or owner file;
+   a lock or owner file; concurrent first acquisition publishes only complete
+   locked gate/mutex inodes, a race loser adopts the winner, and injected crashes
+   before and after `NOREPLACE` leave respectively only an unpublished stage or
+   a complete adoptable final—never an empty/partial poisoned final;
 8. artifact installation is deterministic, replaces atomically, removes stale
    files only when authorized, and restores every prior file after injected
    staging, installation, or cleanup failure; descriptor-bound tests replace
    roots, components, and destination names before each atomic transition and
    prove no escape, overwrite, or removal of a colliding inode under the SG-09
-   exclusive-namespace contract; public plans have no arbitrary output-root
+   exclusive-namespace contract; a domain composite plan restores artifacts,
+   stale files, canonical report, and nonmanifest reports together after every
+   injected commit point; public plans have no arbitrary output-root
    constructor, a `CorpusLocation` rooted at/below a coordination directory is
    rejected, and generated, retained, artifact, report, and stale-walk paths
-   reject or skip `.surgeist-generator` at the root and at nested depths, proving
-   the equal-root, parent-root-plus-target, and direct-relative bypasses closed;
-9. hash text validation and report counts/provenance detect drift, and every
-   `GeneratorErrorKind` has the exact SG-12 exit code;
+   reject or skip filesystem-equivalent `.surgeist-generator` names at the root
+   and at nested depths, proving the equal-root, parent-root-plus-target, and
+   direct-relative bypasses closed; injected case-folding and Unicode-normalizing
+   name policies reject aliased reserved/CSS components before domain writes,
+   and injected Linux mount-ID/macOS device-plus-fsid changes stop traversal;
+9. hash text validation and report counts/provenance detect drift, shared reports
+   accept structurally valid failed/unsupported counts without fictitious
+   artifacts while domain validators enforce their own artifact/count mapping,
+   and every `GeneratorErrorKind` has the exact SG-12 exit code;
 10. a residual deterministic backup is rejected even when its final target is
     absent; compile-time target selection is exactly Linux/macOS; every
     mutation-capable entry point on other targets fails before a coordination,
     cache, import, artifact, or report mutation; supported-target probe failure
     leaves no domain mutation and reports any probe residue; test documentation
     states that non-cooperating namespace mutation while leased is unsupported;
+    missing Linux `STATX_MNT_ID`, missing macOS fs identity, and an inconclusive
+    name-equivalence probe fail `UnsupportedPlatform` after private-probe cleanup;
 11. `tests/public_api.rs` type-checks the exact SG-03.4 root reexports,
     constructors, getters, free functions, operation signatures, enum variants,
     explicit traits, and Serde round trips under default features; the layout,
@@ -1460,19 +1588,25 @@ measurements, and artifacts to prove:
    without launching or acquiring a browser;
 6. representative XML shape, four variants, numeric formatting, layout fields,
    and unchanged generated-by provenance;
-7. disposition accounting, report behavior, full/filtered isolation, and offline
-   drift rejection;
+7. disposition accounting, full/filtered isolation, and offline drift rejection;
+   recoverable case-assigned failures publish successful artifacts plus the
+   full-only failed-case diagnostic report, preserve stale/nonmanifest outputs,
+   and return `Generation`, while fatal launch/acquisition/cleanup/serialization
+   and composite-publication failures roll back artifacts, report, and stale
+   state together;
 8. a verified Taffy checkout's worktree, linked-worktree administration, common
    Git directory, primary object directory, and recursive alternates cannot
    overlap import, artifact/report, or coordination writes;
-9. injected launch, page, measurement, browser-close, handler-join, profile, and
-   acquisition-stage failures, plus an injected operation panic after all
-   synthetic resources are registered, return only after the synthetic child is
-   reaped, every handler is completed or aborted-and-joined, the profile is
-   removed or reported as a collision-safe residue, and a distinct-owner
-   contender can acquire the released same-corpus lease; the panic maps to
-   `Generation`, no final artifact, stale output, or report changes, and no
-   detached-task counter remains.
+9. injected fatal launch, unassigned-generation, browser-close, handler-join,
+   profile, and acquisition-stage failures, plus an injected operation panic
+   after all synthetic resources are registered, a successful close with delayed
+   child exit, a hung page close, and a hung handler return only after the
+   synthetic child is reaped, every handler is completed or aborted-and-joined,
+   the profile is removed or reported as a collision-safe residue, and a
+   distinct-owner contender can acquire the released same-corpus lease; the
+   panic maps to `Generation`, no final artifact, stale output, or report changes,
+   and no detached-task counter remains. Item 7 separately covers recoverable
+   case-assigned page/measurement failures.
 
 CSS tests shall use official-shaped synthetic fixture JSON and local temporary Git
 repositories to prove:
@@ -1487,12 +1621,15 @@ repositories to prove:
 5. equal and component-wise ancestor/descendant overlaps among import,
    expectation, report, manifest, and coordination namespaces fail with the
    specified `InvalidManifest` or `InvalidPath` before lease acquisition or any
-   directory creation; a verified checkout equal to, above, or below every CSS
+   domain directory creation (only a cleaned private alias probe is allowed);
+   case-folded and Unicode-normalized aliases receive the same matrix; a
+   verified checkout equal to, above, or below every CSS
    writable/coordination namespace fails with `InvalidPath` while leaving both
    the checkout and owner/corpus trees unchanged; linked-worktree administrative
    and common directories, primary object storage, and a recursively configured
    local alternate object store receive the same overlap matrix even when the
-   canonical worktree root itself is disjoint;
+   canonical worktree root itself is textually disjoint, including an injected
+   mount/path alias with matching descriptor ancestry;
 6. active/default and non-active reason accounting;
 7. full generation writes expectations/report and removes stale outputs only
    after success;
