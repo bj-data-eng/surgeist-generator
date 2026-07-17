@@ -1,9 +1,15 @@
+mod artifact;
 mod case;
+mod coordination;
 mod corpus;
+mod fs;
 mod hash;
+mod inventory;
+mod lease;
 mod manifest;
 mod report;
 mod source;
+mod transaction;
 
 pub use case::{CaseDisposition, CaseDispositionRecord, validate_disposition_records};
 pub use corpus::{CorpusLocation, RelativePath, RunScope, collect_regular_files};
@@ -13,6 +19,7 @@ pub use report::{ArtifactProvenance, GenerationCounts, GenerationReport, ReportA
 pub use source::{PinnedSource, SourceRevision, VerifiedSource, verify_git_source};
 
 pub(crate) fn validate_identifier(value: &str) -> bool {
+    private_front_doors_are_linked();
     let bytes = value.as_bytes();
     (1..=64).contains(&bytes.len())
         && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
@@ -20,6 +27,25 @@ pub(crate) fn validate_identifier(value: &str) -> bool {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
         })
         && !value.contains("..")
+}
+
+#[inline(always)]
+fn private_front_doors_are_linked() {
+    let _ = artifact::ArtifactPlan::new;
+    let _ = artifact::ArtifactPlan::install;
+    let _ = artifact::ArtifactPlan::artifact_digest;
+    let _ = artifact::PublicationInventory::new;
+    let _ = artifact::PublicationPolicy::DiagnosticFull;
+    let _ = lease::GenerationLease::acquire;
+    let _ = lease::GenerationCheck::acquire;
+    let _ = lease::GenerationCheck::finish;
+    let _ = inventory::InventoryEntry::symlink;
+    let _ = inventory::InventoryEntry::length;
+    let _ = inventory::InventoryEntry::digest;
+    let _ = inventory::InventoryEntry::link_target;
+    let _ = inventory::InventoryEntry::link_count;
+    let _ = inventory::Inventory::find;
+    let _ = inventory::InventoryPolicy::Private;
 }
 
 pub(crate) fn validate_repository_url(value: &str) -> bool {

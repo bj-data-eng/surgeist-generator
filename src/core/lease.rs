@@ -1,563 +1,208 @@
-use std::fs::{self, File, Metadata, OpenOptions, TryLockError};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::sync::{Arc, Weak};
 
-use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, Result, RunScope, Sha256Digest};
+use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, Result, RunScope};
 
-/// An exclusive lease for one generator domain and canonical corpus root.
+use super::coordination::{
+    CoordinationAccess, CoordinationGuard, CoordinationState, Domain, LeaseMetadata,
+    acquire_exclusive, acquire_shared_check,
+};
+use super::fs::{HeldIdentity, RootedFs};
+
+/// A live, exclusive mutation authority for one fixed corpus and domain.
 #[derive(Debug)]
-pub struct GenerationLease {
-    file: File,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ObjectIdentity {
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(not(unix))]
-    length: u64,
-    #[cfg(not(unix))]
-    modified: Option<SystemTime>,
-}
-
-impl ObjectIdentity {
-    fn from_metadata(metadata: &Metadata) -> Self {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            Self {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            Self {
-                length: metadata.len(),
-                modified: metadata.modified().ok(),
-            }
-        }
-    }
+pub(crate) struct GenerationLease {
+    guard: CoordinationGuard,
 }
 
 impl GenerationLease {
-    /// Acquires the lease for `domain` and the location's canonical corpus root.
-    ///
-    /// The supplied location and scope are already-validated lifecycle inputs.
-    /// Contention returns [`GeneratorErrorKind::LeaseActive`] with coherent owner
-    /// metadata; dropping the returned value releases the advisory lock.
-    pub fn acquire(
+    /// Acquires a corpus-local exclusive lease after all coordination recovery.
+    pub(crate) fn acquire(
         location: &CorpusLocation,
-        domain: impl AsRef<str>,
-        generator: impl AsRef<str>,
-        scope: &RunScope,
-        command: impl AsRef<str>,
-    ) -> Result<Self> {
-        Self::acquire_inner(
-            location,
-            domain.as_ref(),
-            generator.as_ref(),
-            scope,
-            command.as_ref(),
-            None,
-        )
-    }
-
-    fn acquire_inner(
-        location: &CorpusLocation,
-        domain: &str,
+        domain: Domain,
         generator: &str,
         scope: &RunScope,
         command: &str,
-        coordination_hook: Option<&dyn Fn(&Path)>,
     ) -> Result<Self> {
-        let domain = checked_metadata("domain", domain)?;
-        let generator = checked_metadata("generator", generator)?;
-        let command = checked_metadata("command", command)?;
-        let owner_identity =
-            real_directory_identity(location.owner_root(), "validate generation owner root")?;
-        let coordination_root = location
-            .owner_root()
-            .join("target")
-            .join("surgeist-generator");
-        let coordination_identity =
-            create_coordination_root(location.owner_root(), &owner_identity, &coordination_root)?;
-        if let Some(hook) = coordination_hook {
-            hook(&coordination_root);
-        }
-        validate_coordination_root(
-            location.owner_root(),
-            &owner_identity,
-            &coordination_root,
-            &coordination_identity,
-        )?;
+        Self::acquire_with_revalidation(location, domain, generator, scope, command, |_| Ok(()))
+    }
 
-        let key = Sha256Digest::from_bytes(format!(
-            "domain={domain}\ncorpus={}",
-            location.corpus_root().display()
-        ));
-        let gate_path = coordination_root.join(format!("{key}.gate.lock"));
-        let lease_path = coordination_root.join(format!("{key}.lease.lock"));
-        let gate = open_lock_file(
-            location.owner_root(),
-            &owner_identity,
-            &coordination_root,
-            &coordination_identity,
-            &gate_path,
-        )?;
-        validate_open_lock_file(
-            &gate,
-            location.owner_root(),
-            &owner_identity,
-            &coordination_root,
-            &coordination_identity,
-            &gate_path,
-        )?;
-        gate.lock().map_err(|source| {
-            io_source(
-                "lock generation acquisition gate",
-                gate_path.display(),
-                source,
-            )
-        })?;
+    /// Acquires a lease and performs a final protected-source check while locked.
+    pub(crate) fn acquire_with_revalidation(
+        location: &CorpusLocation,
+        domain: Domain,
+        generator: &str,
+        scope: &RunScope,
+        command: &str,
+        protected_revalidation: impl FnOnce(&RootedFs) -> Result<()>,
+    ) -> Result<Self> {
+        let metadata = LeaseMetadata::new(generator, scope, command)?;
+        acquire_exclusive(location, domain, metadata, protected_revalidation)
+            .map(|guard| Self { guard })
+    }
 
-        let mut lease = match open_lock_file(
-            location.owner_root(),
-            &owner_identity,
-            &coordination_root,
-            &coordination_identity,
-            &lease_path,
-        ) {
-            Ok(file) => file,
-            Err(error) => {
-                let _ = gate.unlock();
-                return Err(error);
-            }
-        };
-        validate_open_lock_file(
-            &lease,
-            location.owner_root(),
-            &owner_identity,
-            &coordination_root,
-            &coordination_identity,
-            &lease_path,
-        )?;
-        match lease.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                let owner = read_owner(&mut lease, &lease_path)?;
-                gate.unlock().map_err(|source| {
-                    io_source(
-                        "unlock generation acquisition gate",
-                        gate_path.display(),
-                        source,
-                    )
-                })?;
-                return Err(GeneratorError::new(
-                    GeneratorErrorKind::LeaseActive,
-                    "acquire generation lease",
-                    format!("active owner: {owner}"),
-                ));
-            }
-            Err(TryLockError::Error(source)) => {
-                let _ = gate.unlock();
-                return Err(io_source(
-                    "lock generation lease",
-                    lease_path.display(),
-                    source,
-                ));
-            }
+    /// Creates a non-owning binding to this exact acquisition.
+    pub(crate) fn bind(
+        &self,
+        location: &CorpusLocation,
+        domain: Domain,
+    ) -> Result<LeaseBinding> {
+        if self.guard.access() != CoordinationAccess::Exclusive {
+            return Err(binding_error("lease is not exclusive"));
         }
-
-        let metadata = owner_metadata(location, domain, generator, scope, command)?;
-        validate_open_lock_file(
-            &lease,
-            location.owner_root(),
-            &owner_identity,
-            &coordination_root,
-            &coordination_identity,
-            &lease_path,
-        )?;
-        if let Err(source) = write_owner(&mut lease, metadata.as_bytes()) {
-            let _ = lease.unlock();
-            let _ = gate.unlock();
-            return Err(io_source(
-                "write generation lease owner",
-                lease_path.display(),
-                source,
-            ));
+        let state = self.guard.state();
+        if !state.is_live() {
+            return Err(binding_error("lease has been released"));
         }
-        if let Err(error) = validate_open_lock_file(
-            &lease,
-            location.owner_root(),
-            &owner_identity,
-            &coordination_root,
-            &coordination_identity,
-            &lease_path,
-        ) {
-            let _ = lease.unlock();
-            let _ = gate.unlock();
-            return Err(error);
+        if state.domain() != domain {
+            return Err(binding_error("lease domain does not match the plan"));
         }
-        gate.unlock().map_err(|source| {
-            let _ = lease.unlock();
-            io_source(
-                "unlock generation acquisition gate",
-                gate_path.display(),
-                source,
-            )
-        })?;
-        Ok(Self { file: lease })
+        if state.canonical_corpus() != location.corpus_root() {
+            return Err(binding_error("lease corpus does not match the plan"));
+        }
+        let token = state
+            .token()
+            .ok_or_else(|| binding_error("exclusive lease has no acquisition token"))?
+            .to_owned();
+        Ok(LeaseBinding {
+            state: Arc::downgrade(state),
+            original_token: token,
+            canonical_corpus: location.corpus_root().to_path_buf(),
+            corpus_identity: state.corpus_identity().clone(),
+            domain,
+        })
     }
 
     #[cfg(test)]
-    fn acquire_with_coordination_hook(
+    fn state(&self) -> &Arc<CoordinationState> {
+        self.guard.state()
+    }
+}
+
+/// A read-only shared coordination guard. Finishing repeats absence/residue checks.
+#[derive(Debug)]
+pub(crate) struct GenerationCheck {
+    guard: Option<CoordinationGuard>,
+}
+
+impl GenerationCheck {
+    pub(crate) fn acquire(location: &CorpusLocation, domain: Domain) -> Result<Self> {
+        acquire_shared_check(location, domain).map(|guard| Self { guard: Some(guard) })
+    }
+
+    pub(crate) fn finish(mut self) -> Result<()> {
+        self.guard
+            .take()
+            .ok_or_else(|| verification_error("check guard was already finished"))?
+            .finish_check()
+    }
+}
+
+/// A plan's proof that it was constructed from one original live acquisition.
+#[derive(Clone, Debug)]
+pub(crate) struct LeaseBinding {
+    state: Weak<CoordinationState>,
+    original_token: String,
+    canonical_corpus: PathBuf,
+    corpus_identity: HeldIdentity,
+    domain: Domain,
+}
+
+impl LeaseBinding {
+    /// Validates only in-memory authority first, before any capability probe or write.
+    pub(crate) fn validate(
+        &self,
         location: &CorpusLocation,
-        domain: &str,
-        generator: &str,
-        scope: &RunScope,
-        command: &str,
-        hook: impl Fn(&Path),
-    ) -> Result<Self> {
-        Self::acquire_inner(location, domain, generator, scope, command, Some(&hook))
-    }
-}
-
-impl Drop for GenerationLease {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
-fn checked_metadata<'a>(label: &str, value: &'a str) -> Result<&'a str> {
-    if value.is_empty()
-        || value.trim() != value
-        || value.contains('\0')
-        || value.contains('\n')
-        || value.contains('\r')
-    {
-        return Err(GeneratorError::new(
-            GeneratorErrorKind::InvalidPath,
-            "validate generation lease metadata",
-            format!("invalid {label}"),
-        ));
-    }
-    Ok(value)
-}
-
-fn real_directory_identity(path: &Path, operation: &str) -> Result<ObjectIdentity> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|source| io_source(operation, path.display(), source))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(GeneratorError::new(
-            GeneratorErrorKind::InvalidPath,
-            operation,
-            format!("not a real directory: {}", path.display()),
-        ));
-    }
-    Ok(ObjectIdentity::from_metadata(&metadata))
-}
-
-fn validate_real_directory(path: &Path, expected: &ObjectIdentity, operation: &str) -> Result<()> {
-    let actual = real_directory_identity(path, operation)?;
-    if actual != *expected {
-        return Err(GeneratorError::new(
-            GeneratorErrorKind::InvalidPath,
-            operation,
-            format!("directory identity changed: {}", path.display()),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_coordination_root(
-    owner_root: &Path,
-    owner_identity: &ObjectIdentity,
-    coordination_root: &Path,
-    coordination_identity: &ObjectIdentity,
-) -> Result<()> {
-    validate_real_directory(
-        owner_root,
-        owner_identity,
-        "revalidate generation owner root",
-    )?;
-    validate_real_directory(
-        coordination_root,
-        coordination_identity,
-        "revalidate generation coordination root",
-    )?;
-    let canonical = fs::canonicalize(coordination_root).map_err(|source| {
-        io_source(
-            "canonicalize generation coordination root",
-            coordination_root.display(),
-            source,
-        )
-    })?;
-    if !canonical.starts_with(owner_root) {
-        return Err(GeneratorError::new(
-            GeneratorErrorKind::InvalidPath,
-            "revalidate generation coordination root",
-            format!(
-                "coordination root escaped owner root: {}",
-                coordination_root.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_open_lock_file(
-    file: &File,
-    owner_root: &Path,
-    owner_identity: &ObjectIdentity,
-    coordination_root: &Path,
-    coordination_identity: &ObjectIdentity,
-    path: &Path,
-) -> Result<()> {
-    validate_coordination_root(
-        owner_root,
-        owner_identity,
-        coordination_root,
-        coordination_identity,
-    )?;
-    let path_metadata = fs::symlink_metadata(path)
-        .map_err(|source| io_source("inspect generation lock path", path.display(), source))?;
-    let handle_metadata = file
-        .metadata()
-        .map_err(|source| io_source("inspect generation lock handle", path.display(), source))?;
-    if path_metadata.file_type().is_symlink()
-        || !path_metadata.is_file()
-        || ObjectIdentity::from_metadata(&path_metadata)
-            != ObjectIdentity::from_metadata(&handle_metadata)
-    {
-        return Err(GeneratorError::new(
-            GeneratorErrorKind::InvalidPath,
-            "validate generation lock identity",
-            format!("lock file identity changed: {}", path.display()),
-        ));
-    }
-    Ok(())
-}
-
-fn create_coordination_root(
-    owner_root: &Path,
-    owner_identity: &ObjectIdentity,
-    target: &Path,
-) -> Result<ObjectIdentity> {
-    let relative = target.strip_prefix(owner_root).map_err(|_| {
-        GeneratorError::new(
-            GeneratorErrorKind::InvalidPath,
-            "validate generation coordination root",
-            target.display().to_string(),
-        )
-    })?;
-    let mut current = owner_root.to_path_buf();
-    let mut component_identities: Vec<(std::path::PathBuf, ObjectIdentity)> = Vec::new();
-    for component in relative.components() {
-        validate_real_directory(
-            owner_root,
-            owner_identity,
-            "revalidate generation owner root",
-        )?;
-        for (path, identity) in &component_identities {
-            validate_real_directory(
-                path,
-                identity,
-                "revalidate generation coordination component",
-            )?;
+        domain: Domain,
+    ) -> Result<LeaseOperation> {
+        if self.domain != domain {
+            return Err(binding_error("plan domain differs from its original lease"));
         }
-        current.push(component.as_os_str());
-        match fs::create_dir(&current) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let metadata = fs::symlink_metadata(&current).map_err(|source| {
-                    io_source(
-                        "inspect generation coordination root",
-                        current.display(),
-                        source,
-                    )
-                })?;
-                if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                    return Err(GeneratorError::new(
-                        GeneratorErrorKind::InvalidPath,
-                        "validate generation coordination root",
-                        format!("not a real directory: {}", current.display()),
-                    ));
-                }
-            }
-            Err(source) => {
-                return Err(io_source(
-                    "create generation coordination root",
-                    current.display(),
-                    source,
-                ));
-            }
+        if self.canonical_corpus != location.corpus_root() {
+            return Err(binding_error("plan corpus differs from its original lease"));
         }
-        let metadata = fs::symlink_metadata(&current).map_err(|source| {
-            io_source(
-                "inspect generation coordination root",
-                current.display(),
-                source,
-            )
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(GeneratorError::new(
-                GeneratorErrorKind::InvalidPath,
-                "validate generation coordination root",
-                format!("not a real directory: {}", current.display()),
+        let state = self
+            .state
+            .upgrade()
+            .ok_or_else(|| binding_error("original lease no longer exists"))?;
+        if !state.is_live() {
+            return Err(binding_error("original lease has been released"));
+        }
+        if !state.try_begin_operation() {
+            return Err(binding_error(
+                "another transaction is active under the original lease",
             ));
         }
-        component_identities.push((current.clone(), ObjectIdentity::from_metadata(&metadata)));
-    }
-    validate_real_directory(
-        owner_root,
-        owner_identity,
-        "revalidate generation owner root",
-    )?;
-    for (path, identity) in &component_identities {
-        validate_real_directory(
-            path,
-            identity,
-            "revalidate generation coordination component",
-        )?;
-    }
-    real_directory_identity(target, "validate generation coordination root")
-}
-
-fn open_lock_file(
-    owner_root: &Path,
-    owner_identity: &ObjectIdentity,
-    coordination_root: &Path,
-    coordination_identity: &ObjectIdentity,
-    path: &Path,
-) -> Result<File> {
-    validate_coordination_root(
-        owner_root,
-        owner_identity,
-        coordination_root,
-        coordination_identity,
-    )?;
-    let file = match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(GeneratorError::new(
-                    GeneratorErrorKind::InvalidPath,
-                    "validate generation lock file",
-                    format!("not a real file: {}", path.display()),
-                ));
-            }
-            OpenOptions::new().read(true).write(true).open(path)
+        if state.domain() != self.domain
+            || state.canonical_corpus() != self.canonical_corpus
+            || state.corpus_identity() != &self.corpus_identity
+            || state.token() != Some(self.original_token.as_str())
+        {
+            state.finish_operation();
+            return Err(binding_error("original lease identity changed"));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path),
-        Err(error) => Err(error),
+        Ok(LeaseOperation { state })
     }
-    .map_err(|source| io_source("open generation lock file", path.display(), source))?;
-    validate_open_lock_file(
-        &file,
-        owner_root,
-        owner_identity,
-        coordination_root,
-        coordination_identity,
-        path,
-    )?;
-    Ok(file)
+
 }
 
-fn read_owner(file: &mut File, path: &Path) -> Result<String> {
-    file.seek(SeekFrom::Start(0))
-        .and_then(|_| {
-            let mut owner = String::new();
-            file.read_to_string(&mut owner).map(|_| owner)
-        })
-        .map_err(|source| io_source("read generation lease owner", path.display(), source))
-        .map(|owner| owner.trim_end().to_owned())
+#[derive(Debug)]
+pub(crate) struct LeaseOperation {
+    state: Arc<CoordinationState>,
 }
 
-fn write_owner(file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(bytes)?;
-    file.flush()?;
-    file.sync_all()
+impl std::ops::Deref for LeaseOperation {
+    type Target = CoordinationState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
 }
 
-fn owner_metadata(
-    location: &CorpusLocation,
-    domain: &str,
-    generator: &str,
-    scope: &RunScope,
-    command: &str,
-) -> Result<String> {
-    let start = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| {
-            GeneratorError::new(
-                GeneratorErrorKind::Io,
-                "read generation lease start time",
-                error.to_string(),
-            )
-        })?
-        .as_secs();
-    let scope = match scope {
-        RunScope::Full => "full".to_owned(),
-        RunScope::Filtered(filter) => format!("filtered:{}", filter.as_str()),
-    };
-    Ok(format!(
-        "generator={generator}\npid={}\ncorpus_root={}\ndomain={domain}\nscope={scope}\ncommand={command}\nunix_start={start}\n",
-        std::process::id(),
-        escape_metadata_path(location.corpus_root())
-    ))
+impl Drop for LeaseOperation {
+    fn drop(&mut self) {
+        self.state.finish_operation();
+    }
 }
 
-fn escape_metadata_path(path: &Path) -> String {
-    path.display()
-        .to_string()
-        .replace('\\', "\\\\")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-}
-
-fn io_source(
-    operation: &str,
-    detail: impl std::fmt::Display,
-    source: std::io::Error,
-) -> GeneratorError {
-    GeneratorError::with_source(
-        GeneratorErrorKind::Io,
-        operation,
-        detail.to_string(),
-        source,
+fn binding_error(detail: impl Into<String>) -> GeneratorError {
+    GeneratorError::new(
+        GeneratorErrorKind::ArtifactTransaction,
+        "validate artifact mutation lease",
+        detail,
     )
 }
 
-#[cfg(test)]
+fn verification_error(detail: impl Into<String>) -> GeneratorError {
+    GeneratorError::new(
+        GeneratorErrorKind::Verification,
+        "finish generation check",
+        detail,
+    )
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{GenerationLease, open_lock_file, real_directory_identity};
-    use crate::{CorpusLocation, GeneratorErrorKind, RelativePath, RunScope};
+    use crate::{CorpusLocation, GeneratorErrorKind, RunScope};
 
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    use super::{Domain, GenerationCheck, GenerationLease};
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
-        fn new(label: &str) -> Self {
-            let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        fn new() -> Self {
+            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "surgeist-generator-{label}-{}-{sequence}",
+                "surgeist-generator-lease-{}-{sequence}",
                 std::process::id()
             ));
-            fs::create_dir(&path).expect("create isolated test directory");
+            fs::create_dir(&path).expect("create test root");
             Self(path)
         }
 
@@ -568,169 +213,190 @@ mod tests {
 
     impl Drop for TestDirectory {
         fn drop(&mut self) {
-            fs::remove_dir_all(&self.0).expect("remove isolated test directory");
+            fs::remove_dir_all(&self.0).expect("remove test root");
         }
     }
 
-    #[test]
-    fn generation_lease_contends_by_corpus() {
-        let directory = TestDirectory::new("lease-contention");
-        let corpus = directory.path().join("corpus");
+    fn locations() -> (TestDirectory, CorpusLocation, CorpusLocation) {
+        let temporary = TestDirectory::new();
+        let owner = temporary.path().join("owner");
+        let nested_owner = owner.join("nested");
+        let corpus = nested_owner.join("corpus");
+        fs::create_dir(&owner).expect("create owner");
+        fs::create_dir(&nested_owner).expect("create nested owner");
         fs::create_dir(&corpus).expect("create corpus");
-        let location = CorpusLocation::new(directory.path(), &corpus).expect("valid location");
+        let outer = CorpusLocation::new(&owner, &corpus).expect("outer location");
+        let inner = CorpusLocation::new(&nested_owner, &corpus).expect("inner location");
+        (temporary, outer, inner)
+    }
 
+    #[test]
+    fn distinct_owner_ancestors_for_one_corpus_contend_on_the_corpus_mutex() {
+        let (_temporary, outer, inner) = locations();
         let held = GenerationLease::acquire(
-            &location,
-            "layout",
-            "surgeist-layout-generate",
+            &outer,
+            Domain::Layout,
+            "layout-generator",
             &RunScope::Full,
             "generate",
         )
-        .expect("acquire first lease");
-        let unrelated_domain = GenerationLease::acquire(
-            &location,
-            "css",
-            "surgeist-css-generate",
-            &RunScope::Full,
-            "generate",
-        )
-        .expect("another domain has an unrelated lease key");
-        let other_corpus = directory.path().join("other-corpus");
-        fs::create_dir(&other_corpus).expect("create second corpus");
-        let other_location =
-            CorpusLocation::new(directory.path(), &other_corpus).expect("valid second location");
-        let unrelated_corpus = GenerationLease::acquire(
-            &other_location,
-            "layout",
-            "surgeist-layout-generate",
-            &RunScope::Full,
-            "generate",
-        )
-        .expect("another corpus has an unrelated lease key");
-        let contender = GenerationLease::acquire(
-            &location,
-            "layout",
-            "surgeist-layout-generate",
-            &RunScope::Filtered(RelativePath::new("one.html").unwrap()),
-            "generate-existing",
-        )
-        .expect_err("full and filtered work on one corpus must contend");
-        assert_eq!(contender.kind(), GeneratorErrorKind::LeaseActive);
-        let diagnostic = contender.to_string();
-        assert!(diagnostic.contains("surgeist-layout-generate"));
-        assert!(diagnostic.contains("scope=full"));
-        assert!(diagnostic.contains("command=generate"));
-        assert!(diagnostic.contains(&format!("pid={}", std::process::id())));
-        assert!(diagnostic.contains("unix_start="));
-
-        let coordination = directory.path().join("target/surgeist-generator");
-        let owner_files = fs::read_dir(&coordination)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".lease.lock"))
-            .collect::<Vec<_>>();
-        assert_eq!(owner_files.len(), 3);
-        assert!(owner_files.iter().any(|entry| {
-            fs::read_to_string(entry.path())
-                .is_ok_and(|owner| owner.contains("generator=surgeist-layout-generate"))
-        }));
-
-        drop(held);
-        GenerationLease::acquire(
-            &location,
-            "layout",
-            "surgeist-layout-generate",
-            &RunScope::Full,
-            "check-corpus",
-        )
-        .expect("dropping the lease permits reacquisition");
-        drop(unrelated_domain);
-        drop(unrelated_corpus);
-    }
-
-    #[test]
-    fn generation_lease_validates_metadata_before_coordination_writes() {
-        let directory = TestDirectory::new("lease-validation");
-        let corpus = directory.path().join("corpus");
-        fs::create_dir(&corpus).unwrap();
-        let location = CorpusLocation::new(directory.path(), &corpus).unwrap();
-
+        .expect("first lease");
         let error = GenerationLease::acquire(
-            &location,
-            "layout\nother",
-            "surgeist-layout-generate",
+            &inner,
+            Domain::Layout,
+            "layout-generator",
             &RunScope::Full,
             "generate",
         )
-        .unwrap_err();
-        assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
-        assert!(!directory.path().join("target").exists());
+        .expect_err("same corpus/domain must contend");
+        assert_eq!(error.kind(), GeneratorErrorKind::LeaseActive);
+        drop(held);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn generation_lease_rejects_coordination_path_swap() {
-        use std::os::unix::fs::symlink;
-
-        let directory = TestDirectory::new("lease-coordination-swap");
-        let outside = TestDirectory::new("lease-coordination-outside");
-        let corpus = directory.path().join("corpus");
-        fs::create_dir(&corpus).unwrap();
-        let location = CorpusLocation::new(directory.path(), &corpus).unwrap();
-
-        symlink(outside.path(), directory.path().join("target")).unwrap();
-        let construction_error = GenerationLease::acquire(
-            &location,
-            "layout",
-            "surgeist-layout-generate",
-            &RunScope::Full,
-            "generate",
-        )
-        .expect_err("a symlinked target directory must be rejected");
-        assert_eq!(construction_error.kind(), GeneratorErrorKind::InvalidPath);
-        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
-        fs::remove_file(directory.path().join("target")).unwrap();
-
-        let error = GenerationLease::acquire_with_coordination_hook(
-            &location,
-            "layout",
-            "surgeist-layout-generate",
-            &RunScope::Full,
-            "generate",
-            |coordination| {
-                fs::rename(coordination, coordination.with_extension("original")).unwrap();
-                symlink(outside.path(), coordination).unwrap();
-            },
-        )
-        .expect_err("a coordination-directory swap must be rejected");
-        assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
-        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
-
-        fs::remove_file(directory.path().join("target/surgeist-generator")).unwrap();
-        fs::rename(
-            directory.path().join("target/surgeist-generator.original"),
-            directory.path().join("target/surgeist-generator"),
-        )
-        .unwrap();
-        let lock_link = directory
-            .path()
-            .join("target/surgeist-generator/attacker.gate.lock");
-        let outside_lock = outside.path().join("outside.lock");
-        fs::write(&outside_lock, b"outside").unwrap();
-        symlink(&outside_lock, &lock_link).unwrap();
-        let lock_error = open_lock_file(
-            location.owner_root(),
-            &real_directory_identity(location.owner_root(), "test owner").unwrap(),
-            &directory.path().join("target/surgeist-generator"),
-            &real_directory_identity(
-                &directory.path().join("target/surgeist-generator"),
-                "test coordination",
+    fn two_shared_checks_are_read_only_and_can_coexist() {
+        let (_temporary, outer, _) = locations();
+        drop(
+            GenerationLease::acquire(
+                &outer,
+                Domain::Layout,
+                "layout-generator",
+                &RunScope::Full,
+                "generate",
             )
-            .unwrap(),
-            &lock_link,
+            .expect("seed coordination"),
+        );
+        let before = directory_snapshot(outer.corpus_root());
+        let first = GenerationCheck::acquire(&outer, Domain::Layout).expect("first check");
+        let second = GenerationCheck::acquire(&outer, Domain::Layout).expect("second check");
+        second.finish().expect("finish second");
+        first.finish().expect("finish first");
+        assert_eq!(directory_snapshot(outer.corpus_root()), before);
+    }
+
+    #[test]
+    fn binding_rejects_release_and_a_later_reacquisition() {
+        let (_temporary, outer, _) = locations();
+        let first = GenerationLease::acquire(
+            &outer,
+            Domain::Layout,
+            "layout-generator",
+            &RunScope::Full,
+            "generate",
         )
-        .expect_err("a symlinked lock file must be rejected");
-        assert_eq!(lock_error.kind(), GeneratorErrorKind::InvalidPath);
-        assert_eq!(fs::read(&outside_lock).unwrap(), b"outside");
+        .expect("first lease");
+        let binding = first
+            .bind(&outer, Domain::Layout)
+            .expect("bind first lease");
+        assert_eq!(binding.domain, Domain::Layout);
+        assert_eq!(binding.canonical_corpus, outer.corpus_root());
+        assert!(binding.validate(&outer, Domain::Layout).is_ok());
+        drop(first);
+        let second = GenerationLease::acquire(
+            &outer,
+            Domain::Layout,
+            "layout-generator",
+            &RunScope::Full,
+            "generate",
+        )
+        .expect("second lease");
+        assert_eq!(binding.validate(&outer, Domain::Layout).unwrap_err().kind(), GeneratorErrorKind::ArtifactTransaction);
+        assert_ne!(second.state().token(), Some(binding.original_token.as_str()));
+    }
+
+    #[test]
+    fn validated_binding_pins_the_os_mutex_until_the_operation_finishes() {
+        let (_temporary, outer, _) = locations();
+        let first = GenerationLease::acquire(
+            &outer,
+            Domain::Layout,
+            "layout-generator",
+            &RunScope::Full,
+            "generate",
+        )
+        .expect("first lease");
+        let binding = first
+            .bind(&outer, Domain::Layout)
+            .expect("lease binding");
+        let operation = binding
+            .validate(&outer, Domain::Layout)
+            .expect("validated operation");
+        drop(first);
+        let error = GenerationLease::acquire(
+            &outer,
+            Domain::Layout,
+            "layout-generator",
+            &RunScope::Full,
+            "generate",
+        )
+        .expect_err("operation pin must retain the lock");
+        assert_eq!(error.kind(), GeneratorErrorKind::LeaseActive);
+        drop(operation);
+        drop(
+            GenerationLease::acquire(
+                &outer,
+                Domain::Layout,
+                "layout-generator",
+                &RunScope::Full,
+                "generate",
+            )
+            .expect("lease after operation completion"),
+        );
+    }
+
+    #[test]
+    fn one_acquisition_serializes_in_process_transactions() {
+        let (_temporary, outer, _) = locations();
+        let lease = GenerationLease::acquire(
+            &outer,
+            Domain::Layout,
+            "layout-generator",
+            &RunScope::Full,
+            "generate",
+        )
+        .expect("lease");
+        let first_binding = lease
+            .bind(&outer, Domain::Layout)
+            .expect("first binding");
+        let second_binding = lease
+            .bind(&outer, Domain::Layout)
+            .expect("second binding");
+        let first = first_binding
+            .validate(&outer, Domain::Layout)
+            .expect("first transaction");
+        let error = second_binding
+            .validate(&outer, Domain::Layout)
+            .expect_err("concurrent transaction");
+        assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+        drop(first);
+        drop(
+            second_binding
+                .validate(&outer, Domain::Layout)
+                .expect("serialized transaction"),
+        );
+    }
+
+    fn directory_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn visit(root: &Path, current: &Path, output: &mut Vec<(PathBuf, Vec<u8>)>) {
+            let mut entries: Vec<_> = fs::read_dir(current)
+                .expect("read snapshot directory")
+                .map(|entry| entry.expect("read snapshot entry"))
+                .collect();
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                let path = entry.path();
+                let relative = path.strip_prefix(root).expect("relative snapshot").to_path_buf();
+                let metadata = fs::symlink_metadata(&path).expect("snapshot metadata");
+                if metadata.is_dir() {
+                    output.push((relative, Vec::new()));
+                    visit(root, &path, output);
+                } else {
+                    output.push((relative, fs::read(path).expect("snapshot bytes")));
+                }
+            }
+        }
+        let mut output = Vec::new();
+        visit(root, root, &mut output);
+        output
     }
 }
