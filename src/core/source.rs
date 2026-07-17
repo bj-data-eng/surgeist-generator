@@ -1008,7 +1008,7 @@ fn selects_custom_remote_helper(value: &str) -> bool {
         is_git_transport_name(transport)
             && !matches!(
                 transport,
-                "file" | "git" | "ssh" | "http" | "https" | "ftp" | "ftps"
+                "file" | "git" | "ssh" | "git+ssh" | "ssh+git" | "http" | "https" | "ftp" | "ftps"
             )
     })
 }
@@ -2460,6 +2460,33 @@ mod tests {
     }
 
     #[test]
+    fn local_config_retains_builtin_ssh_url_aliases() {
+        let mut rejected = Vec::new();
+        for (name, url) in [
+            ("git-plus-ssh", "git+ssh://git@example.invalid/other.git"),
+            ("ssh-plus-git", "ssh+git://git@example.invalid/other.git"),
+        ] {
+            let (directory, origin, revision) = repository();
+            let key = format!("remote.{name}.url");
+            run_git(
+                directory.path(),
+                &[OsStr::new("config"), OsStr::new(&key), OsStr::new(url)],
+            );
+
+            if let Err(error) =
+                verify_git_source(directory.path(), &pin(&origin, revision, "fixtures"))
+            {
+                rejected.push((url, error.kind()));
+            }
+        }
+
+        assert!(
+            rejected.is_empty(),
+            "built-in SSH URL aliases rejected from local configuration: {rejected:?}"
+        );
+    }
+
+    #[test]
     fn custom_remote_helper_selector_uses_git_transport_grammar() {
         for value in [
             "sentinel://payload",
@@ -2538,6 +2565,57 @@ mod tests {
         let error =
             result.expect_err("worktree-scoped unknown transport remote helper must fail closed");
         assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+    }
+
+    #[test]
+    fn linked_worktree_config_retains_builtin_ssh_url_aliases() {
+        let mut rejected = Vec::new();
+        for (name, url) in [
+            ("git-plus-ssh", "git+ssh://git@example.invalid/other.git"),
+            ("ssh-plus-git", "ssh+git://git@example.invalid/other.git"),
+        ] {
+            let (directory, origin, revision) = repository();
+            run_git(
+                directory.path(),
+                &[
+                    OsStr::new("config"),
+                    OsStr::new("extensions.worktreeConfig"),
+                    OsStr::new("true"),
+                ],
+            );
+            let linked_parent = TestDirectory::new("linked-builtin-ssh-alias");
+            let linked = linked_parent.path().join("linked");
+            run_git(
+                directory.path(),
+                &[
+                    OsStr::new("worktree"),
+                    OsStr::new("add"),
+                    OsStr::new("--quiet"),
+                    OsStr::new("--detach"),
+                    linked.as_os_str(),
+                    OsStr::new("HEAD"),
+                ],
+            );
+            let key = format!("remote.{name}.url");
+            run_git(
+                &linked,
+                &[
+                    OsStr::new("config"),
+                    OsStr::new("--worktree"),
+                    OsStr::new(&key),
+                    OsStr::new(url),
+                ],
+            );
+
+            if let Err(error) = verify_git_source(&linked, &pin(&origin, revision, "fixtures")) {
+                rejected.push((url, error.kind()));
+            }
+        }
+
+        assert!(
+            rejected.is_empty(),
+            "built-in SSH URL aliases rejected from linked-worktree configuration: {rejected:?}"
+        );
     }
 
     #[cfg(unix)]
