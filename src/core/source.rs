@@ -180,7 +180,7 @@ pub struct VerifiedSource {
     canonical_source_root: PathBuf,
     revision: SourceRevision,
     pub(crate) snapshot: VerifiedSourceSnapshot,
-    pub(crate) protection: Vec<ProtectionEntry>,
+    pub(crate) protection: SourceProtection,
 }
 
 impl VerifiedSource {
@@ -282,6 +282,51 @@ impl ObjectIdentity {
 pub(crate) struct ProtectionEntry {
     pub(crate) path: PathBuf,
     pub(crate) identity: ObjectIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SourceProtection {
+    directories: Vec<ProtectionEntry>,
+    alternate_graph: AlternateGraph,
+}
+
+impl SourceProtection {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &ProtectionEntry> {
+        self.directories.iter()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AlternateGraph {
+    primary_objects: PathBuf,
+    object_directories: Vec<AlternateObjectDirectory>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AlternateObjectDirectory {
+    directory: ProtectionEntry,
+    inventory: AlternatesFileState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AlternatesFileState {
+    Absent {
+        path: PathBuf,
+    },
+    Present {
+        path: PathBuf,
+        identity: ObjectIdentity,
+        bytes: Vec<u8>,
+    },
+}
+
+impl AlternatesFileState {
+    fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Absent { .. } => None,
+            Self::Present { bytes, .. } => Some(bytes),
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -415,15 +460,25 @@ fn verify_git_source_impl(
         )));
     }
 
-    let mut protection = vec![
+    let alternate_graph = collect_alternate_graph(&primary_objects.path)?;
+    let mut protected_directories = vec![
         protected_directory(&canonical_root, "protect Git worktree root")?,
         protected_directory(&canonical_source_root, "protect pinned source directory")?,
         worktree_git_dir,
         common_git_dir,
-        primary_objects.clone(),
+        primary_objects,
     ];
-    collect_alternate_protection(&primary_objects.path, &mut protection)?;
-    deduplicate_protection(&mut protection);
+    protected_directories.extend(
+        alternate_graph
+            .object_directories
+            .iter()
+            .map(|entry| entry.directory.clone()),
+    );
+    deduplicate_protection(&mut protected_directories);
+    let protection = SourceProtection {
+        directories: protected_directories,
+        alternate_graph,
+    };
     let snapshot = build_snapshot(&runner, pin, object_format)?;
 
     if let Some(hook) = closing_hook {
@@ -865,7 +920,7 @@ fn parse_config_inventory(bytes: &[u8]) -> Result<Vec<ConfigRecord>> {
             let (key, value) = key_value
                 .split_once('\n')
                 .ok_or_else(|| invalid_source("Git configuration record has no value separator"))?;
-            if key.is_empty() || key.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            if !is_canonical_config_key(key) {
                 return Err(invalid_source(
                     "Git configuration emitted a noncanonical key",
                 ));
@@ -878,6 +933,26 @@ fn parse_config_inventory(bytes: &[u8]) -> Result<Vec<ConfigRecord>> {
             })
         })
         .collect()
+}
+
+fn is_canonical_config_key(key: &str) -> bool {
+    let Some((section, remainder)) = key.split_once('.') else {
+        return false;
+    };
+    let (subsection, variable) = match remainder.rsplit_once('.') {
+        Some((subsection, variable)) => (Some(subsection), variable),
+        None => (None, remainder),
+    };
+    is_canonical_config_component(section)
+        && is_canonical_config_component(variable)
+        && subsection.is_none_or(|value| value.chars().all(|character| !character.is_control()))
+}
+
+fn is_canonical_config_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn validate_config_records(
@@ -992,9 +1067,11 @@ fn forbidden_config_record(key: &str, value: &str) -> bool {
         || credential_helper
         || key.starts_with("protocol.")
         || remote_exec
-        || (key.starts_with("remote.")
-            && key.ends_with(".url")
-            && selects_custom_remote_helper(value))
+        || (is_remote_url_key(key) && selects_custom_remote_helper(value))
+}
+
+fn is_remote_url_key(key: &str) -> bool {
+    key.starts_with("remote.") && (key.ends_with(".url") || key.ends_with(".pushurl"))
 }
 
 fn selects_custom_remote_helper(value: &str) -> bool {
@@ -1310,13 +1387,10 @@ fn protected_directory(path: &Path, operation: &str) -> Result<ProtectionEntry> 
     })
 }
 
-fn collect_alternate_protection(
-    primary_objects: &Path,
-    protection: &mut Vec<ProtectionEntry>,
-) -> Result<()> {
+fn collect_alternate_graph(primary_objects: &Path) -> Result<AlternateGraph> {
     fn visit(
         object_directory: &Path,
-        protection: &mut Vec<ProtectionEntry>,
+        object_directories: &mut Vec<AlternateObjectDirectory>,
         active: &mut BTreeSet<ObjectIdentity>,
         complete: &mut BTreeSet<ObjectIdentity>,
     ) -> Result<()> {
@@ -1330,10 +1404,15 @@ fn collect_alternate_protection(
             return Ok(());
         }
         active.insert(current.identity.clone());
-        protection.push(current.clone());
 
         let alternates_path = current.path.join("info/alternates");
-        if let Some(bytes) = read_optional_nofollow_regular(&alternates_path)? {
+        let inventory = read_alternates_file_state(&alternates_path)?;
+        let alternate_bytes = inventory.bytes().map(<[u8]>::to_vec);
+        object_directories.push(AlternateObjectDirectory {
+            directory: current.clone(),
+            inventory,
+        });
+        if let Some(bytes) = alternate_bytes {
             let text = std::str::from_utf8(&bytes)
                 .map_err(|_| invalid_source("Git alternates inventory is not UTF-8"))?;
             if text.contains('\0') || text.contains('\r') {
@@ -1366,8 +1445,7 @@ fn collect_alternate_protection(
                         "recursive Git alternate object directories contain a cycle",
                     ));
                 }
-                protection.push(alternate.clone());
-                visit(&alternate.path, protection, active, complete)?;
+                visit(&alternate.path, object_directories, active, complete)?;
             }
         }
 
@@ -1376,9 +1454,21 @@ fn collect_alternate_protection(
         Ok(())
     }
 
+    let primary_objects = canonical_source_directory(primary_objects, "protect Git object graph")?;
     let mut active = BTreeSet::new();
     let mut complete = BTreeSet::new();
-    visit(primary_objects, protection, &mut active, &mut complete)
+    let mut object_directories = Vec::new();
+    visit(
+        &primary_objects,
+        &mut object_directories,
+        &mut active,
+        &mut complete,
+    )?;
+    object_directories.sort_by(|left, right| left.directory.path.cmp(&right.directory.path));
+    Ok(AlternateGraph {
+        primary_objects,
+        object_directories,
+    })
 }
 
 fn deduplicate_protection(protection: &mut Vec<ProtectionEntry>) {
@@ -1391,8 +1481,8 @@ fn deduplicate_protection(protection: &mut Vec<ProtectionEntry>) {
     protection.retain(|entry| identities.insert(entry.identity.clone()));
 }
 
-pub(crate) fn revalidate_protection(protection: &[ProtectionEntry]) -> Result<()> {
-    for entry in protection {
+pub(crate) fn revalidate_protection(protection: &SourceProtection) -> Result<()> {
+    for entry in protection.iter() {
         let current = protected_directory(&entry.path, "revalidate protected source directory")?;
         if current != *entry {
             return Err(invalid_source(format!(
@@ -1401,13 +1491,23 @@ pub(crate) fn revalidate_protection(protection: &[ProtectionEntry]) -> Result<()
             )));
         }
     }
+    let alternate_graph = collect_alternate_graph(&protection.alternate_graph.primary_objects)?;
+    if alternate_graph != protection.alternate_graph {
+        return Err(invalid_source(
+            "Git alternate object graph identity or inventory changed during verification",
+        ));
+    }
     Ok(())
 }
 
-fn read_optional_nofollow_regular(path: &Path) -> Result<Option<Vec<u8>>> {
+fn read_alternates_file_state(path: &Path) -> Result<AlternatesFileState> {
     let before = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AlternatesFileState::Absent {
+                path: path.to_path_buf(),
+            });
+        }
         Err(error) => return Err(source_io("inspect Git alternates file", path, error)),
     };
     if !before.is_file() {
@@ -1428,7 +1528,11 @@ fn read_optional_nofollow_regular(path: &Path) -> Result<Option<Vec<u8>>> {
             "Git alternates file identity changed while it was read",
         ));
     }
-    Ok(Some(bytes))
+    Ok(AlternatesFileState::Present {
+        path: path.to_path_buf(),
+        identity,
+        bytes,
+    })
 }
 
 fn verify_raw_cleanliness(
@@ -2107,6 +2211,45 @@ mod tests {
             .to_owned()
     }
 
+    #[cfg(unix)]
+    fn write_nonexecuting_sentinel(path: &Path, marker: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(
+            path,
+            format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()),
+        )
+        .expect("write sentinel");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .expect("make sentinel executable");
+    }
+
+    fn commit_mixed_case_attributes(directory: &Path) -> SourceRevision {
+        fs::write(
+            directory.join(".gitattributes"),
+            b"*.json filter=MixedCase diff=MixedCase\n",
+        )
+        .expect("write mixed-case attributes");
+        run_git(
+            directory,
+            &[OsStr::new("add"), OsStr::new(".gitattributes")],
+        );
+        run_git(
+            directory,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("--quiet"),
+                OsStr::new("-m"),
+                OsStr::new("mixed-case attributes"),
+            ],
+        );
+        SourceRevision::new(run_git(
+            directory,
+            &[OsStr::new("rev-parse"), OsStr::new("HEAD")],
+        ))
+        .expect("mixed-case attributes revision")
+    }
+
     fn repository() -> (TestDirectory, String, SourceRevision) {
         let directory = TestDirectory::new("git-source");
         run_git(
@@ -2160,6 +2303,46 @@ mod tests {
         ))
         .expect("full revision");
         (directory, origin, revision)
+    }
+
+    fn recursive_alternate_repository(
+        label: &str,
+    ) -> (
+        TestDirectory,
+        TestDirectory,
+        TestDirectory,
+        String,
+        SourceRevision,
+    ) {
+        let (base, origin, revision) = repository();
+        let middle = TestDirectory::new(&format!("{label}-middle"));
+        let leaf = TestDirectory::new(&format!("{label}-leaf"));
+        fs::remove_dir(middle.path()).expect("remove middle clone destination");
+        fs::remove_dir(leaf.path()).expect("remove leaf clone destination");
+        run_git_program(&[
+            OsStr::new("clone"),
+            OsStr::new("--quiet"),
+            OsStr::new("--shared"),
+            base.path().as_os_str(),
+            middle.path().as_os_str(),
+        ]);
+        run_git_program(&[
+            OsStr::new("clone"),
+            OsStr::new("--quiet"),
+            OsStr::new("--shared"),
+            middle.path().as_os_str(),
+            leaf.path().as_os_str(),
+        ]);
+        run_git(
+            leaf.path(),
+            &[
+                OsStr::new("remote"),
+                OsStr::new("set-url"),
+                OsStr::new("origin"),
+                OsStr::new(&origin),
+            ],
+        );
+        (base, middle, leaf, origin, revision)
     }
 
     fn pin(origin: &str, revision: SourceRevision, source: &str) -> PinnedSource {
@@ -2401,6 +2584,80 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_config_accepts_inert_mixed_case_subsections() {
+        let (directory, origin, _revision) = repository();
+        let revision = commit_mixed_case_attributes(directory.path());
+        let marker = directory.path().join(".git/mixed-case-sentinel-ran");
+        let sentinel = directory.path().join(".git/mixed-case-sentinel.sh");
+        write_nonexecuting_sentinel(&sentinel, &marker);
+        for key in [
+            "filter.MixedCase.clean",
+            "filter.MixedCase.process",
+            "diff.MixedCase.textconv",
+        ] {
+            run_git(
+                directory.path(),
+                &[OsStr::new("config"), OsStr::new(key), sentinel.as_os_str()],
+            );
+        }
+
+        verify_git_source(directory.path(), &pin(&origin, revision, "fixtures"))
+            .expect("mixed-case filter/diff subsections remain inert");
+        assert!(!marker.exists(), "mixed-case sentinel was executed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_worktree_config_accepts_inert_mixed_case_subsections() {
+        let (directory, origin, _revision) = repository();
+        let revision = commit_mixed_case_attributes(directory.path());
+        run_git(
+            directory.path(),
+            &[
+                OsStr::new("config"),
+                OsStr::new("extensions.worktreeConfig"),
+                OsStr::new("true"),
+            ],
+        );
+        let linked_parent = TestDirectory::new("linked-mixed-case");
+        let linked = linked_parent.path().join("linked");
+        run_git(
+            directory.path(),
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("--quiet"),
+                OsStr::new("--detach"),
+                linked.as_os_str(),
+                OsStr::new("HEAD"),
+            ],
+        );
+        let marker = linked_parent.path().join("mixed-case-sentinel-ran");
+        let sentinel = linked_parent.path().join("mixed-case-sentinel.sh");
+        write_nonexecuting_sentinel(&sentinel, &marker);
+        for key in [
+            "filter.MixedCase.clean",
+            "filter.MixedCase.process",
+            "diff.MixedCase.textconv",
+        ] {
+            run_git(
+                &linked,
+                &[
+                    OsStr::new("config"),
+                    OsStr::new("--worktree"),
+                    OsStr::new(key),
+                    sentinel.as_os_str(),
+                ],
+            );
+        }
+
+        verify_git_source(&linked, &pin(&origin, revision, "fixtures"))
+            .expect("mixed-case worktree filter/diff subsections remain inert");
+        assert!(!marker.exists(), "mixed-case sentinel was executed");
+    }
+
     #[test]
     fn ordinary_config_worktree_is_rejected_when_extension_is_not_enabled() {
         let (directory, origin, revision) = repository();
@@ -2434,6 +2691,26 @@ mod tests {
     }
 
     #[test]
+    fn local_pushurl_custom_remote_helper_is_rejected_before_sentinel_runs() {
+        let (directory, origin, revision) = repository();
+        let marker = directory.path().join(".git/pushurl-helper-ran");
+        let helper_url = format!("ext::sh -c 'touch {}'", marker.display());
+        run_git(
+            directory.path(),
+            &[
+                OsStr::new("config"),
+                OsStr::new("remote.sentinel.pushurl"),
+                OsStr::new(&helper_url),
+            ],
+        );
+
+        let result = verify_git_source(directory.path(), &pin(&origin, revision, "fixtures"));
+        assert!(!marker.exists(), "pushurl helper sentinel was executed");
+        let error = result.expect_err("custom pushurl remote helper must fail closed");
+        assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+    }
+
+    #[test]
     fn ordinary_remote_url_forms_remain_inert_and_accepted() {
         let (directory, origin, revision) = repository();
         for (name, url) in [
@@ -2448,11 +2725,13 @@ mod tests {
             ("local", "/tmp/other.git"),
             ("colon", "./relative::local.git"),
         ] {
-            let key = format!("remote.{name}.url");
-            run_git(
-                directory.path(),
-                &[OsStr::new("config"), OsStr::new(&key), OsStr::new(url)],
-            );
+            for suffix in ["url", "pushurl"] {
+                let key = format!("remote.{name}.{suffix}");
+                run_git(
+                    directory.path(),
+                    &[OsStr::new("config"), OsStr::new(&key), OsStr::new(url)],
+                );
+            }
         }
 
         verify_git_source(directory.path(), &pin(&origin, revision, "fixtures"))
@@ -2467,11 +2746,13 @@ mod tests {
             ("ssh-plus-git", "ssh+git://git@example.invalid/other.git"),
         ] {
             let (directory, origin, revision) = repository();
-            let key = format!("remote.{name}.url");
-            run_git(
-                directory.path(),
-                &[OsStr::new("config"), OsStr::new(&key), OsStr::new(url)],
-            );
+            for suffix in ["url", "pushurl"] {
+                let key = format!("remote.{name}.{suffix}");
+                run_git(
+                    directory.path(),
+                    &[OsStr::new("config"), OsStr::new(&key), OsStr::new(url)],
+                );
+            }
 
             if let Err(error) =
                 verify_git_source(directory.path(), &pin(&origin, revision, "fixtures"))
@@ -2525,6 +2806,36 @@ mod tests {
     }
 
     #[test]
+    fn config_key_validation_preserves_case_only_in_subsections() {
+        for key in [
+            "core.bare",
+            "filter.MixedCase.clean",
+            "diff.One.Two.textconv",
+            "http.https://Example.invalid/.proxy",
+        ] {
+            assert!(
+                super::is_canonical_config_key(key),
+                "rejected canonical Git config key {key:?}"
+            );
+        }
+        for key in [
+            "",
+            "core",
+            "Core.bare",
+            "core.Bare",
+            ".bare",
+            "core.",
+            "core.bad_key",
+            "filter.Mixed\u{7f}Case.clean",
+        ] {
+            assert!(
+                !super::is_canonical_config_key(key),
+                "accepted noncanonical Git config key {key:?}"
+            );
+        }
+    }
+
+    #[test]
     fn linked_worktree_config_rejects_unknown_transport_remote_helper_before_sentinel_runs() {
         let (directory, origin, revision) = repository();
         run_git(
@@ -2568,11 +2879,55 @@ mod tests {
     }
 
     #[test]
-    fn linked_worktree_config_retains_builtin_ssh_url_aliases() {
+    fn linked_worktree_pushurl_custom_remote_helper_is_rejected_before_sentinel_runs() {
+        let (directory, origin, revision) = repository();
+        run_git(
+            directory.path(),
+            &[
+                OsStr::new("config"),
+                OsStr::new("extensions.worktreeConfig"),
+                OsStr::new("true"),
+            ],
+        );
+        let linked_parent = TestDirectory::new("linked-pushurl-helper");
+        let linked = linked_parent.path().join("linked");
+        run_git(
+            directory.path(),
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("--quiet"),
+                OsStr::new("--detach"),
+                linked.as_os_str(),
+                OsStr::new("HEAD"),
+            ],
+        );
+        let marker = linked_parent.path().join("pushurl-helper-ran");
+        let helper_url = format!("ext::sh -c 'touch {}'", marker.display());
+        run_git(
+            &linked,
+            &[
+                OsStr::new("config"),
+                OsStr::new("--worktree"),
+                OsStr::new("remote.sentinel.pushurl"),
+                OsStr::new(&helper_url),
+            ],
+        );
+
+        let result = verify_git_source(&linked, &pin(&origin, revision, "fixtures"));
+        assert!(!marker.exists(), "pushurl helper sentinel was executed");
+        let error = result.expect_err("worktree custom pushurl remote helper must fail closed");
+        assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+    }
+
+    #[test]
+    fn linked_worktree_config_retains_builtin_scp_and_local_url_forms() {
         let mut rejected = Vec::new();
         for (name, url) in [
             ("git-plus-ssh", "git+ssh://git@example.invalid/other.git"),
             ("ssh-plus-git", "ssh+git://git@example.invalid/other.git"),
+            ("scp", "git@example.invalid:/other.git"),
+            ("local", "/tmp/other.git"),
         ] {
             let (directory, origin, revision) = repository();
             run_git(
@@ -2596,16 +2951,18 @@ mod tests {
                     OsStr::new("HEAD"),
                 ],
             );
-            let key = format!("remote.{name}.url");
-            run_git(
-                &linked,
-                &[
-                    OsStr::new("config"),
-                    OsStr::new("--worktree"),
-                    OsStr::new(&key),
-                    OsStr::new(url),
-                ],
-            );
+            for suffix in ["url", "pushurl"] {
+                let key = format!("remote.{name}.{suffix}");
+                run_git(
+                    &linked,
+                    &[
+                        OsStr::new("config"),
+                        OsStr::new("--worktree"),
+                        OsStr::new(&key),
+                        OsStr::new(url),
+                    ],
+                );
+            }
 
             if let Err(error) = verify_git_source(&linked, &pin(&origin, revision, "fixtures")) {
                 rejected.push((url, error.kind()));
@@ -2614,7 +2971,7 @@ mod tests {
 
         assert!(
             rejected.is_empty(),
-            "built-in SSH URL aliases rejected from linked-worktree configuration: {rejected:?}"
+            "built-in, SCP, or local URL forms rejected from linked-worktree configuration: {rejected:?}"
         );
     }
 
@@ -2936,6 +3293,77 @@ mod tests {
         .unwrap();
         let error = verify_git_source(leaf.path(), &pin(origin, revision, "fixtures"))
             .expect_err("alternate recursion cycle must fail");
+        assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+    }
+
+    #[test]
+    fn primary_alternates_absence_to_created_fails_closing_revalidation() {
+        let (directory, origin, revision) = repository();
+        let (alternate, _alternate_origin, _alternate_revision) = repository();
+        let alternates_path = directory.path().join(".git/objects/info/alternates");
+        assert!(!alternates_path.exists(), "primary alternates precondition");
+        let alternate_objects = fs::canonicalize(alternate.path().join(".git/objects"))
+            .expect("canonical alternate objects");
+
+        let error = super::verify_git_source_with_test_hook(
+            directory.path(),
+            &pin(&origin, revision, "fixtures"),
+            move || {
+                fs::write(
+                    &alternates_path,
+                    format!("{}\n", alternate_objects.display()),
+                )
+                .expect("create primary alternates inventory before closing revalidation");
+            },
+        )
+        .expect_err("primary alternates creation must fail the closing revalidation");
+        assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+    }
+
+    #[test]
+    fn recursive_alternates_content_change_fails_closing_revalidation() {
+        let (_base, middle, leaf, origin, revision) =
+            recursive_alternate_repository("recursive-content-change");
+        let (replacement, _replacement_origin, _replacement_revision) = repository();
+        let replacement_objects = fs::canonicalize(replacement.path().join(".git/objects"))
+            .expect("canonical replacement objects");
+        let alternates_path = middle.path().join(".git/objects/info/alternates");
+
+        let error = super::verify_git_source_with_test_hook(
+            leaf.path(),
+            &pin(&origin, revision, "fixtures"),
+            move || {
+                fs::write(
+                    &alternates_path,
+                    format!("{}\n", replacement_objects.display()),
+                )
+                .expect("rewrite recursive alternates inventory before closing revalidation");
+            },
+        )
+        .expect_err("recursive alternates content change must fail the closing revalidation");
+        assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+    }
+
+    #[test]
+    fn recursive_alternates_identity_change_fails_closing_revalidation() {
+        let (_base, middle, leaf, origin, revision) =
+            recursive_alternate_repository("recursive-identity-change");
+        let alternates_path = middle.path().join(".git/objects/info/alternates");
+        let displaced_path = middle.path().join(".git/objects/info/alternates-displaced");
+
+        let error = super::verify_git_source_with_test_hook(
+            leaf.path(),
+            &pin(&origin, revision, "fixtures"),
+            move || {
+                let bytes =
+                    fs::read(&alternates_path).expect("read recursive alternates inventory");
+                fs::rename(&alternates_path, &displaced_path)
+                    .expect("displace recursive alternates inventory");
+                fs::write(&alternates_path, bytes)
+                    .expect("replace recursive alternates inventory with identical content");
+            },
+        )
+        .expect_err("recursive alternates identity change must fail the closing revalidation");
         assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
     }
 
