@@ -120,7 +120,7 @@ The command-specific namespaces are:
 | Command/resource | Writable namespaces | Protected read-only namespaces |
 | --- | --- | --- |
 | Layout generate | `xml`; `.surgeist-generator` including journals, stages, lock files, and browser profiles | `corpus.toml`; `html`; both helper assets; validated Taffy sidecar/files; complete browser cache root and exact executable |
-| Layout import Taffy | `html`; `.surgeist-generator` including journals/stages | `corpus.toml`; helpers; manifest-classified authored HTML; complete Taffy source protection snapshot |
+| Layout import Taffy | `html` as one partition-aware publication authority: reserved sidecar and Taffy-owned paths are replaceable while exact manifest-authored files are retained; `.surgeist-generator` including journals/stages | `corpus.toml`; helpers; the held retained-authored partition; complete Taffy source protection snapshot |
 | Layout check Taffy | none | corpus inputs plus complete Taffy source protection snapshot |
 | Layout check corpus | none | manifest, helpers, HTML/Taffy sidecar, XML, reports, and existing coordination state |
 | CSS import CSSTree | `import_root`; `.surgeist-generator` including journals/stages | `corpus.toml`; `expectation_root`; complete CSSTree source protection snapshot |
@@ -137,11 +137,23 @@ used. The complete browser cache root is read-only.
 ### SR-03.2 Disjointness and revalidation
 
 For each command, every generator-owned writable namespace is compared with every
-protected namespace and with every other writable final root. Equality, protected
-ancestor of writable, writable ancestor of protected, and component-wise overlap
-are all rejected. The browser cache root must be outside the complete corpus
-root, not only outside `xml`; import and expectation roots must be disjoint from
-each other, `corpus.toml`, and `.surgeist-generator`.
+external protected namespace and with every other writable final root. Equality,
+protected ancestor of writable, writable ancestor of protected, and
+component-wise overlap are all rejected. The browser cache root must be outside
+the complete corpus root, not only outside `xml`; import and expectation roots
+must be disjoint from each other, `corpus.toml`, and `.surgeist-generator`.
+
+Layout Taffy import has one narrow internal exception: `html` is the atomic final
+root and contains an exact retained-authored partition. Before lease acquisition,
+the command derives three strict file sets: manifest-owned Surgeist paths,
+current Taffy-owned paths, and desired Taffy-owned paths plus the reserved
+sidecar. The authored set must be disjoint from both Taffy sets; any exact file
+collision is `InvalidInventory`. Directories may be shared only as implied
+ancestors of disjoint files. Every authored file is opened through the held
+`html` authority, identity-bound, snapshotted, and revalidated while the mutex is
+held; its snapshot bytes are copied unchanged into the staged complete `html`
+root. Taffy paths and the reserved sidecar are the only replaceable partition.
+No other command or protected/writable pair receives this ancestor exception.
 
 The comparison has three layers:
 
@@ -216,14 +228,20 @@ artifact or semantic oracle depends on that order.
 The pinned measurement `BrowserConfig` uses the current layout binary as its
 executable and applies exactly `with_head`, `disable_default_args`,
 `disable_cache`, the attempt `user_data_dir`, the 28 normalized manifest
-strings, and the one launch-capsule environment entry. It retains Chromiumoxide
-0.9.1's exact remaining defaults: port zero, sandbox enabled, no extensions,
-window size, incognito, hidden mode, HTTPS-first disabling, or request
-interception; 20-second launch timeout; 30-second request timeout; default
-viewport; ignored invalid events; and ignored HTTPS errors. Those settings add
-only the three driver switches stated above. A focused config adapter test
-passes permutations through the pinned builder and supervisor parser and proves
-the same admitted semantic set.
+strings, and the one launch-capsule environment entry. Chromiumoxide 0.9.1's
+remaining builder fields stay at port zero, sandbox true, no extensions/window
+size/incognito/hidden/HTTPS-first disabling/request interception, 20-second
+launch timeout, 30-second request timeout, default viewport, ignored invalid
+events, and ignored HTTPS errors. These are builder inputs, not promises that
+the manifest cannot request the corresponding Chromium behavior. In particular,
+manifest keys such as `no-sandbox`, `disable-setuid-sandbox`, `headless`,
+`incognito`, `window-size`, `disable-blink-features`, and `disable-features` are
+manifest-owned unless already forbidden above; their exact values are pinned by
+the raw launch digest and forwarded unchanged. Operator trust covers that pinned
+configuration. The builder itself adds only the three driver switches stated
+above. A focused config adapter test passes permutations through the pinned
+builder and supervisor parser, proves the exact admitted manifest-plus-driver
+set, and never treats builder defaults as effective-command overrides.
 
 The real browser environment is fixed and cleared. Both version and measurement
 commands use `Command::env_clear`; set `HOME`, `TMPDIR`, `TMP`, `TEMP`,
@@ -241,9 +259,11 @@ is removed by `env_clear`, and is not an operator configuration surface.
 
 Synthetic tests cover both ancestor directions, missing suffixes, case/symlink
 aliases, source object-store overlap, browser-cache/corpus overlap, replacement
-between preflight and protected revalidation, switch normalization/set
-permutations, launch-capsule rejection, the exact cleared environment map, and
-outside sentinels that remain byte-identical after generator-owned operations.
+between preflight and protected revalidation, the one retained-authored import
+partition, authored/Taffy collision rejection, switch normalization/set
+permutations including manifest-owned browser settings, launch-capsule rejection,
+the exact cleared environment map, and outside sentinels that remain
+byte-identical after generator-owned operations.
 They do not make a containment claim about the trusted executable, which tests
 never launch.
 
@@ -456,8 +476,10 @@ The hard-coded `TransactionProtocol::crash_prefixes`, `CrashPrefix`, and
 `RecoveredPrefix` model may remain only as supplementary ordering documentation.
 The executable proof instruments the production `RootedFs`,
 `TransactionEngine::install`, `TransactionEngine::recover_all`, bootstrap, and
-cleanup paths with an instance-scoped `#[cfg(test)]` observer. Production
-construction has no observer and no interrupted return.
+cleanup paths, plus `install_owner_record`, `recover_owner_transactions`,
+`run_rename_probe`, and `recover_probe_journals`, with an instance-scoped
+`#[cfg(test)]` observer. Production construction has no observer and no
+interrupted return.
 
 The observer emits one event after every recovery-distinct mutation or
 durability operation, not only after high-level phases. Events contain a stable
@@ -468,9 +490,11 @@ phase, primitive, strict relative path, and per-phase ordinal. They include:
   and containing-directory sync inside `publish_file_exclusive`;
 - every stage directory and individual staged-file creation and each deepest-
   first directory sync;
+- every direct handle partial/full write, flush, file sync, identity validation,
+  and drop boundary used by owner-record staging;
 - every exclusive/swap/claim/completed-journal rename and each parent sync;
 - every individual receipt-bound file/directory removal, receipt removal,
-  journal removal, and parent sync.
+  journal removal, probe-member removal, owner-journal removal, and parent sync.
 
 An unhooked run first records the complete ordered trace for the same fixture.
 The harness then reruns from a fresh fixture once for every trace prefix and
@@ -550,6 +574,53 @@ publication, recovery-claim rename, cleanup-receipt temporary and publication,
 each member removal, receipt removal, journal removal, and all parent syncs.
 Corruption and a genuinely live non-relinquished owner remain errors with
 evidence preserved.
+
+#### Owner-record and rename-probe oracles
+
+The same normative observer drives both production protocols that run between
+transaction/bootstrap recovery and protected-source revalidation during every
+exclusive acquisition.
+
+Owner-record install runs twice: once with no prior `owner.json` and once with a
+valid old record. Its trace includes active-journal creation; every intent,
+registration, prepared, committed, and recovered-aborted temporary/write/sync/
+publication; empty stage creation; each stage write prefix, flush, sync, and
+identity check; exclusive or swap commit; leases-parent sync; old-stage removal;
+and every simple-journal member/directory removal. Before the exclusive/swap
+commit event, the visible owner remains respectively absent or byte-identical old;
+at and after commit, the complete new canonical record is visible. A fresh
+`recover_owner_transactions` after every install prefix preserves that oracle,
+removes all valid residue, and is idempotent.
+
+Owner recovery is itself recorded and interrupted at every primitive for four
+seeds: absent/old before commit and absent/old after commit. It may publish only
+the outcome marker dictated by actual owner visibility, never change old/new
+choice, and must leave a prefix another fresh production recovery completes
+idempotently. The fixture injects deterministic token, PID, clock, roots, and
+metadata so bytes are assertable. Unknown members, malformed markers, digest or
+identity replacement, and owner bytes matching neither outcome return
+`ArtifactTransaction`, preserve evidence, and do not alter the visible owner.
+
+Rename-probe install traces active-journal/intent publication, left/right probe
+directory creation, exclusive left-to-moved rename, moved/right swap, each
+post-swap removal, directory sync, intent removal, and active-journal removal.
+No prefix may change a domain artifact or historical owner record. After every
+install prefix, fresh `recover_probe_journals` removes only validated
+intent/temporary/probe members; a subsequent production `run_rename_probe`
+succeeds and leaves no residue. Probe recovery is also interrupted after every
+individual removal and sync and must finish idempotently on the next fresh call.
+An unknown member, wrong type/mode/identity, alias, mount, or replaced probe
+directory returns `ArtifactTransaction` and preserves the complete evidence.
+
+Named production-path tests are
+`owner_record_install_every_prefix_recovers_absent`,
+`owner_record_install_every_prefix_recovers_swap`,
+`owner_record_recovery_every_prefix_is_idempotent`,
+`owner_record_corruption_preserves_evidence`,
+`rename_probe_install_every_prefix_recovers`,
+`rename_probe_recovery_every_prefix_is_idempotent`,
+`rename_probe_corruption_preserves_evidence`, and
+`lease_acquisition_recovers_owner_and_probe_prefixes`.
 
 ### SR-04.5 Shared publication state and error matrix
 
@@ -1043,12 +1114,14 @@ Invocation uses only the normalized unordered semantic set from SR-03.2.
 The Taffy sidecar is an artifact migration, not a manifest migration. A legacy
 schema-2 corpus without it returns `Verification` from generate/check with the
 instruction to run `import-taffy --source-root ...`; import atomically adds the
-sidecar while preserving authored HTML. A future layout-owned adoption must run,
-review, and commit that one corpus migration before switching its scripts. It
-also runs the named schema-2 compatibility fixtures against its owned manifest;
-if that manifest hits one of the three declared tightenings, the layout-owned
-handoff must review and commit the corresponding normalization before adoption.
-This repository never performs either sibling migration.
+sidecar while preserving authored HTML. Sidecar-free import classification is
+defined in SR-06.2 and does not guess from file extension or bytes alone. A future
+layout-owned adoption must run, review, and commit that one corpus migration
+before switching its scripts. It also runs the named schema-2 compatibility
+fixtures against its owned manifest; if that manifest hits one of the three
+declared tightenings, the layout-owned handoff must review and commit the
+corresponding normalization before adoption. This repository never performs
+either sibling migration.
 
 ### SR-06.2 Taffy import and offline proof
 
@@ -1077,21 +1150,46 @@ strictly increasing by `RelativePath`. The SHA-256 golden names are
 `layout_taffy_sidecar_sha1_golden` and
 `layout_taffy_sidecar_sha256_golden`.
 
-The current `html` publication inventory admits only:
+Import first derives the exact desired Taffy destination set from the verified
+pinned snapshot after exclusions and requires it to be disjoint from the exact
+manifest-owned Surgeist set. Current `html` ownership is then classified in one
+of two mutually exclusive modes:
 
-- the reserved sidecar;
-- Taffy files listed by the old validated sidecar, when present;
-- manifest-owned Surgeist `.html` files;
-- directories implied by those exact files.
+1. **Sidecar mode:** the reserved sidecar must parse and validate; current
+   Taffy-owned files are exactly its listed paths. A malformed sidecar never falls
+   back to legacy mode.
+2. **Sidecar-free legacy mode:** the sidecar is absent, the manifest is the
+   accepted schema-2 contract, and the explicit source verifies at its exact pin.
+   Current Taffy-owned paths are the intersection of present regular files with
+   the derived desired destination set. Missing desired files and byte differences
+   are classifiable stale state that import replaces; a present path outside the
+   desired Taffy set and authored set is unknown and fails. No path may collide
+   with an authored file, and aliases, symlinks, hard links, wrong modes, mounts,
+   or non-file leaves fail before intent.
 
-Before publication every Surgeist file is read through the held rooted authority
-and retained byte-for-byte. A missing/replaced authored file or any unknown entry
+In either mode, admitted inventory is only the reserved sidecar when present,
+classified Taffy files, exact manifest-owned authored files, and directories
+implied by those disjoint file sets. Before publication every authored file is
+read through the held rooted authority, retained byte-for-byte, and closing-
+revalidated under SR-03.2. A missing/replaced authored file or any unknown entry
 fails without mutation. The desired clean-full tree is the new Taffy snapshot,
 new sidecar, and byte-identical authored files. Thus stale old Taffy files are
 removed atomically, authored fixtures cannot be deleted or rewritten, and no
-report/XML is touched. `check-taffy-corpus` performs the same source comparison
-read-only. `check-corpus` requires only the persisted sidecar and verifies its
-pin/count/digests against manifest and HTML without Git.
+report/XML is touched. `check-taffy-corpus` requires the persisted sidecar and
+performs the same source comparison read-only; an absent sidecar is
+`Verification` with the import instruction. `check-corpus` likewise requires
+only the persisted sidecar and verifies its pin/count/digests against manifest
+and HTML without Git.
+
+Named migration tests are
+`layout_taffy_legacy_nonempty_migration_adds_sidecar`,
+`layout_taffy_legacy_missing_and_stale_files_become_current`,
+`layout_taffy_legacy_unknown_file_is_not_guessed`,
+`layout_taffy_authored_destination_collision_is_rejected`,
+`layout_taffy_malformed_sidecar_never_falls_back`, and
+`layout_taffy_authored_revalidation_precedes_import_intent`. The nonempty fixture
+contains at least two authored files, three Taffy files, one stale Taffy file,
+and one initially missing desired file.
 
 A successful import returns `Ok` after the new HTML/sidecar transaction while
 leaving existing XML/reports untouched. If the canonical sidecar digest changed,
@@ -1121,21 +1219,101 @@ keys and maps them to:
 - `contentBoxRtlData` -> `xml/<group>/<stem>__content_box_rtl.xml`.
 
 The deterministic XML renderer retains the preserved element/style/layout
-mapping and generated-by provenance comment. Provenance includes schema 2,
-`html/...` source and digest, linked-resource inventory, helper/base-style
-digests, exact browser provenance, launch-profile digest, manifest digest, Taffy
-revision, and Taffy-sidecar digest. Unsupported measured variants have no XML and
-are reported with reason.
+mapping. Its first line is the generated-by comment with attributes in this exact
+order: `schema`, `source`, `source-sha256`, optional
+`linked-resource-sha256`, `helper-sha256`, optional `base-style-sha256`,
+`browser`, `browser-executable-sha256`, `launch-profile-sha256`,
+`corpus-manifest-sha256`, `taffy-revision`, and
+`taffy-sidecar-sha256`. Required digests are lowercase 64-hex; the Taffy revision
+is the exact 40- or 64-hex sidecar revision. `browser` is the exact manifest
+`provenance_format` after replacing `{version}` and
+`{repository_relative_executable}`. Raw browser SHA-256 is therefore persisted
+separately rather than implied by that string.
+
+All attribute values use the preserved XML escaping order (`&`, `"`, `<`, `>`).
+The linked-resource value, when nonempty, is the strictly path-sorted comma-joined
+list `<strict-relative-path>=<sha256>` and is omitted when empty. The constrained
+contract currently produces the empty list. `base-style-sha256` exists exactly
+when the snapshotted source contains the literal `test_base_style.css`. The
+checker requires the comment as the first line, rejects duplicate/unknown/
+misordered attributes, requires exactly the applicable optional fields, and
+recomputes every value. Unsupported measured variants have no XML and are
+reported with reason.
+
+This is the complete-byte zero-layout golden, including its one final LF (the
+repeated digits are valid example digest/revision values):
+
+```xml
+<!-- generated-by: surgeist-layout-generate schema=2 source="html/group/case.html" source-sha256="0000000000000000000000000000000000000000000000000000000000000000" helper-sha256="0000000000000000000000000000000000000000000000000000000000000000" browser="Chrome 1 cache/chrome" browser-executable-sha256="0000000000000000000000000000000000000000000000000000000000000000" launch-profile-sha256="0000000000000000000000000000000000000000000000000000000000000000" corpus-manifest-sha256="0000000000000000000000000000000000000000000000000000000000000000" taffy-revision="1111111111111111111111111111111111111111" taffy-sidecar-sha256="0000000000000000000000000000000000000000000000000000000000000000" -->
+<test name="case__border_box_ltr" use-rounding="false">
+  <viewport width="0px" height="0px"/>
+  <input>
+    <div/>
+  </input>
+  <expectations>
+    <node x="0" y="0" width="0" height="0"/>
+  </expectations>
+</test>
+```
 
 Full generation serializes all manifest-declared report files beneath
 `xml/generation-reports/`. `all.json` has exactly `metadata`, `filter: null`,
 `summary`, `generated`, `unsupported`, `expected_fail`, `quarantined`, and
-`failed_to_generate` in that order. Metadata contains schema/generator, browser
-source/version/provenance, launch/helper/base-style/manifest/Taffy-sidecar
-digests, and Taffy revision. Entry shapes retain the preserved
-name/source/output/variant/reason fields. Each scoped report has its declared
-filter, contains the deterministic subset of the full result, and matches its
-manifest count. Pretty JSON has one final LF.
+`failed_to_generate` in that order. Metadata fields are exactly, in order:
+`schema_version: 2`, `generator: "surgeist-layout-generate"`,
+`browser_source`, `browser_version`, `browser_provenance`,
+`browser_executable_sha256`, `launch_profile_sha256`, `helper_sha256`,
+`base_style_sha256`, `corpus_manifest_sha256`, `taffy_revision`, and
+`taffy_sidecar_sha256`. Every digest/revision has the grammar above.
+
+Generated entries are exactly `{name, source, output, variant}`; unsupported
+entries are `{name, source, variant, reason}`; expected-fail, quarantined, and
+failed entries are `{name, source, reason}`, each in shown field order. All
+buckets are deterministically sorted by `(source, name, variant-or-empty,
+output-or-empty, reason-or-empty)`. The report decoder's duplicate-member prepass
+and typed objects reject duplicate or unknown fields at every level. Each scoped
+report has identical metadata, its declared nonempty filter string, the exact
+sorted subset of the full result, and its manifest counts. Serde pretty JSON uses
+two-space indentation and one final LF.
+
+The complete empty-bucket report golden is:
+
+```json
+{
+  "metadata": {
+    "schema_version": 2,
+    "generator": "surgeist-layout-generate",
+    "browser_source": "chrome-for-testing",
+    "browser_version": "1",
+    "browser_provenance": "Chrome 1 cache/chrome",
+    "browser_executable_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "launch_profile_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "helper_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "base_style_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "corpus_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "taffy_revision": "1111111111111111111111111111111111111111",
+    "taffy_sidecar_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "filter": null,
+  "summary": {
+    "generated": 0,
+    "unsupported": 0,
+    "expected_fail": 0,
+    "quarantined": 0,
+    "failed_to_generate": 0
+  },
+  "generated": [],
+  "unsupported": [],
+  "expected_fail": [],
+  "quarantined": [],
+  "failed_to_generate": []
+}
+```
+
+Named complete-byte tests are `layout_xml_provenance_complete_golden`,
+`layout_xml_optional_provenance_complete_golden`,
+`layout_report_metadata_complete_golden`, and
+`layout_provenance_rejects_duplicate_unknown_or_misordered_fields`.
 
 The publication matrix is exact:
 
@@ -1216,16 +1394,20 @@ canonical HTTPS Git; revision is exact; counts are positive; roots are strict;
 import/expectation roots are distinct one-component names; report path is exactly
 `<expectation_root>/generation-reports/all.json`. Case IDs are unique; active has
 no reason and all other statuses require one. Overrides must match exactly one
-derived case. A derived case without an override defaults to active.
+derived case. A derived case without an override defaults to active. The
+expectation-relative path `generation-reports/all.json` is reserved exclusively
+for the report and can never be derived from a source fixture.
 
 ### SR-07.2 Import sidecar and publication
 
 Import verifies the explicit checkout and immutable snapshot under
 `fixture_root`, accepts only regular Git mode `100644` JSON, requires exact file
-count, and rejects the reserved root `.surgeist-source.json`. The canonical
-sidecar contains schema 1, full source pin, object format, exact file count, and
-sorted path/Git-mode/blob-ID/SHA-256 records. It and snapshot bytes are published
-as one clean-full `import_root` transaction.
+count, and rejects both the reserved root `.surgeist-source.json` and the fixture
+path `generation-reports/all.json`. That collision is `InvalidInventory` before
+any import intent even though the upstream file is otherwise valid JSON. The
+canonical sidecar contains schema 1, full source pin, object format, exact file
+count, and sorted path/Git-mode/blob-ID/SHA-256 records. It and snapshot bytes are
+published as one clean-full `import_root` transaction.
 
 The exact compact sidecar plus final LF is:
 
@@ -1255,7 +1437,8 @@ visible.
 
 Each imported `<import_root>/<relative>.json` maps exactly to
 `<expectation_root>/<relative>.json`. Its pretty JSON plus final LF has this field
-order and shape:
+order and shape, except that the reserved report-relative path is rejected on
+every sidecar/import read and is never mapped:
 
 ```json
 {
@@ -1340,16 +1523,23 @@ The publication matrix is:
 
 Current classification is expectations mapped from the validated import sidecar,
 the manifest report, and directories implied by them. Any other entry fails
-before intent. A full clean run removes stale expectations that were classified
-by the previous valid report/sidecar but are absent from the new exact set; it
-never guesses ownership from extension alone. `check-corpus` performs no Git or
-mutation and validates manifest, sidecar/files, every expectation byte/schema,
-counts, report relationship, hashes, and exact inventories.
+before intent. A persisted old/malformed sidecar that lists
+`generation-reports/all.json` is `InvalidInventory`; full generation, filtered
+generation, and checking all fail before interpreting that path as either an
+expectation or report. A full clean run removes stale expectations that were
+classified by the previous valid report/sidecar but are absent from the new exact
+set; it never guesses ownership from extension alone. `check-corpus` performs no
+Git or mutation and validates manifest, sidecar/files, every expectation
+byte/schema, counts, report relationship, hashes, and exact inventories.
 
 Byte-golden tests cover ordinary/error cases, escaping, canonical options,
 default/override dispositions, repeated source paths with unique IDs, duplicate
 members, malformed/empty fixtures, sidecar drift, report provenance/counts,
-unknown entries, stale full removal, and filtered preservation.
+unknown entries, stale full removal, filtered preservation, and the named
+`css_import_rejects_report_path_collision`,
+`css_full_generate_rejects_persisted_report_path_collision`,
+`css_filtered_generate_rejects_persisted_report_path_collision`, and
+`css_check_rejects_persisted_report_path_collision` cases.
 
 ## SR-08 Errors, Documentation, And Verification
 
