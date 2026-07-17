@@ -577,9 +577,24 @@ evidence preserved.
 
 #### Owner-record and rename-probe oracles
 
-The same normative observer drives both production protocols that run between
-transaction/bootstrap recovery and protected-source revalidation during every
-exclusive acquisition.
+The complete normative exclusive-acquisition order is:
+
+1. open/bootstrap and exclusively hold the domain mutex;
+2. run `TransactionEngine::recover_all`;
+3. run `recover_owner_transactions`;
+4. run `recover_probe_journals`, then `run_rename_probe`;
+5. for layout only, recover/classify SR-03.3 profile journals;
+6. run the protected-source closing revalidation callback;
+7. only after it succeeds, run `install_owner_record`; and
+8. return the live guard.
+
+The same normative observer drives the owner-record and rename-probe protocols,
+but their positions are intentionally different: probe execution is before
+closing revalidation and owner installation is after it. A probe/profile/
+revalidation failure creates no owner transaction and leaves the historical
+owner byte-identical. An owner-install failure follows the owner visibility
+oracle below and returns no guard. The mutex is released on every failed
+acquisition after durable recovery/evidence decisions complete.
 
 Owner-record install runs twice: once with no prior `owner.json` and once with a
 valid old record. Its trace includes active-journal creation; every intent,
@@ -612,15 +627,34 @@ individual removal and sync and must finish idempotently on the next fresh call.
 An unknown member, wrong type/mode/identity, alias, mount, or replaced probe
 directory returns `ArtifactTransaction` and preserves the complete evidence.
 
+Two deterministic test-only capability faults cover the production failure
+branches. `FailExclusiveRename` rejects left-to-moved before it mutates either
+name; cleanup removes left then right, syncs the journal, and outer cleanup
+removes intent and the active journal. `FailSwapRename` succeeds at
+left-to-moved, rejects moved/right swap before that mutation, then removes moved
+and right in that order, syncs, and performs the same outer cleanup. Every
+individual failure-cleanup and recovery primitive is interruptible. Complete
+cleanup returns `UnsupportedPlatform` after mutex acquisition with the historical
+owner and domain artifacts unchanged and no probe residue. Any cleanup failure
+returns `ArtifactTransaction` with the capability failure plus cleanup source and
+preserves the exact valid active journal. The next acquisition first resumes
+`recover_probe_journals`; after successful recovery it reruns the probe and again
+returns `UnsupportedPlatform` if the injected/platform limitation remains.
+
 Named production-path tests are
 `owner_record_install_every_prefix_recovers_absent`,
 `owner_record_install_every_prefix_recovers_swap`,
 `owner_record_recovery_every_prefix_is_idempotent`,
 `owner_record_corruption_preserves_evidence`,
 `rename_probe_install_every_prefix_recovers`,
+`rename_probe_exclusive_unsupported_every_prefix_recovers`,
+`rename_probe_swap_unsupported_every_prefix_recovers`,
+`rename_probe_unsupported_cleanup_failure_preserves_evidence`,
 `rename_probe_recovery_every_prefix_is_idempotent`,
 `rename_probe_corruption_preserves_evidence`, and
-`lease_acquisition_recovers_owner_and_probe_prefixes`.
+`lease_acquisition_recovers_owner_and_probe_prefixes`. The acquisition boundary
+also has `lease_revalidation_failure_preserves_historical_owner` and
+`lease_owner_install_begins_only_after_revalidation`.
 
 ### SR-04.5 Shared publication state and error matrix
 
@@ -630,7 +664,7 @@ means its structure, provenance, digests, and report relationships all match the
 currently validated inputs; **stale** means every entry is classifiable but at
 least one required artifact is absent or has old provenance, bytes, digest, or
 report linkage; and **invalid** means at least one entry cannot be classified by
-the old validated inventory.
+the validated historical-plus-desired inventory authority below.
 
 | Initial publication | Command form | Successful result |
 | --- | --- | --- |
@@ -655,6 +689,68 @@ The exact command-level state transitions are:
 | CSS filtered `generate` | classifiable expectations current/stale | `Ok`; selected expectations are replaced and every other expectation/report byte is preserved. The resulting full state is current only if the preserved report still validates against all resulting expectations; otherwise it is stale. | If stale, run a successful full generate before `check-corpus` can return `Ok`. |
 | CSS `check-corpus` | import and expectation roots current/stale/absent/invalid | `Ok` only when both are current; `Verification` for absent/stale known state; `InvalidInventory` for unknown entries or malformed known artifacts. No bytes change. | Run the indicated import or full generate; the command never repairs state. |
 
+#### Historical downstream inventory authority
+
+An existing downstream root is never classified solely from the newly imported
+source sidecar. Its durable ownership authority is the previously published full
+report retained inside that downstream root. Historical validation is a strict
+ownership mode, not a freshness waiver: it requires canonical bytes, exact
+schema/generator, duplicate/unknown-field rejection, internally matching summary
+and buckets, unique strict source/output paths, domain mapping rules, and every
+recorded output digest to have exact lowercase SHA-256 grammar. It recomputes
+visible outputs: equality is current for that artifact, while a missing file or
+digest mismatch is classifiable absent/stale state and does not invalidate path
+ownership. It does not require the old source file or old source sidecar to remain
+and does not compare old manifest/source provenance values with current ones. A
+malformed or missing historical authority for a nonempty downstream root is
+`InvalidInventory` and no path is guessed.
+
+For layout, `xml/generation-reports/all.json` is the primary authority. Every
+generated entry maps its recorded `html/<group>/<stem>.html` and variant to the
+one exact `xml/<group>/<stem>__<variant>.xml` path and binds that file's raw
+SHA-256 for freshness checking. Other historical report files must be
+one-component `.json` names,
+parse under the same metadata schema, name a unique nonempty filter, and be exact
+subsets of `all.json`; this classifies old scoped reports even if the current
+manifest no longer declares them. One migration-only authority shape is also
+accepted: the exact preserved schema-2 full/scoped report and generated-comment
+grammar from `legacy_generator.rs`, whose generated entries omit output SHA.
+That shape can establish path ownership only, is always stale, forbids filtered
+publication, and must be replaced by one complete `CleanFull` or
+`DiagnosticFull` publication in the current schema. A report directory must be
+uniformly legacy or current; any mixed legacy/current set is
+`InvalidInventory`.
+
+For CSS, the exact shared `GenerationReport` at
+`<expectation_root>/generation-reports/all.json` is the authority. Each
+`ReportArtifact` must map its strict `<import_root>/<relative>.json` source to
+exactly `<expectation_root>/<relative>.json`, carry the output digest used for
+freshness checking, use the CSS generator/schema/provenance grammar, and have
+positive case count. The
+reserved report collision remains invalid in both current and historical modes.
+
+Before any generation plan, the command constructs `historical ∪ desired`:
+historical output/report paths from the validated old authority plus output/report
+paths derived from the current source/manifest. Every visible downstream entry
+must belong to that union or an implied directory. Clean full publication retains
+only the new desired set, so removed/renamed historical outputs disappear;
+additions are created. Filtered publication writes no authority and preserves all
+other union members. A layout `DiagnosticFull` publishes the complete current
+report set, retains only successfully generated current XML, and removes every
+other historical-union XML/report path; failed current jobs have report entries
+but no XML. It therefore leaves one complete current-schema authority even when
+membership changes. Read-only checking returns `Verification` for a structurally
+valid historical authority that is stale against current inputs, and
+`InvalidInventory` for a malformed authority or an entry outside the union.
+
+Named cross-generation tests are
+`layout_historical_inventory_removal_rename_addition_regenerates`,
+`layout_legacy_report_requires_complete_report_migration`,
+`layout_historical_inventory_rejects_malformed_authority`,
+`layout_membership_delta_diagnostic_replaces_authority`,
+`css_historical_inventory_removal_rename_addition_regenerates`, and
+`css_historical_inventory_rejects_malformed_authority`.
+
 For both filtered commands, an absent final root returns `Verification` before
 transaction intent. For every mutation command, an invalid current root returns
 `InvalidInventory` before transaction intent. A mutation whose required import
@@ -677,6 +773,10 @@ public call returned `Err`:
 | CLI/manifest/inventory/source/namespace/capability or required-import validation before lease | prior absent/current tree | none created by the command | owning `Cli`, `InvalidManifest`, `InvalidInventory`, `SourceVerification`, `InvalidPath`, `UnsupportedPlatform`, or `Verification` kind |
 | read-only coordination acquisition/finish | prior tree | byte-identical coordination/profile state | `Verification`; underlying safe I/O/parse context retained in its diagnostic/source |
 | mutation lease/bootstrap/profile recovery before publication intent | prior tree | active live evidence preserved; dead valid profile state either fully cleaned or retained as resumable cleanup evidence | `LeaseActive` for a held lease/transition or live/permission-inconclusive recorded group; `ArtifactTransaction` for corrupt metadata or unclassifiable recovery/cleanup; safe source retained |
+| exclusive- or swap-rename capability probe fails and all failure cleanup completes | prior tree | no probe residue; historical owner byte-identical; mutex released | `UnsupportedPlatform` with the original capability source |
+| rename-probe recovery or failure cleanup cannot complete | prior tree | exact valid active probe journal retained; historical owner byte-identical; mutex released | `ArtifactTransaction` containing capability/recovery and cleanup context |
+| protected closing revalidation rejects after prerequisite recovery/probe/profile work | prior tree | no owner transaction; historical owner byte-identical; mutex released | exact owning `InvalidPath`, `InvalidInventory`, or `SourceVerification` with safe source |
+| owner-record install fails after successful closing revalidation but before domain publication intent | prior tree | owner remains absent/old before owner commit or complete new after it; valid resumable owner journal retained only when cleanup cannot finish | `ArtifactTransaction` under the owner install/recovery oracle; no live guard returned |
 | after intent but before commit, with synchronous recovery successful | absent for exclusive or complete old for swap | no transaction residue | original owning error kind |
 | commit completed but root sync/outcome/cleanup fails, with recovery successful | complete new | no residue after successful recovery | `ArtifactTransaction` because commit occurred |
 | any recovery or cleanup cannot safely complete | absence/old/new dictated by the commit oracle | valid resumable evidence retained | `ArtifactTransaction` containing operation and recovery context |
@@ -1266,17 +1366,21 @@ Full generation serializes all manifest-declared report files beneath
 `base_style_sha256`, `corpus_manifest_sha256`, `taffy_revision`, and
 `taffy_sidecar_sha256`. Every digest/revision has the grammar above.
 
-Generated entries are exactly `{name, source, output, variant}`; unsupported
-entries are `{name, source, variant, reason}`; expected-fail, quarantined, and
-failed entries are `{name, source, reason}`, each in shown field order. All
-buckets are deterministically sorted by `(source, name, variant-or-empty,
-output-or-empty, reason-or-empty)`. The report decoder's duplicate-member prepass
-and typed objects reject duplicate or unknown fields at every level. Each scoped
-report has identical metadata, its declared nonempty filter string, the exact
-sorted subset of the full result, and its manifest counts. Serde pretty JSON uses
-two-space indentation and one final LF.
+Generated entries are exactly
+`{name, source, output, output_sha256, variant}`; `output_sha256` is the lowercase
+raw SHA-256 of the complete XML bytes including the final LF. Unsupported entries
+are `{name, source, variant, reason}`; expected-fail, quarantined, and failed
+entries are `{name, source, reason}`, each in shown field order. All buckets are
+deterministically sorted by `(source, name, variant-or-empty, output-or-empty,
+output_sha256-or-empty, reason-or-empty)`. The report decoder's duplicate-member
+prepass and typed objects reject duplicate or unknown fields at every level. Each
+scoped/diagnostic report carries the same digest for each generated entry,
+identical metadata, its declared filter when scoped, the exact sorted subset of
+the full result, and its manifest counts. Serde pretty JSON uses two-space
+indentation and one final LF.
 
-The complete empty-bucket report golden is:
+The complete single-generated report golden binds the XML golden above; its
+`output_sha256` is the SHA-256 of that exact fenced XML payload:
 
 ```json
 {
@@ -1296,13 +1400,21 @@ The complete empty-bucket report golden is:
   },
   "filter": null,
   "summary": {
-    "generated": 0,
+    "generated": 1,
     "unsupported": 0,
     "expected_fail": 0,
     "quarantined": 0,
     "failed_to_generate": 0
   },
-  "generated": [],
+  "generated": [
+    {
+      "name": "case__border_box_ltr",
+      "source": "html/group/case.html",
+      "output": "xml/group/case__border_box_ltr.xml",
+      "output_sha256": "04dd77a3fca470f65858a35b059a34a146031adbc5dd80931dd8cbe508dacb6a",
+      "variant": "border_box_ltr"
+    }
+  ],
   "unsupported": [],
   "expected_fail": [],
   "quarantined": [],
@@ -1312,15 +1424,24 @@ The complete empty-bucket report golden is:
 
 Named complete-byte tests are `layout_xml_provenance_complete_golden`,
 `layout_xml_optional_provenance_complete_golden`,
-`layout_report_metadata_complete_golden`, and
+`layout_report_generated_digest_complete_golden`, and
 `layout_provenance_rejects_duplicate_unknown_or_misordered_fields`.
+
+`check-corpus` recomputes each generated entry's digest before accepting its XML
+provenance/body. A body edit with an unchanged valid first-line comment is stale
+`Verification`, not current. Filtered generation preserves reports: if every
+selected XML byte sequence retains the recorded digest, the prior full report may
+remain current; any changed selected digest makes the composed corpus stale until
+a clean full run replaces the report. Named behavior tests are
+`layout_report_rejects_tampered_xml_body` and
+`layout_filtered_digest_change_makes_preserved_report_stale`.
 
 The publication matrix is exact:
 
 | Run outcome | Policy/result | Artifacts | Stale/unknown behavior |
 | --- | --- | --- | --- |
-| Full, every browser job reaches a classified generated/unsupported result and no lifecycle failure | `CleanFull`, then `Ok` | all generated XML plus every full/scoped report | remove only manifest-classified nonretained XML/report paths; unknown entry fails before intent |
-| Full, one or more jobs exhaust retry but SR-03.3 terminalization succeeds and a complete diagnostic report exists | `DiagnosticFull`, install, then return `Generation` | successful XML plus all diagnostic reports with failed entries | preserve every existing unmatched classified XML/report; unknown entry fails |
+| Full, every browser job reaches a classified generated/unsupported result and no lifecycle failure | `CleanFull`, then `Ok` | all generated XML plus every full/scoped report | remove historical-union members absent from the desired set; unknown entry fails before intent |
+| Full, one or more jobs exhaust retry but SR-03.3 terminalization succeeds and a complete diagnostic report exists | `DiagnosticFull`, install, then return `Generation` | successful current XML plus all current diagnostic reports; failed entries have no XML | remove every historical-union XML/report absent from that installed set, including superseded output for failed or removed jobs; unknown entry fails before intent |
 | Filtered, all selected jobs succeed/classify | `Filtered`, then `Ok` | selected generated XML only | write no report; preserve every other XML/report; remove nothing |
 | Validation before lease | no plan/install; exact pre-lease kind from SR-04.5 | none | prior generated tree remains; no profile exists |
 | Version/launch/handler/filtered-job/incomplete-report failure with successful profile terminalization | no plan/install; `SourceVerification`, `Process`, or `Generation` exactly per SR-04.5 | none | prior generated tree remains; no profile residue |
@@ -1329,14 +1450,16 @@ The publication matrix is exact:
 | Artifact transaction fails before commit and synchronous recovery succeeds | error per SR-04.5 | none installed | prior absent/old tree remains; no transaction residue |
 | Artifact transaction commits but root sync/outcome/cleanup reports failure | return `ArtifactTransaction` | complete new XML/report set remains visible | recovery completes or retains valid resumable evidence; never restore old |
 
-Classified XML is the four exact paths for every manifest-admitted HTML fixture;
-retained XML is only successfully generated variants. Classified reports are
-exactly manifest-declared full/scoped paths. Report paths are retained only in a
-complete full/diagnostic report set. Unsupported/quarantined paths are therefore
-removed only by successful clean full publication. Filtered publication cannot
-write reports. Check commands acquire/finish a shared guard, create/recover
-nothing, and verify exact inventory, hashes, report relationships, XML
-provenance, and absence of unknown entries.
+Desired XML is the four exact paths for every currently manifest-admitted HTML
+fixture; historical XML/report ownership comes only from the validated SR-04.5
+authority. The classifiable set is their union. Retained desired XML is only
+successfully generated variants, and current report paths are exactly the
+manifest-declared full/scoped set. Unsupported/quarantined and removed/renamed
+historical paths are therefore removed only by a complete `CleanFull` or
+`DiagnosticFull` publication. Filtered publication cannot write reports. Check commands acquire/
+finish a shared guard, create/recover nothing, recompute every XML output digest,
+and verify exact union inventory, report relationships, provenance, and absence
+of unknown entries.
 
 Browser-independent synthetic adapters and byte goldens cover HTML injection,
 URLs, four-variant mapping, measurement conversion, XML, reports, retry,
@@ -1521,16 +1644,17 @@ The publication matrix is:
 | Artifact failure before commit with successful recovery | no completed install | prior absent/old expectation tree remains |
 | Artifact failure after commit | return `ArtifactTransaction` | complete new expectation/report root remains; cleanup completes or retains resumable evidence |
 
-Current classification is expectations mapped from the validated import sidecar,
-the manifest report, and directories implied by them. Any other entry fails
-before intent. A persisted old/malformed sidecar that lists
-`generation-reports/all.json` is `InvalidInventory`; full generation, filtered
-generation, and checking all fail before interpreting that path as either an
-expectation or report. A full clean run removes stale expectations that were
-classified by the previous valid report/sidecar but are absent from the new exact
-set; it never guesses ownership from extension alone. `check-corpus` performs no
-Git or mutation and validates manifest, sidecar/files, every expectation
-byte/schema, counts, report relationship, hashes, and exact inventories.
+Desired classification is expectations mapped from the current validated import
+sidecar plus its fixed report; historical classification comes only from the
+validated SR-04.5 full report. Any entry outside their union fails before intent.
+A persisted old/malformed sidecar or historical authority that lists
+`generation-reports/all.json` as a fixture/output is `InvalidInventory`; full
+generation, filtered generation, and checking all fail before interpreting that
+path as either an expectation or report. A full clean run removes stale
+historical expectations absent from the new exact set; it never guesses
+ownership from extension alone. `check-corpus` performs no Git or mutation and
+validates manifest, sidecar/files, every expectation byte/schema, counts, report
+relationship, hashes, and the exact historical-plus-desired inventory.
 
 Byte-golden tests cover ordinary/error cases, escaping, canonical options,
 default/override dispositions, repeated source paths with unique IDs, duplicate
