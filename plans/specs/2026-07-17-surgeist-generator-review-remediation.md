@@ -26,7 +26,7 @@ sibling work, or supply missing normative behavior.
 
 Only `surgeist-generator` may be mutated. The allowed surface is its manifest and
 lockfile, repository-local `deny.toml`, library and binary source, focused
-synthetic tests, README and AGENTS, and workflow planning/evidence files. Root
+synthetic tests, README and AGENTS, and canonical planning files. Root
 `surgeist`, `surgeist-layout`, `surgeist-css`, their corpora, and their artifacts
 remain outside mutation and test scope. No sibling checkout is needed.
 
@@ -72,10 +72,11 @@ code and does not provide the rooted, recoverable containment required here.
 Building a new downloader/extractor would widen the objective and verification
 surface. The layout driver therefore accepts an explicitly supplied, existing
 browser executable as a trusted external capability and checks only its identity,
-cache containment, executable type, and manifest version output. Those checks do
-not prove the program benign. Taffy and CSSTree commands accept explicitly
-supplied, existing Git checkouts whose bytes and provenance are verified
-read-only. None of the resources is installed, repaired, or removed.
+cache containment, executable type, raw SHA-256 stability, and manifest version
+output. Those checks do not prove the program benign. Taffy and CSSTree commands
+accept explicitly supplied, existing Git checkouts whose bytes and provenance
+are verified read-only. None of the resources is installed, repaired, or
+removed.
 
 Library request fronts are selected rather than binary-only behavior because
 separate Cargo binary targets can consume only the library's public API. Exact
@@ -128,9 +129,9 @@ The command-specific namespaces are:
 
 Transaction reservations named `._surgeist-*` are writable members of the same
 corpus-root publication authority and are included even when not yet present.
-Layout browser profiles live only beneath
-`.surgeist-generator/profiles/layout/<lease-token>` and are created and removed
-by the held rooted authority. No owner-global or system-temporary profile path is
+Layout browser profile journals live only beneath
+`.surgeist-generator/profiles/layout/` and are created, recovered, and removed by
+the held rooted authority. No owner-global or system-temporary profile path is
 used. The complete browser cache root is read-only.
 
 ### SR-03.2 Disjointness and revalidation
@@ -168,50 +169,268 @@ bytes—not a reread checkout—feed import publication.
 
 Existing browser validation performs the same canonical and identity checks on
 the manifest cache root and CLI executable, rejects any resolution outside the
-cache, and requires an executable regular file. Only after lease acquisition and
-the complete closing revalidation does it create the rooted profile hierarchy,
+cache, requires an executable single-link regular file, and snapshots its raw
+SHA-256 through the held descriptor. Closing revalidation requires the same
+identity and digest. Only after lease acquisition and the complete closing
+revalidation does it create the rooted profile hierarchy,
 execute `<browser> --version` with the fixed environment below, compare the exact
 normalized output with the manifest, and launch Chromium with that same
 environment. The trusted executable capability can write or spawn outside the
 generator-owned namespaces; this specification does not claim to sandbox or
 contain it. Operator trust in that exact executable is a command precondition,
-and README/rustdoc must state the boundary.
+and includes ordinary Chromium behavior: the cache path is not concurrently
+replaced, and the browser and its helpers remain in the inherited process group.
+The supervisor revalidates path identity/digest immediately before spawn and
+again after terminalization, but macOS path-based spawn is not an atomic
+execute-from-held-descriptor proof. A malicious binary could replace itself,
+daemonize, or leave the recorded group. README/rustdoc must state that boundary;
+the lifecycle proof covers the recorded group, not processes a trusted
+capability deliberately detaches from it.
 
-The preserved launch profile is additionally constrained to 28 unique printable
-ASCII arguments, one exactly `use-mock-keychain`, with no slash, backslash,
-control byte, or NUL. After stripping an optional leading `--` and text after the
-first `=`, these keys are forbidden: `user-data-dir`, `disk-cache-dir`,
-`data-path`, `log-file`, `crash-dumps-dir`, `download-default-directory`,
-`remote-debugging-port`, `remote-debugging-address`, `load-extension`, and
-`disable-extensions-except`. The driver alone supplies its rooted user-data
-profile and Chromiumoxide transport arguments. This rejects known configuration
-redirection but is not presented as a security boundary against a malicious
-binary.
+The preserved manifest contains 28 launch strings and their order remains part of
+the preserved launch digest. For invocation, each string is normalized by
+removing exactly one optional leading `--`, splitting at the first `=`, and
+requiring a nonempty ASCII key that does not begin with `-`. The 28 normalized
+keys must be unique; every complete string must be printable ASCII and contain no
+slash, backslash, control byte, or NUL. One normalized string is exactly
+`use-mock-keychain`. These manifest keys are forbidden:
+`user-data-dir`, `disk-cache-dir`, `media-cache-dir`, `data-path`, `homedir`,
+`log-file`, `log-net-log`, `crash-dumps-dir`, `crash-dump-dir`,
+`breakpad-dump-location`, `download-default-directory`, `ssl-key-log-file`,
+`trace-startup-file`, `profiling-file`, `print-to-pdf`, `screenshot`,
+`remote-debugging-port`, `remote-debugging-address`, `remote-debugging-pipe`,
+`disable-extensions`, `load-extension`, and `disable-extensions-except`. The
+driver-owned normalized switch set is exactly `remote-debugging-port=0`,
+`disable-extensions`, and `user-data-dir=<exact profile path>`.
 
-The browser environment is not configurable. Both version and measurement
-commands override `HOME`, `TMPDIR`, `TMP`, `TEMP`, `XDG_CONFIG_HOME`,
-`XDG_CACHE_HOME`, and `XDG_DATA_HOME` with precreated directories beneath the
-lease profile; override `TZ`, `LANG`, and `LC_ALL` with `UTC`, `C`, and `C`;
-override `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `http_proxy`, `https_proxy`,
-and `all_proxy` with the empty string; override `NO_PROXY` and `no_proxy` with
-`*`; and set no manifest- or CLI-supplied environment entry. Before the lease,
-capability validation rejects
-`InvalidPath` if the inherited environment contains a key beginning `DYLD_`,
-`LD_`, `CHROME_`, or `CHROMIUM_`, or an exact key `SSLKEYLOGFILE`,
-`FONTCONFIG_FILE`, `FONTCONFIG_PATH`, `GOOGLE_API_KEY`,
-`GOOGLE_DEFAULT_CLIENT_ID`, or `GOOGLE_DEFAULT_CLIENT_SECRET`. Chromiumoxide
-inherits other process entries because it has no environment-clear interface;
-that residual OS context is explicitly part of the trusted external capability,
-not a filesystem-containment or malicious-executable defense. README/rustdoc
-state this residual boundary and the generator reads no environment override as
-configuration.
+Chromiumoxide 0.9.1 intentionally treats the complete switch collection as an
+unordered key map. The manifest order is therefore a digest/provenance promise,
+not an argv-order promise. Unique disjoint keys make all admitted switches
+order-independent. Before it starts the trusted executable, the internal
+supervisor validates that the received normalized switch set is exactly the 28
+manifest switches plus those three driver switches, replaces Chromiumoxide's
+display-form `user-data-dir` value with the exact OS-native profile path from its
+bound launch capsule, and forwards the otherwise unchanged received order. No
+artifact or semantic oracle depends on that order.
+
+The pinned measurement `BrowserConfig` uses the current layout binary as its
+executable and applies exactly `with_head`, `disable_default_args`,
+`disable_cache`, the attempt `user_data_dir`, the 28 normalized manifest
+strings, and the one launch-capsule environment entry. It retains Chromiumoxide
+0.9.1's exact remaining defaults: port zero, sandbox enabled, no extensions,
+window size, incognito, hidden mode, HTTPS-first disabling, or request
+interception; 20-second launch timeout; 30-second request timeout; default
+viewport; ignored invalid events; and ignored HTTPS errors. Those settings add
+only the three driver switches stated above. A focused config adapter test
+passes permutations through the pinned builder and supervisor parser and proves
+the same admitted semantic set.
+
+The real browser environment is fixed and cleared. Both version and measurement
+commands use `Command::env_clear`; set `HOME`, `TMPDIR`, `TMP`, `TEMP`,
+`XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, and `XDG_DATA_HOME` to precreated directories
+beneath the attempt profile named respectively `home`, `tmp`, `tmp`, `tmp`,
+`xdg-config`, `xdg-cache`, and `xdg-data`; use the profile root as cwd; set
+`PATH=/usr/bin:/bin`, `TZ=UTC`, `LANG=C`, and `LC_ALL=C`; set
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `http_proxy`,
+`https_proxy`, and `all_proxy` to the empty string; and set `NO_PROXY` and
+`no_proxy` to `*`. No inherited, manifest-supplied, or operator-supplied entry
+reaches the real browser. The generator's internal supervisor receives one
+private launch-capsule environment value from its parent; it is authenticated
+against the held lease/profile journal, contains OS paths as lowercase hex bytes,
+is removed by `env_clear`, and is not an operator configuration surface.
 
 Synthetic tests cover both ancestor directions, missing suffixes, case/symlink
 aliases, source object-store overlap, browser-cache/corpus overlap, replacement
-between preflight and protected revalidation, argument/environment rejection,
-the exact fixed environment map, and outside sentinels that remain byte-identical
-after generator-owned operations. They do not make a containment claim about the
-trusted executable, which tests never launch.
+between preflight and protected revalidation, switch normalization/set
+permutations, launch-capsule rejection, the exact cleared environment map, and
+outside sentinels that remain byte-identical after generator-owned operations.
+They do not make a containment claim about the trusted executable, which tests
+never launch.
+
+### SR-03.3 Browser supervisor, profile journal, and terminalization
+
+Each zero-based batch/retry attempt has a fresh profile token and one exact
+journal root:
+
+```text
+.surgeist-generator/profiles/layout/
+  active-<lease-token>-version-<profile-token>/
+  active-<lease-token>-batch-<batch>-retry-<retry>-<profile-token>/
+    intent.json
+    transition.lock
+    profile/
+    profile.json
+    running.json              # present only after supervisor registration
+```
+
+The children shown apply to either active form; `retry` is `0` or `1`.
+Parent/layout/journal directories are private mode `0700`;
+metadata and the immutable lock are mode `0600`; `transition.lock` contains only
+the existing `surgeist-generator-lock-v1` header. Metadata is compact canonical
+JSON plus one LF with fields in the shown order. `intent.json` contains
+`schema_version: 1`, purpose (`version` or `measurement`), authority key, parent
+PID, lease/profile tokens, nullable batch/retry ordinals, owner-relative browser
+path, browser `HeldIdentity`, raw browser SHA-256, and launch-profile SHA-256.
+Version has null ordinals; measurement has the path-matching integers.
+`profile.json` contains `schema_version: 1`,
+profile token, strict journal-relative profile path, and the profile directory's
+`HeldIdentity`. `HeldIdentity` retains its existing canonical field order
+`kind`, `device`, `inode`, `fsid: {words}`, `mode`, `owner`, `link_count`.
+`running.json` contains `schema_version: 1`, profile token, parent PID,
+supervisor PID, and process-group ID; supervisor PID and process-group ID must be
+equal and nonzero.
+
+The byte shapes are exactly:
+
+```json
+{"schema_version":1,"purpose":"<version-or-measurement>","authority_key":"<authority-key>","parent_pid":1,"lease_token":"<lease-token>","profile_token":"<profile-token>","batch_ordinal":null,"retry_ordinal":null,"browser_path":"<owner-relative-browser-path>","browser_identity":{"kind":"regular","device":1,"inode":1,"fsid":{"words":[1,1]},"mode":493,"owner":1,"link_count":1},"browser_sha256":"<64-lowercase-hex>","launch_profile_sha256":"<64-lowercase-hex>"}
+{"schema_version":1,"profile_token":"<profile-token>","profile_path":"profile","identity":{"kind":"directory","device":1,"inode":1,"fsid":{"words":[1,1]},"mode":448,"owner":1,"link_count":null}}
+{"schema_version":1,"profile_token":"<profile-token>","parent_pid":1,"supervisor_pid":2,"process_group_id":2}
+```
+
+Angle-bracket strings and numeric identity values are grammar examples. Version
+uses null ordinals; measurement serializes nonnegative `u64` batch and `0`/`1`
+retry numbers. All tokens use the existing lowercase token grammar; all identity
+numbers are the observed held values. Unknown/duplicate fields, a nonmatching
+name/purpose/ordinal, or any noncanonical byte representation is invalid.
+
+Before any external launch, the parent creates and syncs the complete prefix
+through `profile.json`. The sole private environment key is
+`SURGEIST_LAYOUT_LAUNCH_CAPSULE`. Its value is this compact canonical JSON with
+no final LF:
+
+```json
+{"schema_version":1,"owner_root_hex":"<lowercase-even-width-hex-os-bytes>","corpus_root_hex":"<lowercase-even-width-hex-os-bytes>","journal_path":"<strict-relative-journal>","intent_sha256":"<64-lowercase-hex>","profile_sha256":"<64-lowercase-hex>","parent_pid":1,"profile_token":"<profile-token>","browser_path":"<owner-relative-browser-path>","purpose":"<version-or-measurement>","launch_strings":["<ordered-normalized-string>"]}
+```
+
+Thus the private launch capsule contains
+schema 1, lowercase-hex owner/corpus OS-path bytes, journal relative path,
+intent/profile-record SHA-256 values, parent PID, profile token, owner-relative
+browser path, purpose, and the ordered normalized launch strings (`version` only
+for the version purpose; the semantic switch set for measurement). The supervisor
+accepts it only when all bytes, digests, identities, tokens, parent PID, and the
+held layout-mutex state match the journal. A forged, stale, incomplete, or
+operator-supplied capsule exits without launching a browser.
+
+The parent first runs a version-purpose supervisor directly, bounds it at five
+seconds, caps each output stream at 64 KiB, validates exit success and normalized
+stdout, terminalizes its group/profile, and only then starts measurement. Timeout
+or excess output group-kills and reaps through the normal lifecycle.
+Normalization is exact UTF-8 `split_whitespace().collect::<Vec<_>>().join(" ")`;
+an empty result cannot match the required nonempty manifest value. Successful
+stderr is retained only for diagnostics and does not enter provenance.
+Immediately before every later measurement-purpose journal, it reopens the cache
+root/executable and requires the same held identity and raw SHA-256 recorded by
+the successful version attempt; drift is `SourceVerification` before that
+supervisor is created.
+
+Chromiumoxide still owns measurement websocket discovery and protocol connection.
+It launches the current layout binary as the measurement-purpose internal
+supervisor, supplies the capsule only to that child, reads the trusted browser's
+forwarded stderr until the DevTools websocket URL appears, connects, and returns
+its normal `Browser`/`Handler`. Either-purpose supervisor performs this exact
+transition while holding `transition.lock`
+exclusively: validate the capsule and parent PID; become a new process-group
+leader; publish/sync `running.json`; spawn the exact verified browser in that
+group with the fixed cwd/environment and validated purpose-specific argv; then
+release the transition lock. It copies browser stderr byte-for-byte without unbounded
+buffering; in version mode it also copies stdout under the parent's stated cap;
+in measurement mode browser stdout is null. It waits for the browser and exits
+with the browser status. A spawn failure leaves a dead recorded group and exits
+nonzero. Thus no real browser can start before its durable group record, and
+killing the supervisor alone cannot make an extant browser group look absent.
+
+The `Browser::launch` future alone is wrapped in
+`AssertUnwindSafe(...).catch_unwind()` because Chromiumoxide 0.9.1 uses `expect`
+while killing/waiting its child on launch failure. The handler task and every
+direct Chromiumoxide future that consumes browser/process/protocol data—page
+creation, evaluation, close, and command replies—use the same narrow dependency
+boundary; repository-owned mapping, accounting, and invariant code is outside
+those wrappers. A caught dependency panic is converted to `Process` with the
+panic payload rendered safely, then the recorded whole group/profile is
+terminalized. The outer worker panic boundary remains for repository-owned
+invariant failures and resumes those payloads as specified below; external
+browser behavior cannot reach that outer boundary.
+
+The normal owner terminalizes an attempt before constructing an artifact plan:
+
+1. stop scheduling work and close/drop every page;
+2. for measurement, while the handler still runs, allow five seconds for
+   `Browser::close`; version proceeds directly to wait;
+3. allow five seconds for the browser/supervisor group to exit and be reaped;
+4. if still live, verify the recorded group against the owned supervisor child,
+   send `SIGKILL` to that whole group through safe `rustix`, and allow five
+   seconds to reap the supervisor;
+5. abort and await the handler task, bounded by five seconds, after the connection
+   is closed;
+6. prove the recorded process group is absent, acquire `transition.lock`
+   exclusively, rename `active-...` to the same `cleanup-...` suffix, sync the
+   profiles parent, erase that tree, and sync again;
+7. only then release the layout lease or build/publish artifacts.
+
+`Browser::kill` is not used because its child is the supervisor, not the whole
+group. Close failure does not skip group kill/wait. The first job/launch/handler
+error remains primary only if all terminalization succeeds. A live or
+inconclusive group after the forced path returns `Process` with its I/O/process
+source and preserves the active journal/profile; a dead group whose durable
+rename/erase fails returns `ArtifactTransaction` containing both the primary and
+cleanup contexts and preserves the cleanup journal. During an unexpected panic,
+the same terminalization runs; the original panic payload is resumed afterward,
+including when cleanup evidence must remain for the next acquisition.
+
+After abrupt parent death, the next exclusive layout acquisition inspects profile
+journals before source revalidation or new profile creation. A held transition
+lock or live/permission-inconclusive recorded process group returns `LeaseActive`
+without signaling or deleting anything. This deliberately treats PID/group reuse
+as a safe false positive. Once the group is provably absent, a complete active
+journal is renamed and erased; an already renamed cleanup journal resumes erasure;
+an interrupted pre-`running.json` creation prefix is erased only when the
+transition lock is free and its exact prefix/identities validate. Unknown or
+corrupt metadata, replacement, a mount, or unsafe erasure returns
+`ArtifactTransaction` and preserves evidence. Recovery never sends a signal;
+operators terminate an orphaned trusted browser group and retry.
+
+At most one active, cleanup, or interrupted-prefix journal may exist because a
+new version/measurement journal is never created until the preceding one is
+terminal. Recovery first enumerates and validates the complete journal-level
+inventory without mutation. A second journal or any unknown member is
+`ArtifactTransaction` with every byte preserved; one valid dead journal is then
+recovered through its deterministic primitive trace.
+
+The profile subtree is opaque browser output only below the bound `profile/`
+directory. A dedicated descriptor-relative eraser enumerates raw OS names,
+never follows symlinks, holds/revalidates every opened directory identity,
+refuses mount/device changes, unlinks non-directories, removes directories
+deepest-first, and supports non-UTF-8 names. It is unavailable for any other
+namespace. Unknown journal-level members remain errors. Read-only checks never
+traverse or recover profiles; any active/cleanup/prefix profile state is
+`Verification`.
+
+The SR-04.2 observer also traces every profile directory/metadata temporary,
+write, sync, publication, transition-lock boundary, running publication,
+active-to-cleanup rename, raw entry unlink/rmdir, and parent sync. Fresh-process
+recovery is interrupted at every recorded prefix; the oracle is either a live
+group with byte-identical evidence or a dead group with complete idempotent
+cleanup, never guessed deletion.
+
+Named synthetic tests are
+`layout_profile_normal_close_is_terminal`,
+`layout_profile_launch_failure_is_terminal`,
+`layout_profile_forced_group_kill_is_terminal`,
+`layout_profile_parent_crash_live_group_blocks`,
+`layout_profile_parent_crash_dead_group_recovers`,
+`layout_profile_transition_lock_closes_launch_race`,
+`layout_profile_cleanup_every_prefix_recovers`,
+`layout_profile_opaque_entries_never_escape`,
+`layout_profile_cleanup_failure_preserves_evidence`,
+`layout_dependency_panic_maps_to_process`,
+`layout_profile_panic_resumes_after_cleanup`, and
+`layout_profile_panic_retains_cleanup_evidence`. They use a crate-owned fake
+browser mode in the current test binary to exercise real supervisor processes,
+process groups, locks, restart, and repeated recovery; deterministic injected
+clock/probe adapters avoid wall-clock timeout waits and cover
+permission/inconclusive probes. They never launch Chromium or any unowned
+executable.
 
 ## SR-04 Shared-Core Correction Contract
 
@@ -373,20 +592,48 @@ explicit checkout pin, object, or immutable-snapshot mismatch returns
 `SourceVerification` before lease.
 
 Read-only checks acquire and finish only `GenerationCheck`. An active exclusive
-lease returns `LeaseActive`; abandoned, resumable, or malformed coordination/
-transaction evidence returns `ArtifactTransaction`. A check never bootstraps,
-recovers, removes, or otherwise repairs that state.
+lease, live profile group, transition lock, abandoned/resumable journal, malformed
+coordination metadata, or coordination appearing during the check returns
+`Verification`, preserving the existing check-error classification. A check never
+returns `LeaseActive` or `ArtifactTransaction` for coordination state and never
+bootstraps, recovers, removes, signals, or otherwise repairs it.
 
 Failure state is determined by the actual durable boundary, not by whether the
 public call returned `Err`:
 
 | Failure point | Visible final generation | Residue | Returned kind |
 | --- | --- | --- | --- |
-| CLI/manifest/source/namespace/capability validation before lease | prior absent/current tree | none created by the command | owning `Cli`, `InvalidManifest`, `SourceVerification`, `InvalidPath`, or `UnsupportedPlatform` kind |
-| lease/bootstrap/recovery before transaction intent | prior tree | only a valid coordination state that later acquisition can inspect; no publication journal | `LeaseActive` or owning transaction/I/O kind |
+| CLI/manifest/inventory/source/namespace/capability or required-import validation before lease | prior absent/current tree | none created by the command | owning `Cli`, `InvalidManifest`, `InvalidInventory`, `SourceVerification`, `InvalidPath`, `UnsupportedPlatform`, or `Verification` kind |
+| read-only coordination acquisition/finish | prior tree | byte-identical coordination/profile state | `Verification`; underlying safe I/O/parse context retained in its diagnostic/source |
+| mutation lease/bootstrap/profile recovery before publication intent | prior tree | active live evidence preserved; dead valid profile state either fully cleaned or retained as resumable cleanup evidence | `LeaseActive` for a held lease/transition or live/permission-inconclusive recorded group; `ArtifactTransaction` for corrupt metadata or unclassifiable recovery/cleanup; safe source retained |
 | after intent but before commit, with synchronous recovery successful | absent for exclusive or complete old for swap | no transaction residue | original owning error kind |
 | commit completed but root sync/outcome/cleanup fails, with recovery successful | complete new | no residue after successful recovery | `ArtifactTransaction` because commit occurred |
 | any recovery or cleanup cannot safely complete | absence/old/new dictated by the commit oracle | valid resumable evidence retained | `ArtifactTransaction` containing operation and recovery context |
+
+Layout generation has this additional exact pre-publication matrix. Every row
+retains the prior XML/report generation because artifact intent is constructed
+only after browser/profile terminalization:
+
+| Boundary/outcome | Returned behavior | Coordination/profile state at return | Lease/source precedence |
+| --- | --- | --- | --- |
+| launch-switch/profile grammar validation | `InvalidManifest` before lease | none | validation error is primary |
+| browser cache/path/type/digest identity validation | `InvalidPath` for initial path/type/alias policy or `SourceVerification` for pre-spawn or post-terminalization drift from the verified executable | none | validation error is primary |
+| profile-journal creation/registration fails before external launch | `ArtifactTransaction` with I/O source | exact valid prefix retained if it cannot be synchronously erased | lease released only after recovery/retention decision |
+| `<browser> --version` cannot spawn, exits nonzero, times out, or emits non-UTF-8 | `Process` with process/I/O source | group absent; profile fully erased, or cleanup overrides as below | original `Process` survives successful cleanup |
+| normalized version output differs from manifest | `SourceVerification` | group absent; profile fully erased, or cleanup overrides as below | mismatch survives successful cleanup |
+| capsule/supervisor/browser launch, DevTools discovery/connection, or handler task fails | `Process` with original source | owned group is closed or group-killed/reaped and profile erased; otherwise active evidence remains | successful terminalization preserves `Process`; live/inconclusive terminalization remains `Process` with cleanup context |
+| one job fails but retry/report classification completes | cleanable diagnostic state | group reaped and profile erased before any plan | full run may publish `DiagnosticFull` then returns `Generation`; filtered/incomplete diagnostic returns `Generation` without intent |
+| measurement/report derivation fails before a complete diagnostic result | `Generation` | group reaped and profile erased | no publication intent |
+| close/wait requires forced group kill and succeeds | original job/launch/handler result | no profile journal | forced fallback alone does not replace the primary result |
+| group signal/wait/probe remains live, permission-denied, or inconclusive | `Process` with primary plus terminalization context | active journal/profile and group record preserved | lease is released; next mutation returns `LeaseActive` or `ArtifactTransaction`; checks return `Verification` |
+| group is dead but active-to-cleanup rename or opaque erase fails | `ArtifactTransaction` with primary plus cleanup context and safe I/O source | cleanup journal preserved | cleanup failure overrides an ordinary semantic error; next mutation resumes cleanup |
+| unexpected internal panic | resume original panic payload after the same terminalization attempt | clean, active, or cleanup evidence exactly as above | no `GeneratorError` is fabricated; next access observes retained evidence |
+
+For all ordinary-error rows, if profile/group cleanup is complete the layout lease
+is released before return. If durable evidence must remain, the lease is still
+released only after that evidence is synced, so a later mutation can apply the
+stated recovery rule. No browser/profile residue can coexist with artifact
+transaction intent.
 
 No domain matrix may promise byte-identical old output after a post-commit
 failure. Repeating acquisition/recovery must preserve the committed new tree and
@@ -446,9 +693,11 @@ The layout feature has intentional compile-time/binary-size cost from the browse
 protocol/runtime graph; isolation behind `required-features` keeps that graph out
 of default and CSS-only builds. No compiled-size budget or measurement tool is
 configured, so no new tool is introduced. Coordination/runtime cost is one
-domain mutex, one private runtime thread, one handler task per browser, bounded
-batches from the manifest, and one profile per active browser; all are terminal
-before return. CSS adds no dependency or runtime thread.
+domain mutex, one private runtime thread, one handler task and internal supervisor
+process per browser, bounded batches from the manifest, and one profile per
+batch/retry attempt. Successful/ordinary-error returns are terminal; an
+unresolved process group or durable cleanup failure follows SR-03.3 and blocks or
+is recovered by the next mutation. CSS adds no dependency or runtime thread.
 
 The installed advisory database is offline and may be stale; `cargo audit
 --no-fetch --stale` is a fail-on-reported-advisory gate, not a claim of current
@@ -590,22 +839,35 @@ The binaries are each at most fifteen physical lines. They call the correspondin
 `surgeist-css-generate: <error>` once, and exit only through
 `GeneratorError::exit_code`.
 
-`run_from_env` reads `args_os` and no configuration environment variable. Flag
-and command names must be UTF-8; owner/corpus/source roots retain OS-native path
-bytes; browser/filter values must convert to checked UTF-8 `RelativePath`.
+For an interface invocation, `run_from_env` reads `args_os` and no operator
+configuration environment variable. The layout front door first detects the one
+private SR-03.3 launch-capsule key; it enters supervisor mode only after the
+capsule validates against a live journal and otherwise treats that key as `Cli`
+without external launch. Flag and command names must be UTF-8;
+owner/corpus/source roots retain OS-native path bytes; browser/filter values must
+convert to checked UTF-8 `RelativePath`.
 Unknown/duplicate flags, missing values, repeated positionals, invalid command,
 or command-option mismatch returns `Cli` before domain I/O. Filesystem absence,
 canonicalization, identity, manifest, and source failures retain their domain
 error kinds.
 
+The packaged layout binary is also the only production supervisor host. Before
+a `Generate` request acquires resources, `layout::run` requires the canonical
+current executable's file name to be exactly `surgeist-layout-generate`; another
+host returns `Generation`. `run_from_env` is therefore the normal production
+entry for generation. Check/import requests remain directly library-callable,
+and synthetic process tests use only a crate-private injected test host. No
+third Cargo binary target or discoverable internal CLI mode exists.
+
 Layout `run` spawns one named private worker thread. Spawn or Tokio runtime-build
 failure is `Generation` before resource acquisition. The worker owns a
 multi-thread Tokio runtime and a terminal-resource registry. External-input
-errors never panic. An unexpected internal panic is caught inside the worker,
-all registered browser/handler/profile/lease resources are terminalized
-idempotently, and the original panic payload is resumed on the caller after
-join; it is not mislabeled as success or an input error. A normal join returns
-the semantic result only after cleanup. CSS `run` is synchronous and threadless.
+errors never panic. An unexpected internal panic is caught inside the worker;
+SR-03.3 terminalization runs idempotently; the original panic payload is resumed
+on the caller after join; and any cleanup failure remains in its durable profile
+journal for next-acquisition recovery. It is not mislabeled as success or an
+input error. A normal join returns the exact SR-04.5 result only after cleanup.
+CSS `run` is synchronous and threadless.
 
 ## SR-06 Layout Domain Contract
 
@@ -682,12 +944,12 @@ expected_count = 1103
 excluded_destination_dirs = ["grid-lanes", "subgrid"]
 
 [[cases]]
-id = "<unique canonical id>"
-source_root = "surgeist"
-source = "<strict .html path below html>"
+id = "<unique exact string; trimmed-nonempty only for surgeist>"
+source_root = "<surgeist-or-taffy>"
+source = "<unique strict relative path>"
 generator = "constrained-html"
 status = "active"
-# reason exists only for non-active status
+# reason is optional for every status
 ```
 
 The angle-bracket strings above are grammar notation, not accepted literal
@@ -696,25 +958,64 @@ manifest field relative to the preserved source. `batch_size` is a positive
 `usize`; navigation timeout and polling interval are positive `u64` values;
 disposition/report counts are nonnegative `usize` values; `retry_count` and all
 lifecycle strings/booleans are exactly the shown values. `arguments` contains
-exactly 28 unique entries, includes `use-mock-keychain`, and satisfies SR-03.2's
-redirect restrictions. The two excluded destination directories are exactly the
-shown unique set in either order. The Taffy repository, revision, source
-directory, pre-exclusion count, destination, source-root kinds/paths, and upstream
-commit are exact.
+exactly 28 entries whose normalized keys are unique, includes normalized
+`use-mock-keychain`, and satisfies SR-03.2's switch restrictions. The two
+excluded destination directories are exactly the shown unique set in either
+order. The Taffy repository, revision, source directory, pre-exclusion count,
+destination, source-root kinds/paths, and upstream commit are exact.
 
 Paths are strict normalized relative paths. `cache_root` resolves beneath owner
 and outside corpus; the CLI browser executable resolves beneath that exact cache
 root. Report files are unique one-component JSON names; full is exactly
 `all.json`; scoped filters/files are unique. Taffy and Surgeist share the `html`
-physical root but have disjoint manifest ownership. Every authored Surgeist file
-appears exactly once in `cases`; imported Taffy files come only from the verified
-sidecar. Unknown HTML entries fail inventory validation.
+physical root but have disjoint manifest ownership. Case IDs are unique by exact
+UTF-8 bytes and case sources are unique after `RelativePath` parsing. A
+`source_root = "surgeist"` ID must be nonempty after trimming, its source ends in
+`.html`, and its record owns that authored file. A `source_root = "taffy"` record
+may have any ID, status, reason, and strict source path; exactly as in the
+preserved implementation, it is a compatibility/uniqueness record with no
+fixture-ownership, filtering, disposition, or report effect. `source_root =
+"html"` and every other value are rejected. `generator` is exactly
+`constrained-html`; status is exactly `active`, `expected-fail`, `unsupported`, or
+`quarantined`; reason is absent or any UTF-8 string. Imported Taffy ownership
+comes only from the verified sidecar. Every non-Taffy HTML file appears exactly
+once as a Surgeist case; unknown HTML entries fail inventory validation.
 
-Compatibility classification is backward-compatible schema 2 with two explicit
-security tightenings: duplicate launch/exclusion entries and path-redirecting
-launch arguments formerly admitted by loose validation are rejected. No browser
-pin field or schema 3 is introduced. Exact preserved-schema fixtures and a
-full-field TOML golden must parse to the same domain values and launch digest.
+Layout disposition accounting remains in shared core through a crate-private
+`PreservedLayoutDisposition` adapter; the stricter public
+`CaseDispositionRecord` contract does not change. The adapter retains the exact
+manifest ID/source/status. An active case ignores an optional declared reason.
+For a non-active case, a present reason is emitted byte-for-byte, including an
+empty or padded string; an absent reason becomes exactly `manifest marks case
+expected-fail`, `manifest marks case unsupported`, or `manifest marks case
+quarantined`. These are the preserved report rules. Case-array order has no
+semantic effect; generation/report ordering remains fixture/variant sorted.
+
+Compatibility is **canonical-schema-2 compatible**, not acceptance-set fully
+backward-compatible. No required field, source-root spelling, lifecycle literal,
+case ID/reason rule, Taffy compatibility-record behavior, launch digest, browser
+pin field, or schema version changes. The complete and only deliberate
+tightenings of inputs formerly accepted by the loose parser are:
+
+1. case sources must already be strict normalized `RelativePath` strings; legacy
+   spellings containing `.` components are rejected instead of normalized;
+2. the Taffy exclusion vector contains each of the exact two values once;
+3. launch strings undergo SR-03.2 normalization and reject duplicate normalized
+   keys, non-printable/path-bearing strings, driver-owned or redirecting keys,
+   and malformed leading-hyphen forms. One optional leading `--` is normalized
+   before invocation while the raw manifest spelling remains in the digest.
+
+Named compatibility fixtures are
+`layout_schema2_preserves_taffy_compatibility_records`,
+`layout_schema2_preserves_raw_ids_and_reason_defaults`,
+`layout_schema2_rejects_html_source_root`,
+`layout_schema2_rejects_duplicate_ids_and_sources`,
+`layout_schema2_rejects_only_declared_tightenings`,
+`layout_schema2_launch_digest_preserves_manifest_order`, and
+`layout_schema2_launch_switch_set_is_order_independent`. Each acceptance fixture
+is run through both a preserved-parser test adapter and the new parser/effective
+representation; rejection fixtures name the one deliberate divergence. A
+full-field TOML golden fixes all domain values and launch digest.
 
 The preserved launch digest is lowercase SHA-256 of the exact bytes returned by
 `serde_json::to_vec` for this tuple, with no final LF:
@@ -736,15 +1037,18 @@ The preserved launch digest is lowercase SHA-256 of the exact bytes returned by
 )
 ```
 
-No sorting is applied to launch arguments because manifest order is part of the
-preserved digest and browser invocation.
+No sorting is applied before this digest because raw manifest order is preserved.
+Invocation uses only the normalized unordered semantic set from SR-03.2.
 
 The Taffy sidecar is an artifact migration, not a manifest migration. A legacy
 schema-2 corpus without it returns `Verification` from generate/check with the
 instruction to run `import-taffy --source-root ...`; import atomically adds the
 sidecar while preserving authored HTML. A future layout-owned adoption must run,
-review, and commit that one corpus migration before switching its scripts. This
-repository never performs that sibling migration.
+review, and commit that one corpus migration before switching its scripts. It
+also runs the named schema-2 compatibility fixtures against its owned manifest;
+if that manifest hits one of the three declared tightenings, the layout-owned
+handoff must review and commit the corresponding normalization before adoption.
+This repository never performs either sibling migration.
 
 ### SR-06.2 Taffy import and offline proof
 
@@ -838,9 +1142,12 @@ The publication matrix is exact:
 | Run outcome | Policy/result | Artifacts | Stale/unknown behavior |
 | --- | --- | --- | --- |
 | Full, every browser job reaches a classified generated/unsupported result and no lifecycle failure | `CleanFull`, then `Ok` | all generated XML plus every full/scoped report | remove only manifest-classified nonretained XML/report paths; unknown entry fails before intent |
-| Full, one or more jobs exhaust retry but supervisor reaches terminal cleanup and a complete diagnostic report exists | `DiagnosticFull`, install, then return `Generation` | successful XML plus all diagnostic reports with failed entries | preserve every existing unmatched classified XML/report; unknown entry fails |
+| Full, one or more jobs exhaust retry but SR-03.3 terminalization succeeds and a complete diagnostic report exists | `DiagnosticFull`, install, then return `Generation` | successful XML plus all diagnostic reports with failed entries | preserve every existing unmatched classified XML/report; unknown entry fails |
 | Filtered, all selected jobs succeed/classify | `Filtered`, then `Ok` | selected generated XML only | write no report; preserve every other XML/report; remove nothing |
-| Filtered job failure, validation failure, browser/version failure, panic cleanup failure, or incomplete report before plan construction | no plan/install; return semantic error | none | prior generated tree remains |
+| Validation before lease | no plan/install; exact pre-lease kind from SR-04.5 | none | prior generated tree remains; no profile exists |
+| Version/launch/handler/filtered-job/incomplete-report failure with successful profile terminalization | no plan/install; `SourceVerification`, `Process`, or `Generation` exactly per SR-04.5 | none | prior generated tree remains; no profile residue |
+| Browser/profile terminalization failure | no plan/install; `Process` or `ArtifactTransaction` exactly per SR-04.5 | none | prior generated tree remains; active/cleanup evidence retained |
+| Unexpected internal panic | no plan/install; original payload resumed after terminalization attempt | none | prior generated tree remains; any cleanup evidence retained |
 | Artifact transaction fails before commit and synchronous recovery succeeds | error per SR-04.5 | none installed | prior absent/old tree remains; no transaction residue |
 | Artifact transaction commits but root sync/outcome/cleanup reports failure | return `ArtifactTransaction` | complete new XML/report set remains visible | recovery completes or retains valid resumable evidence; never restore old |
 
@@ -855,8 +1162,9 @@ provenance, and absence of unknown entries.
 
 Browser-independent synthetic adapters and byte goldens cover HTML injection,
 URLs, four-variant mapping, measurement conversion, XML, reports, retry,
-clean/diagnostic/filtered matrices, profile cleanup, and CLI errors. No test
-launches or downloads a browser or reads a sibling corpus.
+clean/diagnostic/filtered matrices, the full SR-03.3 supervisor/profile lifecycle,
+and CLI errors. No test launches or downloads a browser or reads a sibling
+corpus.
 
 ### SR-06.4 Preservation retirement
 
@@ -1051,8 +1359,15 @@ The existing non-exhaustive `GeneratorErrorKind` set remains stable. Malformed
 syntax/option matrices map to `Cli`; manifest schema to `InvalidManifest`;
 fixture/current-tree shape to `InvalidInventory`; pin/snapshot drift to
 `SourceVerification`; unsupported mutation target to `UnsupportedPlatform`;
-lease/process/transaction/generation/check failures retain their existing kinds.
-Safe I/O/process sources are preserved. External input never asserts or panics.
+mutation contention/live recorded groups to `LeaseActive`; browser spawn,
+version execution, DevTools, handler, signal, and wait failures to `Process`;
+job/diagnostic derivation failures to `Generation`; artifact/profile corruption
+or failed durable recovery/cleanup to `ArtifactTransaction`; and known stale,
+absent, active, or malformed coordination observed by a read-only check to
+`Verification`. A version-output mismatch is `SourceVerification`; an ordinary
+filesystem operation outside a durable transaction remains `Io`. Exact
+post-commit and cleanup precedence is SR-04.5. Safe I/O/process sources are
+preserved. External input never asserts or panics.
 
 Focused parser tests construct real `Cli` errors and require exit code 64. Each
 binary integration test invokes invalid syntax, observes only its exact prefixed
@@ -1068,7 +1383,9 @@ corpus ownership, Apple-Silicon macOS mutation support versus portable default
 value/read compilation, offline checking, and the fact that production crates do
 not normally depend on this tooling crate. They identify Chromium as a trusted
 external executable capability outside generator-owned filesystem containment
-and explain the one-time Taffy-sidecar migration. They do not call the crate a
+with a fixed cleared environment, explain internal supervisor/profile recovery
+and the operator action for a still-live orphan group, and explain the one-time
+Taffy-sidecar/schema-tightening adoption checks. They do not call the crate a
 scaffold or claim sibling integration completed.
 
 ### SR-08.3 Final offline matrix
@@ -1107,13 +1424,17 @@ remote readback.
 The implementation sequence must allocate each SR section and baseline finding
 to exactly one bounded closure cycle, keep shared-core correction ahead of domain
 use, keep layout preservation retirement inside layout closure, and leave final
-documentation/plan cleanup until both features are executable. The
+documentation/handoff normalization until both features are executable. The
 `surgeist-agent` skill is the sole execution and publication authority; this
 specification does not restate or redefine that gate.
 
-The terminal tree retains canonical `plans/.gitkeep` and the reviewed
-specification, sequence, cycle, review, and evidence paths required by the
-candidate handoff. The handoff names each path and reviewed revision together
-with the immutable published leaf SHA and exact feature/command/verification
-contract; root and sibling adoption remain separate future work. Execution-
-resource cleanup remains solely governed by `surgeist-agent`.
+The terminal tree retains canonical `plans/.gitkeep`, the already committed
+baseline review, and only the reviewed specification, implementation-sequence,
+and cycle-plan paths required by the candidate handoff. Planning-review verdicts,
+worker/reviewer transcripts, command evidence, and handoff chatter remain
+task-local and are embedded in the canonical candidate record; they are not
+persisted as additional planning documents. The handoff names each canonical
+planning path and reviewed revision together with the immutable published leaf
+SHA and exact feature/command/verification contract. Root and sibling adoption
+remain separate future work. Execution-resource cleanup remains solely governed
+by `surgeist-agent`.
