@@ -992,7 +992,33 @@ fn forbidden_config_record(key: &str, value: &str) -> bool {
         || credential_helper
         || key.starts_with("protocol.")
         || remote_exec
-        || (key.starts_with("remote.") && key.ends_with(".url") && value.contains("::"))
+        || (key.starts_with("remote.")
+            && key.ends_with(".url")
+            && selects_custom_remote_helper(value))
+}
+
+fn selects_custom_remote_helper(value: &str) -> bool {
+    if value
+        .split_once("::")
+        .is_some_and(|(transport, _)| is_git_transport_name(transport))
+    {
+        return true;
+    }
+    value.split_once("://").is_some_and(|(transport, _)| {
+        is_git_transport_name(transport)
+            && !matches!(
+                transport,
+                "file" | "git" | "ssh" | "http" | "https" | "ftp" | "ftps"
+            )
+    })
+}
+
+fn is_git_transport_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
 }
 
 fn require_config_origin(
@@ -2384,6 +2410,133 @@ mod tests {
 
         let error = verify_git_source(directory.path(), &pin(&origin, revision, "fixtures"))
             .expect_err("disabled config.worktree must fail closed");
+        assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+    }
+
+    #[test]
+    fn local_config_rejects_unknown_transport_remote_helper_before_sentinel_runs() {
+        let (directory, origin, revision) = repository();
+        let marker = directory.path().join("remote-helper-ran");
+        let helper_url = format!("sentinel://{}", marker.display());
+        run_git(
+            directory.path(),
+            &[
+                OsStr::new("config"),
+                OsStr::new("remote.sentinel.url"),
+                OsStr::new(&helper_url),
+            ],
+        );
+
+        let result = verify_git_source(directory.path(), &pin(&origin, revision, "fixtures"));
+        assert!(!marker.exists(), "remote helper sentinel was executed");
+        let error = result.expect_err("unknown transport remote helper must fail closed");
+        assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+    }
+
+    #[test]
+    fn ordinary_remote_url_forms_remain_inert_and_accepted() {
+        let (directory, origin, revision) = repository();
+        for (name, url) in [
+            ("https", "https://example.invalid/other.git"),
+            ("http", "http://example.invalid/other.git"),
+            ("ssh", "ssh://git@example.invalid/other.git"),
+            ("git", "git://example.invalid/other.git"),
+            ("ftp", "ftp://example.invalid/other.git"),
+            ("ftps", "ftps://example.invalid/other.git"),
+            ("file", "file:///tmp/other.git"),
+            ("scp", "git@example.invalid:/other.git"),
+            ("local", "/tmp/other.git"),
+            ("colon", "./relative::local.git"),
+        ] {
+            let key = format!("remote.{name}.url");
+            run_git(
+                directory.path(),
+                &[OsStr::new("config"), OsStr::new(&key), OsStr::new(url)],
+            );
+        }
+
+        verify_git_source(directory.path(), &pin(&origin, revision, "fixtures"))
+            .expect("ordinary Git remote URL forms remain inert");
+    }
+
+    #[test]
+    fn custom_remote_helper_selector_uses_git_transport_grammar() {
+        for value in [
+            "sentinel://payload",
+            "sentinel+v1://payload",
+            "sentinel-v1://payload",
+            "sentinel.v1://payload",
+            "1sentinel://payload",
+            "Sentinel://payload",
+            "sentinel::payload",
+            "https:://payload",
+        ] {
+            assert!(
+                super::selects_custom_remote_helper(value),
+                "missed custom remote-helper selector {value:?}"
+            );
+        }
+        for value in [
+            "file:///tmp/repository.git",
+            "git://example.invalid/repository.git",
+            "ssh://git@example.invalid/repository.git",
+            "http://example.invalid/repository.git",
+            "https://example.invalid/repository.git",
+            "ftp://example.invalid/repository.git",
+            "ftps://example.invalid/repository.git",
+            "git@example.invalid:/repository.git",
+            "/tmp/repository::copy.git",
+            "./relative::repository.git",
+            "https://example.invalid/repository::copy.git",
+            "sentinel_name://payload",
+        ] {
+            assert!(
+                !super::selects_custom_remote_helper(value),
+                "rejected ordinary or non-helper Git URL form {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn linked_worktree_config_rejects_unknown_transport_remote_helper_before_sentinel_runs() {
+        let (directory, origin, revision) = repository();
+        run_git(
+            directory.path(),
+            &[
+                OsStr::new("config"),
+                OsStr::new("extensions.worktreeConfig"),
+                OsStr::new("true"),
+            ],
+        );
+        let linked_parent = TestDirectory::new("linked-helper");
+        let linked = linked_parent.path().join("linked");
+        run_git(
+            directory.path(),
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("--quiet"),
+                OsStr::new("--detach"),
+                linked.as_os_str(),
+                OsStr::new("HEAD"),
+            ],
+        );
+        let marker = linked_parent.path().join("remote-helper-ran");
+        let helper_url = format!("sentinel://{}", marker.display());
+        run_git(
+            &linked,
+            &[
+                OsStr::new("config"),
+                OsStr::new("--worktree"),
+                OsStr::new("remote.sentinel.url"),
+                OsStr::new(&helper_url),
+            ],
+        );
+
+        let result = verify_git_source(&linked, &pin(&origin, revision, "fixtures"));
+        assert!(!marker.exists(), "remote helper sentinel was executed");
+        let error =
+            result.expect_err("worktree-scoped unknown transport remote helper must fail closed");
         assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
     }
 
