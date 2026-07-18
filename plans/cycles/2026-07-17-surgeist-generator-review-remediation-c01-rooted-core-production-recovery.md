@@ -14,15 +14,15 @@
   tests**, and the pre-existing portion of **Quality matrix**; SR-04.1 through
   SR-04.4; the transaction, lease, bootstrap, owner-record, rename-probe, and
   shared error clauses of SR-04.5; and the current-core clauses of SR-04.6; at
-  commit `7f482badb807675bf1d30b6f1cbf39c6d01297e6`, normalized semantic-content
+  commit `66fa0cb31521bd03bfb240396ff8d900ee9f9d24`, normalized semantic-content
   SHA-256
-  `eb40f1a16781f59c119a1eb7c50e79a1e0c130d3b1c144be6528922fea721f82`,
+  `da98c3d8047cc696ea0ca96e81858c5f9ac16acac1ab367263ec0e83d6537253`,
   review `CLEAN`.
 - Reviewed implementation sequence:
   `plans/sequences/2026-07-17-surgeist-generator-review-remediation.md`, entry
-  C01, at commit `cb341baf0f1f18877bedbc960878b1b7a37d9acb`, normalized
+  C01, at commit `ec56226ae94b4de2049f4c2803c56590027e6cb3`, normalized
   semantic-content SHA-256
-  `25ec1764d2252d981c4113a89c21e27e4a86ed0667f51286d5d80cd8f4d872f1`,
+  `d7c41ac55064ff4efad6fb6f0b63f58f44b124a058cfdc0f7406dbeeab10e398`,
   review `CLEAN`.
 - Bounded outcome: correct rooted absence handling, replace model-only
   transaction/bootstrap assurances with exhaustive failure injection through the
@@ -48,12 +48,12 @@
 - Owned Rust remains free of executable `unsafe`; strict exact-name, no-follow,
   same-mount, identity, type, ownership, and mode checks may not be weakened to
   make absence or recovery tests pass.
-- Current source evidence is the immutable implementation-series tree: the diff
-  from that source base through the cycle base contains planning files only. The
-  committed baseline records ten lease/artifact failures at the just-created
-  `leases` path, model-only transaction/bootstrap tests, one identity `map_err`,
-  rustfmt deltas, and WASM warnings. No implementation test is rerun during plan
-  authorship.
+- The cycle base remains planning-only. C01-T01 and C01-T02 are task-clean at
+  `20c55499a3e0485f1f8dabbd93b0459e05250720` and
+  `135e1a6afabe09f739e16e1bde8395fd46ef7d4c`. C01-T03 has an unreviewed initial
+  worker span `135e1a6afabe09f739e16e1bde8395fd46ef7d4c..3080113df920862302b397d7cfb84e28c72578c0`;
+  a fresh worker must reconcile its ordinary exhaustive tests with this amended
+  plan before task review. No implementation test runs during this correction.
 - The supported mutation host is `Darwin arm64`; portable default-library
   verification is warning-denied `wasm32-unknown-unknown`. Unsupported targets
   retain their semantic stop before mutation.
@@ -61,6 +61,12 @@
   test sentinel. The exhaustive harness is instance-scoped and `#[cfg(test)]`;
   a test interruption unwinds only with a private sentinel so production error
   recovery cannot consume it as an ordinary failure.
+- Every test that enumerates each real event, byte, or recovery prefix is marked
+  `#[ignore = "exhaustive opt-in diagnostic"]`. Ordinary Cargo test matrices
+  compile but never execute these diagnostics; named focused commands execute
+  them only with libtest `--ignored`, and an ignored-test listing proves the
+  classification. A named diagnostic command must execute its expected nonzero
+  test count; a successful zero-test filter is a verification failure.
 - The artificial `private_front_doors_are_linked` references remain until real
   domain callers replace them in later cycles. C01 may not delete them merely to
   satisfy dead-code checks.
@@ -176,14 +182,17 @@
   leaves no owned residue, and is stable on repetition; corruption/unknown/
   identity-replacement evidence is preserved as `ArtifactTransaction`; a
   post-commit operational or cleanup failure cannot restore old output. The old
-  protocol table may remain only as supplementary ordering documentation.
+  protocol table may remain only as supplementary ordering documentation. Both
+  exhaustive prefix enumerators are ignored diagnostics; corruption and
+  post-commit tests remain ordinary.
 - Commands:
-  - `cargo test --locked --offline -p surgeist-generator --lib transaction_install_every_prefix`
-  - `cargo test --locked --offline -p surgeist-generator --lib transaction_recovery_every_prefix`
+  - `cargo test --locked --offline -p surgeist-generator --lib transaction_install_every_prefix -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib transaction_recovery_every_prefix -- --ignored`
   - `cargo test --locked --offline -p surgeist-generator --lib transaction_corruption_preserves_evidence`
   - `cargo test --locked --offline -p surgeist-generator --lib transaction_post_commit_failure`
   - `cargo test --locked --offline -p surgeist-generator --lib core::artifact::tests`
   - `cargo test --locked --offline -p surgeist-generator --no-default-features`
+  - `cargo test --locked --offline -p surgeist-generator --lib -- --ignored --list`
   - `cargo clippy --locked --offline -p surgeist-generator --no-default-features --all-targets -- -F unsafe-code -D warnings`
   - `cargo fmt --check`
 - Dependencies: C01-T02 is task-clean.
@@ -213,10 +222,10 @@
   corruption/live-owner evidence remains; every recoverable prefix completes and
   is idempotent without replacing the winner.
 - Commands:
-  - `cargo test --locked --offline -p surgeist-generator --lib bootstrap_header_every_byte_prefix`
-  - `cargo test --locked --offline -p surgeist-generator --lib bootstrap_uncontended_every_prefix`
-  - `cargo test --locked --offline -p surgeist-generator --lib bootstrap_winner_held_every_prefix`
-  - `cargo test --locked --offline -p surgeist-generator --lib bootstrap_winner_released_every_prefix`
+  - `cargo test --locked --offline -p surgeist-generator --lib bootstrap_header_every_byte_prefix -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib bootstrap_uncontended_every_prefix -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib bootstrap_winner_held_every_prefix -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib bootstrap_winner_released_every_prefix -- --ignored`
   - `cargo test --locked --offline -p surgeist-generator --lib core::lease::tests`
   - `cargo test --locked --offline -p surgeist-generator --no-default-features`
   - `cargo clippy --locked --offline -p surgeist-generator --no-default-features --all-targets -- -F unsafe-code -D warnings`
@@ -250,8 +259,8 @@
   probe, or revalidation failure creates no owner transaction, preserves the
   historical owner, releases the mutex, and returns no guard.
 - Commands:
-  - `cargo test --locked --offline -p surgeist-generator --lib owner_record_install_every_prefix`
-  - `cargo test --locked --offline -p surgeist-generator --lib owner_record_recovery_every_prefix`
+  - `cargo test --locked --offline -p surgeist-generator --lib owner_record_install_every_prefix -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib owner_record_recovery_every_prefix -- --ignored`
   - `cargo test --locked --offline -p surgeist-generator --lib owner_record_corruption_preserves_evidence`
   - `cargo test --locked --offline -p surgeist-generator --lib lease_revalidation_failure_preserves_historical_owner`
   - `cargo test --locked --offline -p surgeist-generator --lib lease_owner_install_begins_only_after_revalidation`
@@ -284,13 +293,13 @@
   mount states preserve evidence; the next acquisition recovers before re-probe
   and owner installation.
 - Commands:
-  - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_install_every_prefix`
-  - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_exclusive_unsupported_every_prefix`
-  - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_swap_unsupported_every_prefix`
+  - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_install_every_prefix -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_exclusive_unsupported_every_prefix -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_swap_unsupported_every_prefix -- --ignored`
   - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_unsupported_cleanup_failure`
-  - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_recovery_every_prefix`
+  - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_recovery_every_prefix -- --ignored`
   - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_corruption_preserves_evidence`
-  - `cargo test --locked --offline -p surgeist-generator --lib lease_acquisition_recovers_owner_and_probe_prefixes`
+  - `cargo test --locked --offline -p surgeist-generator --lib lease_acquisition_recovers_owner_and_probe_prefixes -- --ignored`
   - `cargo test --locked --offline -p surgeist-generator --lib core::lease::tests`
   - `cargo test --locked --offline -p surgeist-generator --no-default-features`
   - `cargo clippy --locked --offline -p surgeist-generator --no-default-features --all-targets -- -F unsafe-code -D warnings`
@@ -305,7 +314,9 @@
   satisfies its visibility, residue, error, recovery, and idempotence oracle;
   the ten previously blocked lease/artifact tests reach their intended behavior;
   corrupt or unclassifiable evidence is retained; post-commit state is never
-  rolled back; and the C01 quality matrix is clean without public/domain changes.
+  rolled back; ordinary matrices report every exhaustive diagnostic ignored;
+  explicit diagnostic runs are clean; and the C01 quality matrix is clean
+  without public/domain changes.
 - Final command list:
   - `RUSTFLAGS="-D warnings" cargo check --locked --offline -p surgeist-generator --no-default-features`
   - `RUSTFLAGS="-D warnings" cargo check --locked --offline -p surgeist-generator --features layout-browser`
@@ -315,6 +326,7 @@
   - `cargo test --locked --offline -p surgeist-generator --features layout-browser`
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus`
   - `cargo test --locked --offline -p surgeist-generator --all-features`
+  - `cargo test --locked --offline -p surgeist-generator --all-features --lib -- --ignored --list`
   - `cargo clippy --locked --offline -p surgeist-generator --no-default-features --all-targets -- -F unsafe-code -D warnings`
   - `cargo clippy --locked --offline -p surgeist-generator --features layout-browser --all-targets -- -F unsafe-code -D warnings`
   - `cargo clippy --locked --offline -p surgeist-generator --features css-corpus --all-targets -- -F unsafe-code -D warnings`
@@ -325,11 +337,12 @@
   - `shasum -a 256 src/layout/legacy_generator.rs`
   - `git ls-files -co --exclude-standard -z -- '*.rs' ':(exclude)vendor/**' ':(exclude)target/**' | LC_ALL=C sort -zu | tr '\0' '\n'`
   - `! git ls-files -co --exclude-standard -z -- '*.rs' ':(exclude)vendor/**' ':(exclude)target/**' | LC_ALL=C sort -zu | xargs -0 rg -n --pcre2 '#\s*\[\s*(?:unsafe\s*\(|no_mangle\b|export_name\b)|\bunsafe\s*(?:\{|fn\b|trait\b|impl\b|extern\b)|\bstatic\s+mut\b|\bextern\s*(?:"[^"]*")?\s*\{' --`
-  - `cargo test --locked --offline -p surgeist-generator --lib transaction_install_every_prefix`
-  - `cargo test --locked --offline -p surgeist-generator --lib transaction_recovery_every_prefix`
-  - `cargo test --locked --offline -p surgeist-generator --lib bootstrap_`
-  - `cargo test --locked --offline -p surgeist-generator --lib owner_record_`
-  - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_`
+  - `cargo test --locked --offline -p surgeist-generator --lib transaction_install_every_prefix -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib transaction_recovery_every_prefix -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib bootstrap_ -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib owner_record_ -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_ -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib lease_acquisition_recovers_owner_and_probe_prefixes -- --ignored`
 - Required handoff: immutable published C01 SHA; exact ordered task ranges and
   clean reviews; real-prefix event/oracle counts; final command evidence;
   preservation digest; clean worktree; authority-remote main readback; and an
