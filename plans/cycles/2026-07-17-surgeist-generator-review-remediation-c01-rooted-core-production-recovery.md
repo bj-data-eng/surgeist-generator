@@ -64,6 +64,10 @@
 - The artificial `private_front_doors_are_linked` references remain until real
   domain callers replace them in later cycles. C01 may not delete them merely to
   satisfy dead-code checks.
+- Local policy names no authoritative generated-Rust root in this leaf. The
+  owned-Rust manifest therefore consists of every tracked and non-ignored
+  untracked `*.rs` path, including the preservation copy, while dependency/vendor
+  and build-cache roots are excluded.
 
 ## Impacts
 
@@ -319,7 +323,8 @@
   - `cargo fmt --check`
   - `git diff --check`
   - `shasum -a 256 src/layout/legacy_generator.rs`
-  - `! rg -n --glob '*.rs' '(^|[^[:alnum:]_])unsafe[[:space:]]*(fn|impl|trait|extern|\{|\()' src tests`
+  - `git ls-files -co --exclude-standard -z -- '*.rs' ':(exclude)vendor/**' ':(exclude)target/**' | LC_ALL=C sort -zu | tr '\0' '\n'`
+  - `! git ls-files -co --exclude-standard -z -- '*.rs' ':(exclude)vendor/**' ':(exclude)target/**' | LC_ALL=C sort -zu | xargs -0 rg -n --pcre2 '#\s*\[\s*(?:unsafe\s*\(|no_mangle\b|export_name\b)|\bunsafe\s*(?:\{|fn\b|trait\b|impl\b|extern\b)|\bstatic\s+mut\b|\bextern\s*(?:"[^"]*")?\s*\{' --`
   - `cargo test --locked --offline -p surgeist-generator --lib transaction_install_every_prefix`
   - `cargo test --locked --offline -p surgeist-generator --lib transaction_recovery_every_prefix`
   - `cargo test --locked --offline -p surgeist-generator --lib bootstrap_`
