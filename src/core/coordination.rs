@@ -2811,6 +2811,14 @@ mod tests {
                 .identity_of_handle(&adopted)
                 .expect("inspect adopted winner");
             assert!(winner_identity.matches_recovery(&adopted_identity));
+            let error = open_existing_lock(
+                &fixture.rooted(),
+                ACQUISITION_LOCK,
+                CoordinationAccess::Exclusive,
+                false,
+            )
+            .expect_err("adopted winner must remain exclusively held");
+            assert_eq!(error.kind(), GeneratorErrorKind::LeaseActive);
             drop(adopted);
         }
         fixture.assert_clean(Some(&winner_identity));
