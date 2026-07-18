@@ -41,10 +41,12 @@
   SHA-256
   `d2f5ca87cea6b36826e9172e2d7ba7a99196c375e2ca53f8a84a075200e70a9f`.
   It is not formatted, compiled, or tested.
-- No network, dependency/toolchain/target acquisition, browser/source process,
-  corpus generation, or system-wide mutation is permitted. Use only installed
-  Rust 1.97, the installed targets, and already-present Cargo caches with
-  `--locked --offline`.
+- No network is permitted during planning, implementation, or verification; no
+  dependency/toolchain/target acquisition, browser/source process, corpus
+  generation, or system-wide mutation is permitted. Canonical Git query, fetch,
+  push, and readback against this repository's authority remote are reserved only
+  for landing publication. All Cargo work uses installed Rust 1.97, installed
+  targets, and already-present caches with `--locked --offline`.
 - Owned Rust remains free of executable `unsafe`; strict exact-name, no-follow,
   same-mount, identity, type, ownership, and mode checks may not be weakened to
   make absence or recovery tests pass.
@@ -69,6 +71,10 @@
   them only with libtest `--ignored`, and an ignored-test listing proves the
   classification. A named diagnostic command must execute its expected nonzero
   test count; a successful zero-test filter is a verification failure.
+- The 15 fully qualified diagnostic commands under Completion are the exact C01
+  ignored inventory. After T03, T04, T05, and T06, `--ignored --list` must equal
+  respectively the applicable cumulative 2, 6, 9, and 15 names with no extra or
+  missing test; every exact diagnostic command must execute exactly one test.
 - The artificial `private_front_doors_are_linked` references remain until real
   domain callers replace them in later cycles. C01 may not delete them merely to
   satisfy dead-code checks.
@@ -188,8 +194,8 @@
   exhaustive prefix enumerators are ignored diagnostics; corruption and
   post-commit tests remain ordinary.
 - Commands:
-  - `cargo test --locked --offline -p surgeist-generator --lib transaction_install_every_prefix -- --ignored`
-  - `cargo test --locked --offline -p surgeist-generator --lib transaction_recovery_every_prefix -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::transaction::tests::production_recovery::transaction_install_every_prefix_recovers -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::transaction::tests::production_recovery::transaction_recovery_every_prefix_is_idempotent -- --ignored --exact`
   - `cargo test --locked --offline -p surgeist-generator --lib transaction_corruption_preserves_evidence`
   - `cargo test --locked --offline -p surgeist-generator --lib transaction_post_commit_failure`
   - `cargo test --locked --offline -p surgeist-generator --lib core::artifact::tests`
@@ -224,12 +230,13 @@
   corruption/live-owner evidence remains; every recoverable prefix completes and
   is idempotent without replacing the winner.
 - Commands:
-  - `cargo test --locked --offline -p surgeist-generator --lib bootstrap_header_every_byte_prefix -- --ignored`
-  - `cargo test --locked --offline -p surgeist-generator --lib bootstrap_uncontended_every_prefix -- --ignored`
-  - `cargo test --locked --offline -p surgeist-generator --lib bootstrap_winner_held_every_prefix -- --ignored`
-  - `cargo test --locked --offline -p surgeist-generator --lib bootstrap_winner_released_every_prefix -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::bootstrap_header_every_byte_prefix_recovers -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::bootstrap_uncontended_every_prefix_recovers -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::bootstrap_winner_held_every_prefix_recovers -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::bootstrap_winner_released_every_prefix_recovers -- --ignored --exact`
   - `cargo test --locked --offline -p surgeist-generator --lib core::lease::tests`
   - `cargo test --locked --offline -p surgeist-generator --no-default-features`
+  - `cargo test --locked --offline -p surgeist-generator --lib -- --ignored --list`
   - `cargo clippy --locked --offline -p surgeist-generator --no-default-features --all-targets -- -F unsafe-code -D warnings`
   - `cargo fmt --check`
 - Dependencies: C01-T03 is task-clean.
@@ -261,12 +268,14 @@
   probe, or revalidation failure creates no owner transaction, preserves the
   historical owner, releases the mutex, and returns no guard.
 - Commands:
-  - `cargo test --locked --offline -p surgeist-generator --lib owner_record_install_every_prefix -- --ignored`
-  - `cargo test --locked --offline -p surgeist-generator --lib owner_record_recovery_every_prefix -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::owner_record_install_every_prefix_recovers_absent -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::owner_record_install_every_prefix_recovers_swap -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::owner_record_recovery_every_prefix_is_idempotent -- --ignored --exact`
   - `cargo test --locked --offline -p surgeist-generator --lib owner_record_corruption_preserves_evidence`
   - `cargo test --locked --offline -p surgeist-generator --lib lease_revalidation_failure_preserves_historical_owner`
   - `cargo test --locked --offline -p surgeist-generator --lib lease_owner_install_begins_only_after_revalidation`
   - `cargo test --locked --offline -p surgeist-generator --no-default-features`
+  - `cargo test --locked --offline -p surgeist-generator --lib -- --ignored --list`
   - `cargo clippy --locked --offline -p surgeist-generator --no-default-features --all-targets -- -F unsafe-code -D warnings`
   - `cargo fmt --check`
 - Dependencies: C01-T04 is task-clean.
@@ -295,15 +304,16 @@
   mount states preserve evidence; the next acquisition recovers before re-probe
   and owner installation.
 - Commands:
-  - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_install_every_prefix -- --ignored`
-  - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_exclusive_unsupported_every_prefix -- --ignored`
-  - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_swap_unsupported_every_prefix -- --ignored`
-  - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_unsupported_cleanup_failure`
-  - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_recovery_every_prefix -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_install_every_prefix_recovers -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_exclusive_unsupported_every_prefix_recovers -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_swap_unsupported_every_prefix_recovers -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_unsupported_cleanup_failure_preserves_evidence -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_recovery_every_prefix_is_idempotent -- --ignored --exact`
   - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_corruption_preserves_evidence`
-  - `cargo test --locked --offline -p surgeist-generator --lib lease_acquisition_recovers_owner_and_probe_prefixes -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::lease::tests::lease_acquisition_recovers_owner_and_probe_prefixes -- --ignored --exact`
   - `cargo test --locked --offline -p surgeist-generator --lib core::lease::tests`
   - `cargo test --locked --offline -p surgeist-generator --no-default-features`
+  - `cargo test --locked --offline -p surgeist-generator --lib -- --ignored --list`
   - `cargo clippy --locked --offline -p surgeist-generator --no-default-features --all-targets -- -F unsafe-code -D warnings`
   - `cargo fmt --check`
 - Dependencies: C01-T05 is task-clean.
@@ -358,12 +368,21 @@
       done <"$manifest"
     )
     ```
-  - `cargo test --locked --offline -p surgeist-generator --lib transaction_install_every_prefix -- --ignored`
-  - `cargo test --locked --offline -p surgeist-generator --lib transaction_recovery_every_prefix -- --ignored`
-  - `cargo test --locked --offline -p surgeist-generator --lib bootstrap_ -- --ignored`
-  - `cargo test --locked --offline -p surgeist-generator --lib owner_record_ -- --ignored`
-  - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_ -- --ignored`
-  - `cargo test --locked --offline -p surgeist-generator --lib lease_acquisition_recovers_owner_and_probe_prefixes -- --ignored`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::transaction::tests::production_recovery::transaction_install_every_prefix_recovers -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::transaction::tests::production_recovery::transaction_recovery_every_prefix_is_idempotent -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::bootstrap_header_every_byte_prefix_recovers -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::bootstrap_uncontended_every_prefix_recovers -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::bootstrap_winner_held_every_prefix_recovers -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::bootstrap_winner_released_every_prefix_recovers -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::owner_record_install_every_prefix_recovers_absent -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::owner_record_install_every_prefix_recovers_swap -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::owner_record_recovery_every_prefix_is_idempotent -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_install_every_prefix_recovers -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_exclusive_unsupported_every_prefix_recovers -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_swap_unsupported_every_prefix_recovers -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_unsupported_cleanup_failure_preserves_evidence -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_recovery_every_prefix_is_idempotent -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --lib core::lease::tests::lease_acquisition_recovers_owner_and_probe_prefixes -- --ignored --exact`
 - Required handoff: immutable published C01 SHA; exact ordered task ranges and
   clean reviews; real-prefix event/oracle counts; final command evidence;
   preservation digest; clean worktree; authority-remote main readback; and an
