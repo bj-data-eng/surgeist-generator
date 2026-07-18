@@ -14,15 +14,15 @@
   tests**, and the pre-existing portion of **Quality matrix**; SR-04.1 through
   SR-04.4; the transaction, lease, bootstrap, owner-record, rename-probe, and
   shared error clauses of SR-04.5; and the current-core clauses of SR-04.6; at
-  commit `66fa0cb31521bd03bfb240396ff8d900ee9f9d24`, normalized semantic-content
+  commit `0c56de73f0280993761314f514626951de56cfb7`, normalized semantic-content
   SHA-256
-  `da98c3d8047cc696ea0ca96e81858c5f9ac16acac1ab367263ec0e83d6537253`,
+  `9a1a148c198d39145017db769b9ab91025f1cc37719efc6d3c68ab998da7c524`,
   review `CLEAN`.
 - Reviewed implementation sequence:
   `plans/sequences/2026-07-17-surgeist-generator-review-remediation.md`, entry
-  C01, at commit `ec56226ae94b4de2049f4c2803c56590027e6cb3`, normalized
+  C01, at commit `c7d3f010faf5769960df7c42c937924ebb4d2a39`, normalized
   semantic-content SHA-256
-  `d7c41ac55064ff4efad6fb6f0b63f58f44b124a058cfdc0f7406dbeeab10e398`,
+  `7bb79d1c0f9bd7c78593bff7ac9dbf60b3b5372f7852486b678e9ed4e31316c2`,
   review `CLEAN`.
 - Bounded outcome: correct rooted absence handling, replace model-only
   transaction/bootstrap assurances with exhaustive failure injection through the
@@ -67,14 +67,30 @@
   recovery cannot consume it as an ordinary failure.
 - Every test that enumerates each real event, byte, or recovery prefix is marked
   `#[ignore = "exhaustive opt-in diagnostic"]`. Ordinary Cargo test matrices
-  compile but never execute these diagnostics; named focused commands execute
-  them only with libtest `--ignored`, and an ignored-test listing proves the
-  classification. A named diagnostic command must execute its expected nonzero
-  test count; a successful zero-test filter is a verification failure.
-- The 15 fully qualified diagnostic commands under Completion are the exact C01
+  compile but never execute these diagnostics. C01 task and final gates compare
+  libtest's ignored listing to the exact inventory below and execute none. The
+  single sequential execution is owned by the initiative-final C04 gate.
+- The 15 fully qualified names below are the exact C01
   ignored inventory. After T03, T04, T05, and T06, `--ignored --list` must equal
   respectively the applicable cumulative 2, 6, 9, and 15 names with no extra or
-  missing test; every exact diagnostic command must execute exactly one test.
+  missing test:
+  ```text
+  core::transaction::tests::production_recovery::transaction_install_every_prefix_recovers
+  core::transaction::tests::production_recovery::transaction_recovery_every_prefix_is_idempotent
+  core::coordination::tests::bootstrap_header_every_byte_prefix_recovers
+  core::coordination::tests::bootstrap_uncontended_every_prefix_recovers
+  core::coordination::tests::bootstrap_winner_held_every_prefix_recovers
+  core::coordination::tests::bootstrap_winner_released_every_prefix_recovers
+  core::coordination::tests::owner_record_install_every_prefix_recovers_absent
+  core::coordination::tests::owner_record_install_every_prefix_recovers_swap
+  core::coordination::tests::owner_record_recovery_every_prefix_is_idempotent
+  core::coordination::tests::rename_probe_install_every_prefix_recovers
+  core::coordination::tests::rename_probe_exclusive_unsupported_every_prefix_recovers
+  core::coordination::tests::rename_probe_swap_unsupported_every_prefix_recovers
+  core::coordination::tests::rename_probe_unsupported_cleanup_failure_preserves_evidence
+  core::coordination::tests::rename_probe_recovery_every_prefix_is_idempotent
+  core::lease::tests::lease_acquisition_recovers_owner_and_probe_prefixes
+  ```
 - The artificial `private_front_doors_are_linked` references remain until real
   domain callers replace them in later cycles. C01 may not delete them merely to
   satisfy dead-code checks.
@@ -192,10 +208,10 @@
   post-commit operational or cleanup failure cannot restore old output. The old
   protocol table may remain only as supplementary ordering documentation. Both
   exhaustive prefix enumerators are ignored diagnostics; corruption and
-  post-commit tests remain ordinary.
+  post-commit tests remain ordinary. The accepted pre-deferral evidence covers
+  10,547 install and 5,193 recovery prefixes; C01 does not rerun either ignored
+  diagnostic after adding its classification attribute.
 - Commands:
-  - `cargo test --locked --offline -p surgeist-generator --lib core::transaction::tests::production_recovery::transaction_install_every_prefix_recovers -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::transaction::tests::production_recovery::transaction_recovery_every_prefix_is_idempotent -- --ignored --exact`
   - `cargo test --locked --offline -p surgeist-generator --lib transaction_corruption_preserves_evidence`
   - `cargo test --locked --offline -p surgeist-generator --lib transaction_post_commit_failure`
   - `cargo test --locked --offline -p surgeist-generator --lib core::artifact::tests`
@@ -221,19 +237,19 @@
   `bootstrap_uncontended_every_prefix_recovers`,
   `bootstrap_winner_held_every_prefix_recovers`, and
   `bootstrap_winner_released_every_prefix_recovers`. They must fail because the
-  current test checks only a hard-coded step array and cannot interrupt real
-  bootstrap state.
+  current test checks only a hard-coded step array and cannot compile the new
+  production-path diagnostic support. The pre-support `--no-run` build is RED;
+  ignored diagnostic bodies are not executed in C01.
 - Acceptance criteria: incomplete local headers never publish; pre-rename
   prefixes recover to absence and post-rename prefixes to one exact immutable
   lock; held-winner loss returns `LeaseActive` and cleans only the loser while
   preserving the winner; released-winner adoption returns its held handle;
   corruption/live-owner evidence remains; every recoverable prefix completes and
-  is idempotent without replacing the winner.
+  is idempotent without replacing the winner. All four exhaustive bodies compile
+  and occupy exactly their cumulative ignored-inventory positions; execution is
+  deferred to C04.
 - Commands:
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::bootstrap_header_every_byte_prefix_recovers -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::bootstrap_uncontended_every_prefix_recovers -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::bootstrap_winner_held_every_prefix_recovers -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::bootstrap_winner_released_every_prefix_recovers -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --no-default-features --no-run`
   - `cargo test --locked --offline -p surgeist-generator --lib core::lease::tests`
   - `cargo test --locked --offline -p surgeist-generator --no-default-features`
   - `cargo test --locked --offline -p surgeist-generator --lib -- --ignored --list`
@@ -259,18 +275,19 @@
   `owner_record_corruption_preserves_evidence`,
   `lease_revalidation_failure_preserves_historical_owner`, and
   `lease_owner_install_begins_only_after_revalidation` tests. They must fail on
-  missing production-path observation/recovery, not on the already-corrected
-  rooted traversal.
+  missing production-path observation/recovery support at the `--no-run` build,
+  not on the already-corrected rooted traversal. Ignored diagnostic bodies are
+  not executed in C01.
 - Acceptance criteria: before commit the owner is absent or exact old and at/
   after commit it is exact new; fresh recovery of every install/recovery prefix
   removes valid residue and is idempotent; malformed/digest/identity/unknown
   states preserve evidence as `ArtifactTransaction`; a preceding recovery,
   probe, or revalidation failure creates no owner transaction, preserves the
-  historical owner, releases the mutex, and returns no guard.
+  historical owner, releases the mutex, and returns no guard. The three
+  exhaustive bodies compile and extend the ignored inventory from six to nine;
+  execution is deferred to C04.
 - Commands:
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::owner_record_install_every_prefix_recovers_absent -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::owner_record_install_every_prefix_recovers_swap -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::owner_record_recovery_every_prefix_is_idempotent -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --no-default-features --no-run`
   - `cargo test --locked --offline -p surgeist-generator --lib owner_record_corruption_preserves_evidence`
   - `cargo test --locked --offline -p surgeist-generator --lib lease_revalidation_failure_preserves_historical_owner`
   - `cargo test --locked --offline -p surgeist-generator --lib lease_owner_install_begins_only_after_revalidation`
@@ -294,23 +311,20 @@
   re-probe behavior, and mutex release.
 - RED evidence: first add all specified `rename_probe_*` production-path tests
   plus `lease_acquisition_recovers_owner_and_probe_prefixes`. The unsupported
-  cleanup test must first expose the current inability to interrupt/recover each
-  real cleanup primitive.
+  cleanup test must first expose at the `--no-run` build the current missing
+  support for interrupting/recovering each real cleanup primitive. Ignored
+  diagnostic bodies are not executed in C01.
 - Acceptance criteria: every install/recovery prefix is accepted by fresh
   production recovery and finishes idempotently; no probe prefix changes a
   domain artifact or owner record; complete failure cleanup leaves no residue and
   returns the original capability kind; failed cleanup retains the exact valid
   journal and both capability/cleanup context; unknown/type/mode/identity/alias/
   mount states preserve evidence; the next acquisition recovers before re-probe
-  and owner installation.
+  and owner installation. The six exhaustive bodies compile and complete the
+  exact 15-name ignored inventory; execution is deferred to C04.
 - Commands:
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_install_every_prefix_recovers -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_exclusive_unsupported_every_prefix_recovers -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_swap_unsupported_every_prefix_recovers -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_unsupported_cleanup_failure_preserves_evidence -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_recovery_every_prefix_is_idempotent -- --ignored --exact`
+  - `cargo test --locked --offline -p surgeist-generator --no-default-features --no-run`
   - `cargo test --locked --offline -p surgeist-generator --lib rename_probe_corruption_preserves_evidence`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::lease::tests::lease_acquisition_recovers_owner_and_probe_prefixes -- --ignored --exact`
   - `cargo test --locked --offline -p surgeist-generator --lib core::lease::tests`
   - `cargo test --locked --offline -p surgeist-generator --no-default-features`
   - `cargo test --locked --offline -p surgeist-generator --lib -- --ignored --list`
@@ -322,13 +336,13 @@
 ## Completion
 
 - Observable acceptance: SR-04.1 absence semantics are strict and non-mutating;
-  every production transaction/bootstrap/owner/probe install and recovery prefix
-  satisfies its visibility, residue, error, recovery, and idempotence oracle;
+  transaction/bootstrap/owner/probe production-path diagnostic bodies encode the
+  required visibility, residue, error, recovery, and idempotence oracles;
   the ten previously blocked lease/artifact tests reach their intended behavior;
   corrupt or unclassifiable evidence is retained; post-commit state is never
-  rolled back; ordinary matrices report every exhaustive diagnostic ignored;
-  explicit diagnostic runs are clean; and the C01 quality matrix is clean
-  without public/domain changes.
+  rolled back; ordinary matrices are clean; the exact 15 diagnostics compile and
+  are reported ignored without execution; accepted historical T03 evidence is
+  recorded; and the C01 quality matrix is clean without public/domain changes.
 - Final command list:
   - `RUSTFLAGS="-D warnings" cargo check --locked --offline -p surgeist-generator --no-default-features`
   - `RUSTFLAGS="-D warnings" cargo check --locked --offline -p surgeist-generator --features layout-browser`
@@ -368,25 +382,11 @@
       done <"$manifest"
     )
     ```
-  - `cargo test --locked --offline -p surgeist-generator --lib core::transaction::tests::production_recovery::transaction_install_every_prefix_recovers -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::transaction::tests::production_recovery::transaction_recovery_every_prefix_is_idempotent -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::bootstrap_header_every_byte_prefix_recovers -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::bootstrap_uncontended_every_prefix_recovers -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::bootstrap_winner_held_every_prefix_recovers -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::bootstrap_winner_released_every_prefix_recovers -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::owner_record_install_every_prefix_recovers_absent -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::owner_record_install_every_prefix_recovers_swap -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::owner_record_recovery_every_prefix_is_idempotent -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_install_every_prefix_recovers -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_exclusive_unsupported_every_prefix_recovers -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_swap_unsupported_every_prefix_recovers -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_unsupported_cleanup_failure_preserves_evidence -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::coordination::tests::rename_probe_recovery_every_prefix_is_idempotent -- --ignored --exact`
-  - `cargo test --locked --offline -p surgeist-generator --lib core::lease::tests::lease_acquisition_recovers_owner_and_probe_prefixes -- --ignored --exact`
 - Required handoff: immutable published C01 SHA; exact ordered task ranges and
-  clean reviews; real-prefix event/oracle counts; final command evidence;
-  preservation digest; clean worktree; authority-remote main readback; and an
-  explicit statement that C02 alone may begin next.
+  clean reviews; accepted T03 counts; exact deferred 15-name inventory; proof no
+  ignored diagnostic executed in C01; final command evidence; preservation
+  digest; clean worktree; authority-remote main readback; and an explicit
+  statement that C02 alone may begin next and C04 alone owns runtime execution.
 - Unresolved blocker: none. Any missing installed cache/tool, unsupported
   platform behavior on the declared supported host, inability to make a real
   primitive observable without changing production semantics, or contradiction
