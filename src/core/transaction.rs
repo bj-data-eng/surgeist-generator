@@ -59,6 +59,7 @@ pub(crate) enum ProtocolStep {
 
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Supplementary ordering documentation; production prefix tests are normative.
 pub(crate) struct TransactionProtocol {
     commit_kind: CommitKind,
 }
@@ -114,73 +115,6 @@ impl TransactionProtocol {
             .iter()
             .filter(|step| **step == ProtocolStep::Commit)
             .count()
-    }
-
-    pub(crate) fn crash_prefixes(&self) -> impl Iterator<Item = CrashPrefix> + '_ {
-        (0..=self.steps().len()).map(|length| CrashPrefix {
-            commit_kind: self.commit_kind,
-            completed: self.steps()[..length].to_vec(),
-        })
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CrashPrefix {
-    commit_kind: CommitKind,
-    completed: Vec<ProtocolStep>,
-}
-
-#[cfg(test)]
-impl CrashPrefix {
-    pub(crate) fn recover(&self) -> Result<RecoveredPrefix> {
-        let committed = self.completed.contains(&ProtocolStep::Commit);
-        let intent = self.completed.contains(&ProtocolStep::PublishIntent);
-        let cleanup_finished = self
-            .completed
-            .contains(&ProtocolStep::RemoveCompletedDirectory);
-        Ok(RecoveredPrefix {
-            visible: if committed {
-                VisibleGeneration::New
-            } else {
-                VisibleGeneration::Old
-            },
-            resumable_evidence: intent && !cleanup_finished,
-            commit_kind: self.commit_kind,
-        })
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum VisibleGeneration {
-    Old,
-    New,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RecoveredPrefix {
-    visible: VisibleGeneration,
-    resumable_evidence: bool,
-    commit_kind: CommitKind,
-}
-
-#[cfg(test)]
-impl RecoveredPrefix {
-    pub(crate) const fn one_complete_generation(&self) -> bool {
-        matches!(
-            self.visible,
-            VisibleGeneration::Old | VisibleGeneration::New
-        )
-    }
-
-    pub(crate) const fn visible(&self) -> VisibleGeneration {
-        self.visible
-    }
-
-    pub(crate) const fn has_resumable_evidence(&self) -> bool {
-        self.resumable_evidence
     }
 
     pub(crate) const fn commit_kind(&self) -> CommitKind {
@@ -791,7 +725,7 @@ impl<'a> TransactionEngine<'a> {
                     InventoryPolicy::ConstructionCorpus,
                 )?;
             }
-            self.publish_outcome(&active, &intent.token, Outcome::Aborted)?;
+            self.validate_or_publish_outcome(&active, &intent.token, Outcome::Aborted)?;
             return self.complete_cleanup(
                 active_name,
                 &format!("completed-{}", intent.token),
@@ -1516,12 +1450,671 @@ fn pre_intent_error(error: GeneratorError) -> GeneratorError {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommitKind, ProtocolStep, TransactionProtocol, VisibleGeneration};
+    use super::{CommitKind, ProtocolStep, TransactionProtocol};
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    mod production_recovery {
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::path::{Path, PathBuf};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, RelativePath, Result};
+
+        use super::super::{CommitKind, StagedTree, TransactionEngine, TransactionRequest};
+        use crate::core::fs::{
+            CORPUS_DIRECTORY_MODE, CORPUS_FILE_MODE, DurabilityEvent, DurabilityPhase,
+            DurabilityPrimitive, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, RootedFs,
+            RootedObserver,
+        };
+
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+        const AUTHORITY_KEY: &str = "layout-generator";
+        const DOMAIN: &str = "layout";
+        const FINAL_ROOT: &str = "xml";
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+        const TRANSACTION_PARENT: &str = ".surgeist-generator/transactions/layout";
+        const OLD_FILES: &[(&str, &[u8])] = &[
+            ("nested/alpha/kept.txt", b"stable\n"),
+            ("nested/alpha/replaced.txt", b"old generation\n"),
+            ("nested/beta/old-only.txt", b"old only\n"),
+        ];
+        const NEW_FILES: &[(&str, &[u8])] = &[
+            ("nested/alpha/kept.txt", b"stable\n"),
+            ("nested/alpha/replaced.txt", b"new generation\n"),
+            ("nested/beta/new-only.txt", b"new only\n"),
+        ];
+
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        enum SnapshotEntry {
+            Directory(u32),
+            Regular(u32, Vec<u8>),
+            Symlink(u32, PathBuf),
+            Other(u32),
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Visible {
+            Absent,
+            Old,
+            New,
+        }
+
+        struct Fixture {
+            owner: PathBuf,
+            corpus: PathBuf,
+            location: CorpusLocation,
+        }
+
+        impl Fixture {
+            fn new(label: &str, kind: CommitKind) -> Self {
+                let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+                let owner = std::env::temp_dir().join(format!(
+                    "surgeist-generator-transaction-{label}-{}-{sequence}",
+                    std::process::id()
+                ));
+                let corpus = owner.join("corpus");
+                fs::create_dir(&owner).expect("create transaction fixture owner");
+                fs::create_dir(&corpus).expect("create transaction fixture corpus");
+                let location =
+                    CorpusLocation::new(&owner, &corpus).expect("transaction fixture location");
+                if kind == CommitKind::Swap {
+                    seed_generation(&corpus.join(FINAL_ROOT), OLD_FILES);
+                }
+                {
+                    let rooted = RootedFs::open_corpus(&location)
+                        .expect("open transaction fixture authority");
+                    TransactionEngine::new(&rooted, TRANSACTION_PARENT, AUTHORITY_KEY, DOMAIN)
+                        .expect("create transaction fixture parent");
+                }
+                Self {
+                    owner,
+                    corpus,
+                    location,
+                }
+            }
+
+            fn request(&self) -> TransactionRequest {
+                let files = NEW_FILES
+                    .iter()
+                    .map(|(path, bytes)| {
+                        (
+                            RelativePath::new(*path).expect("fixture relative path"),
+                            bytes.to_vec(),
+                        )
+                    })
+                    .collect();
+                TransactionRequest::new(
+                    AUTHORITY_KEY,
+                    DOMAIN,
+                    TOKEN,
+                    RelativePath::new(FINAL_ROOT).expect("fixture final root"),
+                    StagedTree::new(files).expect("fixture staged tree"),
+                )
+                .expect("fixture transaction request")
+            }
+
+            fn snapshot(&self) -> BTreeMap<PathBuf, SnapshotEntry> {
+                snapshot(&self.corpus)
+            }
+
+            fn assert_visible(&self, expected: Visible) {
+                let root = self.corpus.join(FINAL_ROOT);
+                match expected {
+                    Visible::Absent => {
+                        assert!(!root.exists(), "exclusive pre-commit root became visible")
+                    }
+                    Visible::Old | Visible::New => {
+                        let metadata = fs::symlink_metadata(&root)
+                            .expect("visible transaction generation metadata");
+                        assert!(metadata.is_dir(), "visible generation is not a directory");
+                        assert_eq!(mode(&metadata), CORPUS_DIRECTORY_MODE);
+                        let actual = snapshot(&root);
+                        let files = if expected == Visible::Old {
+                            OLD_FILES
+                        } else {
+                            NEW_FILES
+                        };
+                        assert_eq!(actual, expected_generation(files));
+                    }
+                }
+            }
+
+            fn assert_clean(&self, expected: Visible) {
+                self.assert_visible(expected);
+                assert_eq!(self.snapshot(), expected_clean_corpus(expected));
+            }
+
+            fn residue(&self) -> Vec<PathBuf> {
+                let transaction_parent = Path::new(TRANSACTION_PARENT);
+                self.snapshot()
+                    .into_keys()
+                    .filter(|path| {
+                        path.strip_prefix(transaction_parent)
+                            .is_ok_and(|suffix| !suffix.as_os_str().is_empty())
+                            || path.components().next().is_some_and(|component| {
+                                component
+                                    .as_os_str()
+                                    .to_string_lossy()
+                                    .starts_with("._surgeist-layout-stage-")
+                            })
+                    })
+                    .collect()
+            }
+
+            fn active_journal(&self) -> (String, PathBuf) {
+                let parent = self.corpus.join(TRANSACTION_PARENT);
+                let mut active: Vec<_> = fs::read_dir(parent)
+                    .expect("read transaction parent")
+                    .map(|entry| entry.expect("transaction journal entry"))
+                    .filter(|entry| entry.file_name().to_string_lossy().starts_with("active-"))
+                    .collect();
+                active.sort_by_key(|entry| entry.file_name());
+                assert_eq!(active.len(), 1, "expected one active transaction journal");
+                let entry = active.pop().expect("one active transaction journal");
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    entry.path(),
+                )
+            }
+
+            fn recover(&self) -> Result<()> {
+                let rooted = RootedFs::open_corpus(&self.location)?;
+                TransactionEngine::new(&rooted, TRANSACTION_PARENT, AUTHORITY_KEY, DOMAIN)?
+                    .recover_all()
+            }
+
+            fn recover_and_assert_idempotent(&self, expected: Visible) {
+                self.recover().expect("fresh production recovery");
+                self.assert_clean(expected);
+                let stable = self.snapshot();
+                self.recover().expect("repeat production recovery");
+                self.assert_clean(expected);
+                assert_eq!(self.snapshot(), stable, "repeated recovery changed state");
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                fs::remove_dir_all(&self.owner).expect("remove transaction fixture");
+            }
+        }
+
+        fn seed_generation(root: &Path, files: &[(&str, &[u8])]) {
+            fs::create_dir(root).expect("create generation root");
+            fs::set_permissions(root, fs::Permissions::from_mode(CORPUS_DIRECTORY_MODE))
+                .expect("set generation root mode");
+            let mut directories = BTreeSet::new();
+            for (relative, _) in files {
+                let mut parent = Path::new(relative).parent();
+                while let Some(path) = parent {
+                    if path.as_os_str().is_empty() {
+                        break;
+                    }
+                    directories.insert(path.to_path_buf());
+                    parent = path.parent();
+                }
+            }
+            for relative in directories {
+                let directory = root.join(relative);
+                fs::create_dir_all(&directory).expect("create generation directory");
+                fs::set_permissions(
+                    &directory,
+                    fs::Permissions::from_mode(CORPUS_DIRECTORY_MODE),
+                )
+                .expect("set generation directory mode");
+            }
+            for (relative, bytes) in files {
+                let path = root.join(relative);
+                fs::write(&path, bytes).expect("write generation fixture file");
+                fs::set_permissions(&path, fs::Permissions::from_mode(CORPUS_FILE_MODE))
+                    .expect("set generation file mode");
+            }
+        }
+
+        fn mode(metadata: &fs::Metadata) -> u32 {
+            metadata.permissions().mode() & 0o7777
+        }
+
+        fn snapshot(root: &Path) -> BTreeMap<PathBuf, SnapshotEntry> {
+            fn visit(
+                root: &Path,
+                directory: &Path,
+                entries: &mut BTreeMap<PathBuf, SnapshotEntry>,
+            ) {
+                let mut children: Vec<_> = fs::read_dir(directory)
+                    .expect("snapshot directory")
+                    .map(|entry| entry.expect("snapshot entry"))
+                    .collect();
+                children.sort_by_key(|entry| entry.file_name());
+                for child in children {
+                    let path = child.path();
+                    let relative = path
+                        .strip_prefix(root)
+                        .expect("snapshot relative path")
+                        .to_path_buf();
+                    let metadata = fs::symlink_metadata(&path).expect("snapshot entry metadata");
+                    let entry = if metadata.is_dir() {
+                        SnapshotEntry::Directory(mode(&metadata))
+                    } else if metadata.is_file() {
+                        SnapshotEntry::Regular(
+                            mode(&metadata),
+                            fs::read(&path).expect("snapshot regular file"),
+                        )
+                    } else if metadata.file_type().is_symlink() {
+                        SnapshotEntry::Symlink(
+                            mode(&metadata),
+                            fs::read_link(&path).expect("snapshot symbolic link"),
+                        )
+                    } else {
+                        SnapshotEntry::Other(mode(&metadata))
+                    };
+                    let directory_entry = metadata.is_dir();
+                    entries.insert(relative, entry);
+                    if directory_entry {
+                        visit(root, &path, entries);
+                    }
+                }
+            }
+
+            let mut entries = BTreeMap::new();
+            visit(root, root, &mut entries);
+            entries
+        }
+
+        fn expected_generation(files: &[(&str, &[u8])]) -> BTreeMap<PathBuf, SnapshotEntry> {
+            let mut expected = BTreeMap::new();
+            let mut directories = BTreeSet::new();
+            for (relative, bytes) in files {
+                let path = PathBuf::from(relative);
+                let mut parent = path.parent();
+                while let Some(directory) = parent {
+                    if directory.as_os_str().is_empty() {
+                        break;
+                    }
+                    directories.insert(directory.to_path_buf());
+                    parent = directory.parent();
+                }
+                expected.insert(
+                    path,
+                    SnapshotEntry::Regular(CORPUS_FILE_MODE, bytes.to_vec()),
+                );
+            }
+            for directory in directories {
+                expected.insert(directory, SnapshotEntry::Directory(CORPUS_DIRECTORY_MODE));
+            }
+            expected
+        }
+
+        fn expected_clean_corpus(expected: Visible) -> BTreeMap<PathBuf, SnapshotEntry> {
+            let mut snapshot = BTreeMap::from([
+                (
+                    PathBuf::from(".surgeist-generator"),
+                    SnapshotEntry::Directory(PRIVATE_DIRECTORY_MODE),
+                ),
+                (
+                    PathBuf::from(".surgeist-generator/transactions"),
+                    SnapshotEntry::Directory(PRIVATE_DIRECTORY_MODE),
+                ),
+                (
+                    PathBuf::from(TRANSACTION_PARENT),
+                    SnapshotEntry::Directory(PRIVATE_DIRECTORY_MODE),
+                ),
+            ]);
+            let files = match expected {
+                Visible::Absent => return snapshot,
+                Visible::Old => OLD_FILES,
+                Visible::New => NEW_FILES,
+            };
+            snapshot.insert(
+                PathBuf::from(FINAL_ROOT),
+                SnapshotEntry::Directory(CORPUS_DIRECTORY_MODE),
+            );
+            for (relative, entry) in expected_generation(files) {
+                snapshot.insert(Path::new(FINAL_ROOT).join(relative), entry);
+            }
+            snapshot
+        }
+
+        fn run_observed_install(fixture: &Fixture, observer: RootedObserver) -> Result<()> {
+            let rooted = RootedFs::open_corpus_observed(&fixture.location, observer)?;
+            TransactionEngine::new(&rooted, TRANSACTION_PARENT, AUTHORITY_KEY, DOMAIN)?
+                .install(&fixture.request())
+        }
+
+        fn run_observed_recovery(fixture: &Fixture, observer: RootedObserver) -> Result<()> {
+            let rooted = RootedFs::open_corpus_observed(&fixture.location, observer)?;
+            TransactionEngine::new(&rooted, TRANSACTION_PARENT, AUTHORITY_KEY, DOMAIN)?
+                .recover_all()
+        }
+
+        fn expect_interruption(operation: impl FnOnce() -> Result<()>) {
+            let payload = catch_unwind(AssertUnwindSafe(operation))
+                .expect_err("observed production operation must interrupt");
+            assert!(RootedObserver::is_interruption(payload.as_ref()));
+            assert!(payload.downcast_ref::<GeneratorError>().is_none());
+        }
+
+        fn record_install_trace(kind: CommitKind) -> Vec<DurabilityEvent> {
+            let fixture = Fixture::new("install-trace", kind);
+            let observer = RootedObserver::recording();
+            run_observed_install(&fixture, observer.clone()).expect("trace production install");
+            fixture.assert_clean(Visible::New);
+            let events = observer.events();
+            assert!(!events.is_empty(), "production install trace is empty");
+            events
+        }
+
+        fn interrupted_install(
+            fixture: &Fixture,
+            event_index: usize,
+            expected_trace: &[DurabilityEvent],
+        ) {
+            let observer = RootedObserver::interrupt_after(event_index);
+            expect_interruption(|| run_observed_install(fixture, observer.clone()));
+            assert_eq!(
+                observer.events(),
+                expected_trace[..=event_index],
+                "install trace changed at prefix {event_index}"
+            );
+        }
+
+        fn commit_index(events: &[DurabilityEvent], kind: CommitKind) -> usize {
+            let primitive = match kind {
+                CommitKind::Exclusive => DurabilityPrimitive::RenameExclusive,
+                CommitKind::Swap => DurabilityPrimitive::RenameSwap,
+            };
+            let matches: Vec<_> = events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| {
+                    event.phase() == DurabilityPhase::TransactionInstall
+                        && event.primitive() == primitive
+                        && event.path() == FINAL_ROOT
+                })
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(matches.len(), 1, "install trace must contain one commit");
+            matches[0]
+        }
+
+        fn intent_index(events: &[DurabilityEvent]) -> usize {
+            let intent = format!("{TRANSACTION_PARENT}/active-{TOKEN}/intent.json");
+            events
+                .iter()
+                .position(|event| {
+                    event.phase() == DurabilityPhase::TransactionInstall
+                        && event.primitive() == DurabilityPrimitive::RenameExclusive
+                        && event.path() == intent
+                })
+                .expect("install trace contains durable intent publication")
+        }
+
+        fn pre_commit_visibility(kind: CommitKind) -> Visible {
+            match kind {
+                CommitKind::Exclusive => Visible::Absent,
+                CommitKind::Swap => Visible::Old,
+            }
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum RecoverySeed {
+            ExclusivePre,
+            ExclusivePost,
+            SwapPre,
+            SwapPost,
+        }
+
+        impl RecoverySeed {
+            const ALL: [Self; 4] = [
+                Self::ExclusivePre,
+                Self::ExclusivePost,
+                Self::SwapPre,
+                Self::SwapPost,
+            ];
+
+            const fn kind(self) -> CommitKind {
+                match self {
+                    Self::ExclusivePre | Self::ExclusivePost => CommitKind::Exclusive,
+                    Self::SwapPre | Self::SwapPost => CommitKind::Swap,
+                }
+            }
+
+            const fn visibility(self) -> Visible {
+                match self {
+                    Self::ExclusivePre => Visible::Absent,
+                    Self::SwapPre => Visible::Old,
+                    Self::ExclusivePost | Self::SwapPost => Visible::New,
+                }
+            }
+
+            fn install_event(self, trace: &[DurabilityEvent]) -> usize {
+                let commit = commit_index(trace, self.kind());
+                match self {
+                    Self::ExclusivePre => intent_index(trace),
+                    Self::SwapPre => commit
+                        .checked_sub(1)
+                        .expect("swap commit has a preceding durability event"),
+                    Self::ExclusivePost | Self::SwapPost => commit,
+                }
+            }
+
+            fn label(self) -> &'static str {
+                match self {
+                    Self::ExclusivePre => "exclusive-pre",
+                    Self::ExclusivePost => "exclusive-post",
+                    Self::SwapPre => "swap-pre",
+                    Self::SwapPost => "swap-post",
+                }
+            }
+        }
+
+        fn seeded_fixture(seed: RecoverySeed, install_trace: &[DurabilityEvent]) -> Fixture {
+            let fixture = Fixture::new(seed.label(), seed.kind());
+            interrupted_install(&fixture, seed.install_event(install_trace), install_trace);
+            fixture.assert_visible(seed.visibility());
+            assert!(
+                !fixture.residue().is_empty(),
+                "recovery seed must retain transaction evidence"
+            );
+            fixture
+        }
+
+        fn record_recovery_trace(
+            seed: RecoverySeed,
+            install_trace: &[DurabilityEvent],
+        ) -> Vec<DurabilityEvent> {
+            let fixture = seeded_fixture(seed, install_trace);
+            let observer = RootedObserver::recording();
+            run_observed_recovery(&fixture, observer.clone()).expect("trace production recovery");
+            fixture.assert_clean(seed.visibility());
+            let events = observer.events();
+            assert!(!events.is_empty(), "production recovery trace is empty");
+            events
+        }
+
+        fn write_private_file(path: &Path, bytes: &[u8]) {
+            fs::write(path, bytes).expect("write private transaction evidence");
+            fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+                .expect("set private transaction evidence mode");
+        }
+
+        #[test]
+        fn transaction_install_every_prefix_recovers() {
+            for kind in [CommitKind::Exclusive, CommitKind::Swap] {
+                let trace = record_install_trace(kind);
+                let commit = commit_index(&trace, kind);
+                for event_index in 0..trace.len() {
+                    let fixture = Fixture::new("install-prefix", kind);
+                    interrupted_install(&fixture, event_index, &trace);
+                    let expected = if event_index < commit {
+                        pre_commit_visibility(kind)
+                    } else {
+                        Visible::New
+                    };
+                    fixture.assert_visible(expected);
+                    fixture.recover_and_assert_idempotent(expected);
+                }
+                eprintln!(
+                    "transaction-install kind={kind:?} events={} prefixes={} commit_index={commit}",
+                    trace.len(),
+                    trace.len()
+                );
+            }
+        }
+
+        #[test]
+        fn transaction_recovery_every_prefix_is_idempotent() {
+            let exclusive_install = record_install_trace(CommitKind::Exclusive);
+            let swap_install = record_install_trace(CommitKind::Swap);
+            for seed in RecoverySeed::ALL {
+                let install_trace = match seed.kind() {
+                    CommitKind::Exclusive => &exclusive_install,
+                    CommitKind::Swap => &swap_install,
+                };
+                let recovery_trace = record_recovery_trace(seed, install_trace);
+                for event_index in 0..recovery_trace.len() {
+                    let fixture = seeded_fixture(seed, install_trace);
+                    let observer = RootedObserver::interrupt_after(event_index);
+                    expect_interruption(|| run_observed_recovery(&fixture, observer.clone()));
+                    assert_eq!(
+                        observer.events(),
+                        recovery_trace[..=event_index],
+                        "recovery trace changed for {} at prefix {event_index}",
+                        seed.label()
+                    );
+                    fixture.assert_visible(seed.visibility());
+                    fixture.recover_and_assert_idempotent(seed.visibility());
+                }
+                eprintln!(
+                    "transaction-recovery seed={} events={} prefixes={}",
+                    seed.label(),
+                    recovery_trace.len(),
+                    recovery_trace.len()
+                );
+            }
+        }
+
+        #[test]
+        fn transaction_corruption_preserves_evidence() {
+            let install_trace = record_install_trace(CommitKind::Swap);
+            for case in ["malformed", "unknown", "identity-replacement"] {
+                let fixture = seeded_fixture(RecoverySeed::SwapPre, &install_trace);
+                let (_, active) = fixture.active_journal();
+                match case {
+                    "malformed" => write_private_file(&active.join("intent.json"), b"{invalid\n"),
+                    "unknown" => write_private_file(&active.join("unknown.bin"), b"unknown\n"),
+                    "identity-replacement" => {
+                        let stage = fixture
+                            .corpus
+                            .join(format!("._surgeist-{DOMAIN}-stage-{TOKEN}"));
+                        fs::remove_dir_all(&stage).expect("remove registered stage");
+                        fs::create_dir(&stage).expect("create replacement stage");
+                        fs::set_permissions(
+                            &stage,
+                            fs::Permissions::from_mode(CORPUS_DIRECTORY_MODE),
+                        )
+                        .expect("set replacement stage mode");
+                        let replacement = stage.join("replacement.txt");
+                        fs::write(&replacement, b"replacement evidence\n")
+                            .expect("write replacement stage evidence");
+                        fs::set_permissions(
+                            replacement,
+                            fs::Permissions::from_mode(CORPUS_FILE_MODE),
+                        )
+                        .expect("set replacement evidence mode");
+                    }
+                    _ => unreachable!("closed corruption case"),
+                }
+                let before = fixture.snapshot();
+                let error = fixture.recover().expect_err("corrupt transaction evidence");
+                assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+                assert_eq!(fixture.snapshot(), before, "{case} evidence was changed");
+                fixture.assert_visible(Visible::Old);
+                assert!(!fixture.residue().is_empty());
+            }
+            eprintln!("transaction-corruption cases=3 preserved=3 kind=ArtifactTransaction");
+        }
+
+        #[test]
+        fn transaction_post_commit_failure_keeps_new_generation() {
+            for kind in [CommitKind::Exclusive, CommitKind::Swap] {
+                let trace = record_install_trace(kind);
+                let seed = match kind {
+                    CommitKind::Exclusive => RecoverySeed::ExclusivePost,
+                    CommitKind::Swap => RecoverySeed::SwapPost,
+                };
+                let fixture = seeded_fixture(seed, &trace);
+                let (active_name, _) = fixture.active_journal();
+                let rooted = RootedFs::open_corpus(&fixture.location)
+                    .expect("open post-commit failure authority");
+                let engine =
+                    TransactionEngine::new(&rooted, TRANSACTION_PARENT, AUTHORITY_KEY, DOMAIN)
+                        .expect("open post-commit transaction engine");
+                let error = engine
+                    .finish_failed_install(
+                        &active_name,
+                        true,
+                        GeneratorError::new(
+                            GeneratorErrorKind::Io,
+                            "inject post-commit operational failure",
+                            "test-only failure after the real commit event",
+                        ),
+                    )
+                    .expect_err("post-commit failure must be ArtifactTransaction");
+                assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+                drop(engine);
+                drop(rooted);
+                fixture.assert_clean(Visible::New);
+                fixture.recover_and_assert_idempotent(Visible::New);
+            }
+
+            let trace = record_install_trace(CommitKind::Swap);
+            let fixture = seeded_fixture(RecoverySeed::SwapPost, &trace);
+            let (active_name, active) = fixture.active_journal();
+            write_private_file(&active.join("unknown-cleanup-member"), b"retain me\n");
+            let before = fixture.snapshot();
+            let rooted = RootedFs::open_corpus(&fixture.location)
+                .expect("open post-commit cleanup-failure authority");
+            let engine = TransactionEngine::new(&rooted, TRANSACTION_PARENT, AUTHORITY_KEY, DOMAIN)
+                .expect("open post-commit cleanup-failure engine");
+            let error = engine
+                .finish_failed_install(
+                    &active_name,
+                    true,
+                    GeneratorError::new(
+                        GeneratorErrorKind::Io,
+                        "inject post-commit operation failure",
+                        "cleanup must retain the committed generation",
+                    ),
+                )
+                .expect_err("failed post-commit cleanup must be ArtifactTransaction");
+            assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+            drop(engine);
+            drop(rooted);
+            fixture.assert_visible(Visible::New);
+            assert_eq!(
+                fixture.snapshot(),
+                before,
+                "cleanup evidence was not retained"
+            );
+            fs::remove_file(active.join("unknown-cleanup-member"))
+                .expect("remove injected cleanup blocker");
+            fixture.recover_and_assert_idempotent(Visible::New);
+            eprintln!(
+                "transaction-post-commit operational_failures=2 cleanup_failures=1 new_preserved=3"
+            );
+        }
+    }
 
     #[test]
     fn durable_protocol_orders_intent_old_registration_new_and_prepared_before_one_commit() {
         for kind in [CommitKind::Exclusive, CommitKind::Swap] {
             let protocol = TransactionProtocol::new(kind);
+            assert_eq!(protocol.commit_kind(), kind);
             assert!(protocol.has_exact_durable_order());
             assert_eq!(protocol.commit_count(), 1);
             assert_eq!(
@@ -1532,44 +2125,6 @@ mod tests {
                     .count(),
                 1
             );
-        }
-    }
-
-    #[test]
-    fn every_crash_prefix_preserves_old_before_commit_and_new_after_commit() {
-        for kind in [CommitKind::Exclusive, CommitKind::Swap] {
-            let protocol = TransactionProtocol::new(kind);
-            let commit_index = protocol
-                .steps()
-                .iter()
-                .position(|step| *step == ProtocolStep::Commit)
-                .unwrap();
-            for (index, prefix) in protocol.crash_prefixes().enumerate() {
-                let recovered = prefix.recover().unwrap();
-                assert!(recovered.one_complete_generation());
-                assert_eq!(recovered.commit_kind(), kind);
-                if index <= commit_index {
-                    assert_eq!(recovered.visible(), VisibleGeneration::Old);
-                } else {
-                    assert_eq!(recovered.visible(), VisibleGeneration::New);
-                }
-                let cleanup_finished = index
-                    > protocol
-                        .steps()
-                        .iter()
-                        .position(|step| *step == ProtocolStep::RemoveCompletedDirectory)
-                        .unwrap();
-                let intent_durable = index
-                    > protocol
-                        .steps()
-                        .iter()
-                        .position(|step| *step == ProtocolStep::PublishIntent)
-                        .unwrap();
-                assert_eq!(
-                    recovered.has_resumable_evidence(),
-                    intent_durable && !cleanup_finished
-                );
-            }
         }
     }
 }
