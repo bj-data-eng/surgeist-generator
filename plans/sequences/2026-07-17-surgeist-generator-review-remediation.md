@@ -11,9 +11,9 @@
   `05293743a551454adcf63345e80ef0d3982786b1`.
 - Clean reviewed specification:
   `plans/specs/2026-07-17-surgeist-generator-review-remediation.md` at commit
-  `c0a1bc9a92a8bb90de57dbc94aa3875c1fb018e9`, normalized semantic-content
+  `7f482badb807675bf1d30b6f1cbf39c6d01297e6`, normalized semantic-content
   SHA-256
-  `81accda62cf72154ab414971b02dea55e88ecb9bdcbff7b2651f02aa48dd04fd`.
+  `eb40f1a16781f59c119a1eb7c50e79a1e0c130d3b1c144be6528922fea721f82`.
 - Scope remains this leaf repository. Root integration, root API artifacts,
   sibling corpus adoption, and root gitlink promotion remain excluded.
 
@@ -26,8 +26,8 @@
   ordinary absence without weakening path policy; production transaction,
   bootstrap, owner-record, and rename-probe paths replace model-only recovery
   claims with exhaustive observable interruption evidence. Pre-existing format,
-  warning, and Clippy defects in the shared-core baseline are corrected here so
-  this first candidate is independently publishable.
+  warning, and Clippy defects in the shared-core baseline are corrected so this
+  first candidate is independently publishable.
 - Specification sections: SR-02 rows **Rooted lease-tree rejection** and
   **Model-only crash/bootstrap tests**, plus the pre-existing portion of
   **Quality matrix**; SR-04.1 through SR-04.4; the transaction, lease,
@@ -57,11 +57,11 @@
   calls replace artificial private-front-door linkage.
 - Specification sections: the CSS and shared clauses of SR-01 and SR-02
   **Missing domain surface**, **Tautological CLI test**, and affected quality
-  obligations; SR-03.1 and SR-03.2 shared/CSS clauses; SR-04.5 CSS state,
+  obligations; SR-03.1 and SR-03.2 shared/CSS clauses; SR-04.5 CSS source,
   historical-inventory, filtered-selection, publication, and error clauses;
-  SR-04.6 real-domain linkage; SR-05.1 CSS feature edge, SR-05.3, and the CSS
-  portion of SR-05.4; SR-07.1 through SR-07.4; the CSS portion of SR-08.1 and
-  affected SR-08.3 evidence.
+  SR-04.6 CSS linkage; SR-05.1 CSS feature edge, SR-05.3, and the CSS portion of
+  SR-05.4; SR-07.1 through SR-07.4; the CSS portion of SR-08.1 and affected
+  SR-08.3 evidence.
 - Prerequisites: C01 is published and remotely verified; its production
   recovery and publication primitives remain the only mutation foundation.
 - Entry state: shared recovery is cycle-clean, while `css-corpus` is inert and
@@ -76,103 +76,86 @@
   immutable SHA plus shared-source, publication, and CSS evidence to C03. No
   sibling corpus is read or changed.
 
-### C03 — Layout Corpus And Deterministic Artifact Engine
+### C03 — Browser-Free Layout Corpus Interface
 
 - Owning repository: `surgeist-generator`.
-- Bounded outcome: a browser-independent, crate-private layout domain engine
-  owns schema-2 compatibility, partitioned Taffy import/checking, deterministic
-  filtering and historical inventory, HTML/job preparation, measurement-result
-  modeling, XML/report bytes, offline checking, and clean/diagnostic/filtered
-  artifact plans. The preserved source remains immutable and retained; no public
-  layout interface or browser process is introduced in this cycle.
-- Specification sections: layout corpus clauses of SR-01; layout non-browser
-  clauses of SR-03.1 and SR-03.2; layout import/check, historical-inventory,
-  filtered-selection, and artifact-policy clauses of SR-04.5; SR-06.1 and
-  SR-06.2; the browser-independent HTML, four-variant mapping, measurement-value,
-  XML/report schema, digest, checking, and publication-policy clauses of SR-06.3;
-  and the corresponding internal error evidence from SR-08.1.
+- Bounded outcome: one complete, production-reachable `layout-browser` module
+  and thin layout binary expose `check-corpus`, `check-taffy-corpus`, and
+  `import-taffy`. Those commands own schema-2 compatibility, partitioned Taffy
+  import and verification, deterministic current/historical inventory,
+  disposition and four-variant accounting, XML/report validation, and offline
+  corpus attestation. Every implementation path introduced by this cycle is
+  reached by one of those public commands; there is no generation engine,
+  browser backend, artificial linkage, or provisional interface.
+- Specification sections: the browser-free layout clauses of SR-01 and the
+  layout portion of SR-02 **Missing domain surface**, **Tautological CLI test**,
+  and affected quality obligations; layout import/check clauses of SR-03.1 and
+  SR-03.2; SR-04.5 layout import, read-only checking, historical authority,
+  inventory, and scoped-report selection clauses; SR-04.6 browser-free layout
+  linkage; the layout target without its later heavy dependency edge in SR-05.1;
+  the browser-free capability set in SR-05.2; browser-free interface clauses of
+  SR-05.4; SR-06.1, SR-06.2, and the offline inventory/XML/report verification
+  clauses of SR-06.3; and the corresponding SR-08.1 and affected SR-08.3 clauses.
 - Prerequisites: C02 is published and remotely verified; shared source,
   inventory, transaction, and report contracts are stable; the preservation
   digest still matches the reviewed specification.
-- Entry state: CSS is complete, but every retained layout manifest/import/filter/
-  XML/report responsibility still exists only in the preservation source and the
-  `layout-browser` feature remains inert.
-- Exit evidence: production layout-domain code and browser-independent synthetic
-  evidence agree with schema-2 compatibility, sidecar-free migration, authored/
-  Taffy partitioning, exact selection/dispositions, cross-generation authority,
-  measurement-to-artifact mapping, complete byte goldens, offline attestation,
-  and all three artifact policies; no browser dependency, launch, public API, or
-  preservation deletion has occurred.
+- Entry state: CSS is complete, but the layout feature remains inert and every
+  retained layout manifest, Taffy, XML, report, and offline-check responsibility
+  exists only in the immutable preservation source.
+- Exit evidence: the production library and packaged binary execute all three
+  browser-free commands against explicit synthetic roots; their API, CLI,
+  schema compatibility, partitioned import, source proof, exact inventory,
+  report/digest relationships, stale-state classifications, and read-only
+  coordination behavior satisfy the affected feature matrix. The preservation
+  source remains byte-identical, no heavy browser dependency is enabled, and no
+  generation-only code or command exists.
 - Handoff: publish and remotely verify the C03 leaf candidate, then provide its
-  immutable SHA, preservation mapping, and deterministic domain/artifact evidence
-  to C04.
+  immutable SHA, browser-free API/CLI evidence, and mapped preservation
+  responsibilities to C04. No root or sibling handoff occurs.
 
-### C04 — Layout Browser Runtime And Dependency Boundary
-
-- Owning repository: `surgeist-generator`.
-- Bounded outcome: the exact optional layout dependency graph supports a safe,
-  crate-private trusted-browser backend with pinned executable validation,
-  normalized Chromiumoxide configuration, authenticated supervisor launch,
-  durable profile journals, process-group terminalization, retry behavior, and
-  post-crash recovery. It consumes C03's normalized jobs/outcomes without yet
-  exposing the final layout API or deleting the preservation source.
-- Specification sections: browser cache, executable, launch-switch, environment,
-  and closing-revalidation clauses of SR-03.1 and SR-03.2; all of SR-03.3; the
-  acquisition/profile/browser rows of SR-04.5; the layout dependency, feature,
-  MSRV, license, advisory, and policy clauses of SR-05.1; the supervisor portion
-  of SR-05.4; browser execution, batching, retry, and terminalization clauses of
-  SR-06.3; layout process/error clauses of SR-08.1; and the affected dependency/
-  feature evidence of SR-08.3.
-- Prerequisites: C03 is published and remotely verified; its normalized jobs,
-  outcomes, provenance inputs, and artifact boundary are stable; every declared
-  dependency resolves from the already-present offline cache.
-- Entry state: the complete browser-independent layout engine is cycle-clean,
-  while the layout feature has no browser graph, trusted executable boundary,
-  supervisor, or recoverable profile lifecycle.
-- Exit evidence: the exact feature/dependency graph and dependency-policy files
-  pass their offline MSRV/license/advisory obligations; configuration and
-  supervisor adapters prove manifest/driver switch semantics; production-path
-  synthetic processes prove version/launch/panic/retry/group/profile behavior,
-  acquisition ordering, recovery prefixes, and returned-error precedence without
-  launching or acquiring Chromium.
-- Handoff: publish and remotely verify the C04 leaf candidate, then provide its
-  immutable SHA, dependency-policy evidence, and terminal browser-runtime
-  evidence to C05.
-
-### C05 — Layout Composition, Preservation Retirement, And Leaf Candidate
+### C04 — Atomic Layout Generation And Leaf Candidate
 
 - Owning repository: `surgeist-generator`.
-- Bounded outcome: C03's deterministic engine and C04's browser backend compose
-  behind the exact `layout-browser` public API and thin binary; all four commands
-  have final behavior, the preservation responsibility map is complete before
-  `legacy_generator.rs` is removed, both real domain fronts replace artificial
-  linkage, and repository guidance plus the complete offline matrix describe and
-  verify the resulting two-driver crate.
-- Specification sections: remaining SR-01 decisions and SR-02 **Missing domain
-  surface**, **Quality matrix**, **Stale guidance**, and **Tautological CLI test**
-  obligations; composed layout clauses of SR-03 and SR-04.5; final SR-04.6
-  linkage/quality; the complete feature matrix in SR-05.1, all of SR-05.2, and
-  layout interface/binary clauses of SR-05.4; composed orchestration/publication
-  clauses of SR-06.3 and all of SR-06.4; remaining SR-08.1, all of SR-08.2 and
-  SR-08.3; and SR-09.
-- Prerequisites: C04 is published and remotely verified; C03/C04 contracts remain
-  compatible; the preservation digest and complete responsibility map are
-  revalidated before deletion.
-- Entry state: browser-independent layout behavior and the browser backend are
-  cycle-clean but crate-private; `layout-browser` has no final public module or
-  interface binary, preservation remains, and README/AGENTS still describe the
-  scaffold.
-- Exit evidence: both exact public APIs and required-feature binaries are the only
-  production fronts; layout import/check/generate and full/filtered/diagnostic
-  behavior compose end to end; real CLI process failures use the specified
-  prefixes and exit codes; every preserved responsibility is mapped before the
-  source is absent; no artificial linkage or stale guidance remains; the complete
-  supported offline feature, quality, dependency, provenance, and unsafe-absence
-  matrix is clean.
-- Handoff: publish and remotely verify the immutable C05 leaf candidate and
-  produce the canonical leaf completion record for the user's independent review.
-  Any root gitlink, root API artifact, or sibling corpus adoption starts a separate
-  owning-repository workflow.
+- Bounded outcome: the complete generation capability is added as one atomic
+  production vertical slice. The `Generate` command, constructor, accessors,
+  heavy feature edge, trusted-browser boundary, authenticated supervisor,
+  durable profile recovery, Chromium measurement, HTML/job derivation,
+  XML/report production, and clean/diagnostic/filtered publication all become
+  reachable together through the existing public layout module and packaged
+  binary. No backend or dependency-only candidate precedes that front door.
+  The completed responsibility map permits preservation retirement, and final
+  guidance and evidence describe the resulting two-driver crate.
+- Specification sections: all remaining SR-01 and SR-02 obligations; layout
+  generation, browser-cache, executable, launch, environment, and closing-
+  revalidation clauses of SR-03.1 and SR-03.2; all of SR-03.3; remaining layout
+  generation, browser, profile, publication, filtered, diagnostic, and error
+  clauses of SR-04.5; final linkage and quality clauses of SR-04.6; the layout
+  dependency, feature, MSRV, license, advisory, and policy clauses of SR-05.1;
+  the generation capability set in SR-05.2 and remaining SR-05.4 clauses;
+  remaining orchestration, measurement, serialization, and publication clauses
+  of SR-06.3 plus SR-06.4; remaining SR-08.1, all of SR-08.2 and SR-08.3; and
+  SR-09.
+- Prerequisites: C03 is published and remotely verified; its three production
+  commands, corpus model, validation formats, and preservation mapping remain
+  stable; every declared dependency resolves from already-present offline
+  caches.
+- Entry state: both domain fronts are production-reachable, but layout has only
+  its complete browser-free capability set; no generation variant, heavy
+  dependency edge, browser runtime, or generation publication exists, and the
+  preservation source remains immutable.
+- Exit evidence: the final additive layout API and CLI execute all four commands;
+  the exact optional dependency graph and policy evidence are clean; synthetic
+  process and browser adapters prove executable verification, supervisor/profile
+  lifecycle, retry, panic, terminalization, and recovery without launching or
+  acquiring Chromium; generation derives and publishes exact XML/reports under
+  every policy; all retained responsibilities are mapped before the preservation
+  source is removed; no artificial linkage or stale guidance remains; and the
+  complete supported offline feature, quality, provenance, dependency, and
+  unsafe-absence matrix is clean.
+- Handoff: publish and remotely verify the immutable C04 leaf candidate and
+  produce the canonical leaf completion record for the user's independent
+  review. Any root gitlink, root API artifact, or sibling corpus adoption starts
+  a separate owning-repository workflow.
 
 ## Closure Allocation
 
@@ -185,18 +168,18 @@ The sequence allocates every contract exactly once at its final closure boundary
 | Pre-existing shared-core warning/format/Clippy failures | C01 |
 | Shared production transaction/bootstrap/owner/probe recovery | C01 |
 | Protected-source foundation and complete CSS domain surface | C02 |
-| CSS half of missing-domain and real-CLI findings | C02 |
-| Layout schema/import/filter/inventory and deterministic artifact engine | C03 |
-| Browser dependency, trusted-executable, supervisor, profile, and process contracts | C04 |
-| Layout public surface, binary, composed publication, and preservation retirement | C05 |
-| Layout half of missing-domain and real-CLI findings | C05 |
-| Final composed quality matrix, stale guidance, and leaf handoff | C05 |
+| CSS portion of missing-domain and real-CLI findings | C02 |
+| Browser-free layout surface and layout real-CLI evidence | C03 |
+| Layout schema, Taffy partition, historical authority, and offline corpus checking | C03 |
+| Final missing-domain closure: layout generation API, browser runtime, and artifact publication | C04 |
+| Layout preservation retirement | C04 |
+| Final composed quality matrix, guidance, and leaf handoff | C04 |
 
 SR-03 and SR-04.5 close by their explicitly partitioned shared, CSS, layout-
-corpus, browser-runtime, and composed clauses above. SR-05 closes as CSS in C02,
-layout dependencies in C04, and layout/public/composed feature behavior in C05.
-SR-06 closes as deterministic corpus/artifact behavior in C03, browser execution
-in C04, and composition/retirement in C05. SR-07 closes in C02; SR-08 error
-clauses close with their owning domain and its documentation/final matrix in C05;
-SR-09 closes with the C05 candidate handoff. No baseline finding or specification
-clause is deferred beyond C05.
+browser-free, and layout-generation clauses above. SR-05 closes as CSS in C02,
+the browser-free layout front in C03, and the atomic layout generation extension
+in C04. SR-06 closes as import/offline verification in C03 and generation plus
+retirement in C04. SR-07 closes in C02; SR-08 error clauses close with their
+owning behavior and its final documentation/matrix in C04; SR-09 closes with the
+C04 candidate handoff. No baseline finding or specification clause is deferred
+beyond C04.
