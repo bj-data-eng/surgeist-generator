@@ -527,6 +527,17 @@ handles, and is never a `GeneratorError` available to production. Each prefix is
 reopened through a fresh `RootedFs`; actual tree bytes and the complete journal/
 temporary/stage/reservation/receipt inventory are asserted.
 
+Every test that reruns a real filesystem or process scenario for each durability
+event, byte prefix, or recovery prefix is an explicit opt-in diagnostic marked
+with Rust's `#[ignore]` facility. Ordinary `cargo test` commands compile but do
+not execute those diagnostics under any feature combination. Focused evidence
+invokes each diagnostic with an exact name filter plus libtest `--ignored`, and
+an ignored-test listing proves the exhaustive inventory remains outside the
+ordinary suite. Lightweight observer, corruption, error, and ordering tests stay
+in the ordinary suite unless they themselves enumerate every real prefix. No
+environment variable, machine state, or implicit timing rule selects the
+diagnostic class.
+
 ### SR-04.3 Install and recovery oracles
 
 Install traces cover both commit kinds:
@@ -1926,7 +1937,10 @@ Feature tests are synthetic and cannot launch/download Chromium, execute a sourc
 clone/fetch, or read siblings. Final evidence records the owned-Rust executable
 unsafe scan, exact preservation digest/retirement map, baseline-finding closure
 table, license/advisory output and database staleness, clean status, and immutable
-remote readback.
+remote readback. Every ordinary test command above must report the exhaustive
+real-prefix diagnostics as ignored rather than execute them. The owning cycle's
+focused command inventory separately lists and executes those diagnostics with
+libtest `--ignored`.
 
 ## SR-09 Initiative Constraints And Handoff
 
