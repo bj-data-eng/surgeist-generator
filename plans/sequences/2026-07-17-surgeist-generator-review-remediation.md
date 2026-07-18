@@ -11,14 +11,16 @@
   `05293743a551454adcf63345e80ef0d3982786b1`.
 - Clean reviewed specification:
   `plans/specs/2026-07-17-surgeist-generator-review-remediation.md` at commit
-  `66fa0cb31521bd03bfb240396ff8d900ee9f9d24`, normalized semantic-content
+  `0c56de73f0280993761314f514626951de56cfb7`, normalized semantic-content
   SHA-256
-  `da98c3d8047cc696ea0ca96e81858c5f9ac16acac1ab367263ec0e83d6537253`.
+  `9a1a148c198d39145017db769b9ab91025f1cc37719efc6d3c68ab998da7c524`.
 - Scope remains this leaf repository. Root integration, root API artifacts,
   sibling corpus adoption, and root gitlink promotion remain excluded.
 - Across every cycle, exhaustive real durability, byte-prefix, recovery-prefix,
   and process-prefix enumerators are explicit opt-in diagnostics; ordinary Cargo
-  test matrices compile but never execute them.
+  test matrices compile but never execute them. C01 through C04 compare the exact
+  cumulative ignored inventory; only C04, after every initiative implementation
+  task is complete, runs that inventory once in one sequential Cargo invocation.
 
 ## Ordered Cycles
 
@@ -43,13 +45,15 @@
   stop before their intended assertions, recovery tests prove separate models,
   and the configured baseline quality checks are not clean.
 - Exit evidence: every affected lease/artifact assertion reaches its intended
-  condition; every production install, recovery, cleanup, unsupported-capability,
-  corruption, and contention prefix satisfies the specified visibility, residue,
-  kind, and idempotence oracles through explicit diagnostic execution; ordinary
-  test matrices report every exhaustive diagnostic ignored; the affected
-  shared-core and baseline quality matrix is clean.
+  condition; production install, recovery, cleanup, unsupported-capability,
+  corruption, and contention diagnostics encode the specified visibility,
+  residue, kind, and idempotence oracles; their bodies compile and their ignored
+  inventory is exact without executing them; ordinary tests and the affected
+  shared-core and baseline quality matrix are clean. Runtime execution is
+  explicitly deferred to the initiative-final C04 gate.
 - Handoff: publish and remotely verify the C01 leaf candidate, then provide its
-  immutable SHA and recovery evidence to C02. No root or sibling handoff occurs.
+  immutable SHA, accepted historical T03 evidence, and deferred diagnostic
+  inventory to C02. No root or sibling handoff occurs.
 
 ### C02 — Protected Source And CSS Vertical Slice
 
@@ -155,7 +159,10 @@
   every policy; all retained responsibilities are mapped before the preservation
   source is removed; no artificial linkage or stale guidance remains; and the
   complete supported offline feature, quality, provenance, dependency, and
-  unsafe-absence matrix is clean.
+  unsafe-absence matrix is clean. After every C01–C04 implementation task is
+  complete, the exact cumulative ignored diagnostic inventory runs once through
+  the specification's single sequential all-features Cargo command; any failure
+  stops publication and is not rerun without new user authority.
 - Handoff: publish and remotely verify the immutable C04 leaf candidate and
   produce the canonical leaf completion record for the user's independent
   review. Any root gitlink, root API artifact, or sibling corpus adoption starts
