@@ -11,11 +11,14 @@
   `05293743a551454adcf63345e80ef0d3982786b1`.
 - Clean reviewed specification:
   `plans/specs/2026-07-17-surgeist-generator-review-remediation.md` at commit
-  `7f482badb807675bf1d30b6f1cbf39c6d01297e6`, normalized semantic-content
+  `66fa0cb31521bd03bfb240396ff8d900ee9f9d24`, normalized semantic-content
   SHA-256
-  `eb40f1a16781f59c119a1eb7c50e79a1e0c130d3b1c144be6528922fea721f82`.
+  `da98c3d8047cc696ea0ca96e81858c5f9ac16acac1ab367263ec0e83d6537253`.
 - Scope remains this leaf repository. Root integration, root API artifacts,
   sibling corpus adoption, and root gitlink promotion remain excluded.
+- Across every cycle, exhaustive real durability, byte-prefix, recovery-prefix,
+  and process-prefix enumerators are explicit opt-in diagnostics; ordinary Cargo
+  test matrices compile but never execute them.
 
 ## Ordered Cycles
 
@@ -42,8 +45,9 @@
 - Exit evidence: every affected lease/artifact assertion reaches its intended
   condition; every production install, recovery, cleanup, unsupported-capability,
   corruption, and contention prefix satisfies the specified visibility, residue,
-  kind, and idempotence oracles; the affected shared-core and baseline quality
-  matrix is clean.
+  kind, and idempotence oracles through explicit diagnostic execution; ordinary
+  test matrices report every exhaustive diagnostic ignored; the affected
+  shared-core and baseline quality matrix is clean.
 - Handoff: publish and remotely verify the C01 leaf candidate, then provide its
   immutable SHA and recovery evidence to C02. No root or sibling handoff occurs.
 
