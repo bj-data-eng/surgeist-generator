@@ -1702,6 +1702,7 @@ struct OwnerOutcomeMarker {
     visible_identity: Option<HeldIdentity>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 struct OwnerRecordStamp {
     pid: u32,
@@ -1731,20 +1732,21 @@ fn install_owner_record(
             )
         })?
         .as_secs();
-    install_owner_record_controlled(
-        rooted,
-        location,
-        domain,
-        metadata,
-        token,
-        authority_key,
-        OwnerRecordStamp {
-            pid: std::process::id(),
-            unix_start_time,
-        },
-    )
+    let owner = OwnerRecord {
+        schema_version: 1,
+        generator: metadata.generator.clone(),
+        pid: std::process::id(),
+        owner_root: location.owner_root().display().to_string(),
+        corpus_root: location.corpus_root().display().to_string(),
+        scope: metadata.scope.clone(),
+        command: metadata.command.clone(),
+        unix_start_time,
+    };
+    let owner_bytes = canonical_json(&owner, "serialize historical generation owner")?;
+    install_owner_record_bytes(rooted, domain, token, authority_key, &owner_bytes)
 }
 
+#[cfg(test)]
 fn install_owner_record_controlled(
     rooted: &RootedFs,
     location: &CorpusLocation,
@@ -1754,15 +1756,6 @@ fn install_owner_record_controlled(
     authority_key: &str,
     stamp: OwnerRecordStamp,
 ) -> Result<()> {
-    #[cfg(test)]
-    let _observation_phase = rooted.begin_observation_phase(DurabilityPhase::OwnerInstall);
-    let parent = format!(
-        ".surgeist-generator/leases/{}/{}",
-        domain.as_str(),
-        OWNER_TRANSACTIONS
-    );
-    let active = format!("{parent}/active-{token}");
-    let active_identity = rooted.create_dir_exclusive(&active, PRIVATE_DIRECTORY_MODE)?;
     let owner = OwnerRecord {
         schema_version: 1,
         generator: metadata.generator.clone(),
@@ -1774,6 +1767,25 @@ fn install_owner_record_controlled(
         unix_start_time: stamp.unix_start_time,
     };
     let owner_bytes = canonical_json(&owner, "serialize historical generation owner")?;
+    install_owner_record_bytes(rooted, domain, token, authority_key, &owner_bytes)
+}
+
+fn install_owner_record_bytes(
+    rooted: &RootedFs,
+    domain: Domain,
+    token: &str,
+    authority_key: &str,
+    owner_bytes: &[u8],
+) -> Result<()> {
+    #[cfg(test)]
+    let _observation_phase = rooted.begin_observation_phase(DurabilityPhase::OwnerInstall);
+    let parent = format!(
+        ".surgeist-generator/leases/{}/{}",
+        domain.as_str(),
+        OWNER_TRANSACTIONS
+    );
+    let active = format!("{parent}/active-{token}");
+    let active_identity = rooted.create_dir_exclusive(&active, PRIVATE_DIRECTORY_MODE)?;
     let owner_path = owner_path(domain);
     let (old_digest, old_identity) = if rooted.exists(&owner_path)? {
         (
@@ -1794,7 +1806,7 @@ fn install_owner_record_controlled(
         stage_path: stage_path.clone(),
         old_digest,
         old_identity,
-        new_digest: Sha256Digest::from_bytes(&owner_bytes),
+        new_digest: Sha256Digest::from_bytes(owner_bytes),
     };
     rooted.publish_file_exclusive(
         &active,
@@ -1815,7 +1827,7 @@ fn install_owner_record_controlled(
         PRIVATE_FILE_MODE,
     )?;
     rooted
-        .write_file_handle_all(&stage_path, &mut stage, &owner_bytes)
+        .write_file_handle_all(&stage_path, &mut stage, owner_bytes)
         .map_err(|source| {
             transaction_source(
                 "write historical generation owner stage",
@@ -1882,7 +1894,14 @@ fn install_owner_record_controlled(
         }
         rooted.remove_file_exact(&stage_path, expected_old)?;
     }
-    cleanup_owner_journal(rooted, &active, active_identity)
+    cleanup_owner_journal(
+        rooted,
+        domain,
+        authority_key,
+        token,
+        &active,
+        active_identity,
+    )
 }
 
 fn recover_owner_transactions(
@@ -1933,7 +1952,14 @@ fn recover_owner_transactions(
                     &active,
                     &names[0],
                 )?;
-                cleanup_owner_journal(rooted, &active, active_identity)?;
+                cleanup_owner_journal(
+                    rooted,
+                    domain,
+                    authority_key,
+                    token,
+                    &active,
+                    active_identity,
+                )?;
                 continue;
             }
             if names.iter().any(|member| member != &expected) {
@@ -2238,7 +2264,14 @@ fn recover_owner_transactions(
                 "owner/stage contents match neither durable outcome",
             ));
         }
-        cleanup_owner_journal(rooted, &active, active_identity)?;
+        cleanup_owner_journal(
+            rooted,
+            domain,
+            authority_key,
+            token,
+            &active,
+            active_identity,
+        )?;
     }
     Ok(())
 }
@@ -2544,60 +2577,485 @@ fn validate_standalone_owner_outcome(
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct OwnerCleanupMember {
+    name: String,
+    identity: HeldIdentity,
+}
+
 fn cleanup_owner_journal(
     rooted: &RootedFs,
+    domain: Domain,
+    authority_key: &str,
+    token: &str,
     journal: &str,
     journal_identity: HeldIdentity,
 ) -> Result<()> {
     #[cfg(test)]
     let _observation_phase = rooted.begin_observation_phase(DurabilityPhase::OwnerCleanup);
-    let names = rooted.list_dir(journal)?;
-    let outcome = existing_owner_outcome(rooted, journal)?.ok_or_else(|| {
-        transaction_error(
+    let removal_order = validate_owner_cleanup(
+        rooted,
+        domain,
+        authority_key,
+        token,
+        journal,
+        &journal_identity,
+    )?;
+    for member in removal_order {
+        rooted.remove_file_exact(&format!("{journal}/{}", member.name), &member.identity)?;
+    }
+    rooted.remove_dir_exact(journal, &journal_identity)
+}
+
+fn validate_owner_cleanup(
+    rooted: &RootedFs,
+    domain: Domain,
+    authority_key: &str,
+    token: &str,
+    journal: &str,
+    journal_identity: &HeldIdentity,
+) -> Result<Vec<OwnerCleanupMember>> {
+    validate_token(token)?;
+    let expected_journal = format!(
+        ".surgeist-generator/leases/{}/{OWNER_TRANSACTIONS}/active-{token}",
+        domain.as_str()
+    );
+    if journal != expected_journal {
+        return Err(transaction_error(
             "clean private journal",
-            "owner journal has no durable outcome marker",
-        )
-    })?;
+            "owner cleanup journal path differs from its domain and token",
+        ));
+    }
+    validate_owner_cleanup_journal_identity(rooted, journal, journal_identity)?;
+
+    let names = rooted.list_dir(journal)?;
+    let outcome = match (
+        names.iter().any(|name| name == "aborted"),
+        names.iter().any(|name| name == "committed"),
+    ) {
+        (true, false) => OwnerOutcomeKind::Aborted,
+        (false, true) => OwnerOutcomeKind::Committed,
+        (false, false) => {
+            return Err(transaction_error(
+                "clean private journal",
+                "owner journal has no durable outcome marker",
+            ));
+        }
+        (true, true) => {
+            return Err(transaction_error(
+                "clean private journal",
+                "owner journal contains conflicting outcome markers",
+            ));
+        }
+    };
     let outcome_name = match outcome {
         OwnerOutcomeKind::Aborted => "aborted",
         OwnerOutcomeKind::Committed => "committed",
     };
-    let mut removal_order: Vec<_> = names
+    let has_intent = names.iter().any(|name| name == "intent.json");
+    let has_registration = names.iter().any(|name| name == "stage-registration.json");
+    let has_prepared = names.iter().any(|name| name == "prepared.json");
+    let registration_temporary = format!("stage-registration-{token}.tmp");
+    let prepared_temporary = format!("prepared-{token}.tmp");
+    let has_registration_temporary = names.iter().any(|name| name == &registration_temporary);
+    let has_prepared_temporary = names.iter().any(|name| name == &prepared_temporary);
+
+    for name in &names {
+        if !matches!(
+            name.as_str(),
+            "intent.json" | "stage-registration.json" | "prepared.json" | "aborted" | "committed"
+        ) && name != &registration_temporary
+            && name != &prepared_temporary
+        {
+            return Err(transaction_error(
+                "clean private journal",
+                format!("owner journal contains an unexpected cleanup member: {name}"),
+            ));
+        }
+    }
+    if !has_intent && (names.len() != 1 || names[0] != outcome_name) {
+        return Err(transaction_error(
+            "clean private journal",
+            "standalone owner outcome retains other cleanup members",
+        ));
+    }
+    if has_prepared && !has_registration {
+        return Err(transaction_error(
+            "clean private journal",
+            "owner prepared marker has no stage registration",
+        ));
+    }
+    if outcome == OwnerOutcomeKind::Committed
+        && (has_registration_temporary || has_prepared_temporary)
+    {
+        return Err(transaction_error(
+            "clean private journal",
+            "committed owner cleanup retains a publication temporary",
+        ));
+    }
+    if has_registration_temporary && (has_registration || has_prepared || has_prepared_temporary) {
+        return Err(transaction_error(
+            "clean private journal",
+            "owner stage-registration temporary conflicts with later state",
+        ));
+    }
+    if has_prepared_temporary && (!has_registration || has_prepared) {
+        return Err(transaction_error(
+            "clean private journal",
+            "owner prepared temporary conflicts with its registration",
+        ));
+    }
+
+    let mut members = Vec::with_capacity(names.len());
+    for name in &names {
+        let path = format!("{journal}/{name}");
+        let identity = rooted.identity_at(&path)?.ok_or_else(|| {
+            transaction_error(
+                "clean private journal",
+                format!("owner cleanup member disappeared: {name}"),
+            )
+        })?;
+        validate_owner_cleanup_member_identity(rooted, name, &identity)?;
+        members.push(OwnerCleanupMember {
+            name: name.clone(),
+            identity,
+        });
+    }
+
+    let marker_member = owner_cleanup_member(&members, outcome_name)?;
+    let marker: OwnerOutcomeMarker = serde_json::from_slice(&read_owner_cleanup_file(
+        rooted,
+        &format!("{journal}/{outcome_name}"),
+        &marker_member.identity,
+    )?)
+    .map_err(|error| {
+        transaction_error(
+            "clean private journal",
+            format!("invalid owner cleanup outcome marker: {error}"),
+        )
+    })?;
+    validate_owner_cleanup_marker(rooted, domain, authority_key, token, outcome, &marker)?;
+
+    if has_intent {
+        validate_owner_cleanup_intent(
+            rooted,
+            authority_key,
+            token,
+            journal,
+            outcome,
+            &marker,
+            &members,
+        )?;
+    }
+
+    validate_owner_cleanup_journal_identity(rooted, journal, journal_identity)?;
+    if rooted.list_dir(journal)? != names {
+        return Err(transaction_error(
+            "clean private journal",
+            "owner cleanup inventory changed during validation",
+        ));
+    }
+    for member in &members {
+        let actual = rooted
+            .identity_at(&format!("{journal}/{}", member.name))?
+            .ok_or_else(|| {
+                transaction_error(
+                    "clean private journal",
+                    format!("owner cleanup member disappeared: {}", member.name),
+                )
+            })?;
+        if !member.identity.matches_recovery(&actual) {
+            return Err(transaction_error(
+                "clean private journal",
+                format!("owner cleanup member identity changed: {}", member.name),
+            ));
+        }
+    }
+
+    let mut removal_names: Vec<_> = names
         .iter()
         .filter(|name| name.ends_with(".tmp"))
         .cloned()
         .collect();
     for name in ["prepared.json", "stage-registration.json", "intent.json"] {
         if names.iter().any(|member| member == name) {
-            removal_order.push(name.to_owned());
+            removal_names.push(name.to_owned());
         }
     }
-    removal_order.push(outcome_name.to_owned());
-    if removal_order.len() != names.len()
-        || removal_order.iter().collect::<BTreeSet<_>>().len() != names.len()
+    removal_names.push(outcome_name.to_owned());
+    if removal_names.len() != names.len()
+        || removal_names.iter().collect::<BTreeSet<_>>().len() != names.len()
     {
         return Err(transaction_error(
             "clean private journal",
             "owner journal contains an unclassified cleanup member",
         ));
     }
-    for name in removal_order {
-        let path = format!("{journal}/{name}");
-        let identity = rooted.identity_at(&path)?.ok_or_else(|| {
+    removal_names
+        .into_iter()
+        .map(|name| owner_cleanup_member(&members, &name).cloned())
+        .collect()
+}
+
+fn validate_owner_cleanup_journal_identity(
+    rooted: &RootedFs,
+    journal: &str,
+    expected: &HeldIdentity,
+) -> Result<()> {
+    let actual = rooted.identity_at(journal)?.ok_or_else(|| {
+        transaction_error("clean private journal", "owner cleanup journal disappeared")
+    })?;
+    if expected.kind() != NodeKind::Directory
+        || expected.mode() != PRIVATE_DIRECTORY_MODE
+        || expected.link_count().is_some()
+        || expected.owner() != rooted.identity().owner()
+        || expected.device() != rooted.identity().device()
+        || expected.fsid() != rooted.identity().fsid()
+        || !expected.matches_recovery(&actual)
+    {
+        return Err(transaction_error(
+            "clean private journal",
+            "owner cleanup journal identity or policy changed",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_owner_cleanup_member_identity(
+    rooted: &RootedFs,
+    name: &str,
+    identity: &HeldIdentity,
+) -> Result<()> {
+    if identity.kind() != NodeKind::Regular
+        || identity.mode() != PRIVATE_FILE_MODE
+        || identity.link_count() != Some(1)
+        || identity.owner() != rooted.identity().owner()
+        || identity.device() != rooted.identity().device()
+        || identity.fsid() != rooted.identity().fsid()
+    {
+        return Err(transaction_error(
+            "clean private journal",
+            format!("owner cleanup member has the wrong identity or policy: {name}"),
+        ));
+    }
+    Ok(())
+}
+
+fn owner_cleanup_member<'a>(
+    members: &'a [OwnerCleanupMember],
+    name: &str,
+) -> Result<&'a OwnerCleanupMember> {
+    members
+        .iter()
+        .find(|member| member.name == name)
+        .ok_or_else(|| {
             transaction_error(
                 "clean private journal",
-                format!("member disappeared: {name}"),
+                format!("owner cleanup member disappeared: {name}"),
             )
-        })?;
-        if identity.kind() != NodeKind::Regular || identity.mode() != PRIVATE_FILE_MODE {
+        })
+}
+
+fn read_owner_cleanup_file(
+    rooted: &RootedFs,
+    path: &str,
+    expected: &HeldIdentity,
+) -> Result<Vec<u8>> {
+    let mut file = rooted.open_file_handle(path, PRIVATE_FILE_MODE, false)?;
+    let opened = rooted.identity_of_handle(&file)?;
+    if !expected.matches_recovery(&opened) {
+        return Err(transaction_error(
+            "clean private journal",
+            format!("owner cleanup member changed before read: {path}"),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|source| {
+        transaction_source("read owner cleanup member", path.to_owned(), source)
+    })?;
+    let after = rooted.identity_of_handle(&file)?;
+    let named = rooted.identity_at(path)?.ok_or_else(|| {
+        transaction_error(
+            "clean private journal",
+            format!("owner cleanup member disappeared after read: {path}"),
+        )
+    })?;
+    if !expected.matches_recovery(&after) || !expected.matches_recovery(&named) {
+        return Err(transaction_error(
+            "clean private journal",
+            format!("owner cleanup member changed during read: {path}"),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn validate_owner_cleanup_marker(
+    rooted: &RootedFs,
+    domain: Domain,
+    authority_key: &str,
+    token: &str,
+    outcome: OwnerOutcomeKind,
+    marker: &OwnerOutcomeMarker,
+) -> Result<()> {
+    if marker.schema_version != 1
+        || marker.authority_key != authority_key
+        || marker.token != token
+        || marker.owner_path != owner_path(domain)
+        || marker.outcome != outcome
+        || marker.visible_digest.is_some() != marker.visible_identity.is_some()
+        || (outcome == OwnerOutcomeKind::Committed
+            && (marker.visible_digest.as_ref() != Some(&marker.new_digest)
+                || marker.visible_identity.is_none()))
+    {
+        return Err(transaction_error(
+            "clean private journal",
+            "owner cleanup outcome marker is not canonical",
+        ));
+    }
+    validate_recorded_owner_identity(rooted, marker.visible_identity.as_ref())?;
+    match (&marker.visible_digest, &marker.visible_identity) {
+        (None, None) => {
+            if rooted.identity_at(&marker.owner_path)?.is_some() {
+                return Err(transaction_error(
+                    "clean private journal",
+                    "owner cleanup outcome records absence but an owner is visible",
+                ));
+            }
+        }
+        (Some(expected_digest), Some(expected_identity)) => {
+            let actual_identity = rooted.identity_at(&marker.owner_path)?.ok_or_else(|| {
+                transaction_error(
+                    "clean private journal",
+                    "owner cleanup outcome records a missing visible owner",
+                )
+            })?;
+            if !expected_identity.matches_recovery(&actual_identity) {
+                return Err(transaction_error(
+                    "clean private journal",
+                    "visible owner identity differs from the cleanup outcome",
+                ));
+            }
+            let bytes = read_owner_cleanup_file(rooted, &marker.owner_path, expected_identity)?;
+            if &Sha256Digest::from_bytes(bytes) != expected_digest {
+                return Err(transaction_error(
+                    "clean private journal",
+                    "visible owner bytes differ from the cleanup outcome",
+                ));
+            }
+        }
+        _ => {
             return Err(transaction_error(
                 "clean private journal",
-                format!("invalid journal member: {name}"),
+                "visible owner digest and identity presence differ",
             ));
         }
-        rooted.remove_file_exact(&path, &identity)?;
     }
-    rooted.remove_dir_exact(journal, &journal_identity)
+    Ok(())
+}
+
+fn validate_owner_cleanup_intent(
+    rooted: &RootedFs,
+    authority_key: &str,
+    token: &str,
+    journal: &str,
+    outcome: OwnerOutcomeKind,
+    marker: &OwnerOutcomeMarker,
+    members: &[OwnerCleanupMember],
+) -> Result<()> {
+    let intent_member = owner_cleanup_member(members, "intent.json")?;
+    let intent: OwnerIntent = serde_json::from_slice(&read_owner_cleanup_file(
+        rooted,
+        &format!("{journal}/intent.json"),
+        &intent_member.identity,
+    )?)
+    .map_err(|error| {
+        transaction_error(
+            "clean private journal",
+            format!("invalid owner cleanup intent: {error}"),
+        )
+    })?;
+    if intent.schema_version != 1
+        || intent.authority_key != authority_key
+        || intent.token != token
+        || intent.owner_path != marker.owner_path
+        || intent.stage_path != format!("{journal}/owner.stage")
+        || intent.old_digest.is_some() != intent.old_identity.is_some()
+    {
+        return Err(transaction_error(
+            "clean private journal",
+            "owner cleanup intent authority, token, or fixed paths differ",
+        ));
+    }
+    validate_recorded_owner_identity(rooted, intent.old_identity.as_ref())?;
+    let expected_marker = expected_owner_outcome(
+        &intent,
+        outcome,
+        &OwnerVisibility {
+            digest: marker.visible_digest.clone(),
+            identity: marker.visible_identity.clone(),
+        },
+    );
+    if marker != &expected_marker {
+        return Err(transaction_error(
+            "clean private journal",
+            "owner cleanup outcome marker differs from its intent",
+        ));
+    }
+
+    let registration = if let Some(member) = members
+        .iter()
+        .find(|member| member.name == "stage-registration.json")
+    {
+        let registration: HeldIdentity = serde_json::from_slice(&read_owner_cleanup_file(
+            rooted,
+            &format!("{journal}/stage-registration.json"),
+            &member.identity,
+        )?)
+        .map_err(|error| {
+            transaction_error(
+                "clean private journal",
+                format!("invalid owner cleanup stage registration: {error}"),
+            )
+        })?;
+        validate_recorded_owner_identity(rooted, Some(&registration))?;
+        Some(registration)
+    } else {
+        None
+    };
+    if outcome == OwnerOutcomeKind::Committed
+        && registration.as_ref().is_some_and(|expected| {
+            !marker
+                .visible_identity
+                .as_ref()
+                .is_some_and(|actual| expected.matches_recovery(actual))
+        })
+    {
+        return Err(transaction_error(
+            "clean private journal",
+            "committed owner cleanup differs from its stage registration",
+        ));
+    }
+
+    if let Some(member) = members.iter().find(|member| member.name == "prepared.json") {
+        let prepared: Sha256Digest = serde_json::from_slice(&read_owner_cleanup_file(
+            rooted,
+            &format!("{journal}/prepared.json"),
+            &member.identity,
+        )?)
+        .map_err(|error| {
+            transaction_error(
+                "clean private journal",
+                format!("invalid owner cleanup prepared marker: {error}"),
+            )
+        })?;
+        if registration.is_none() || prepared != intent.new_digest {
+            return Err(transaction_error(
+                "clean private journal",
+                "owner cleanup prepared marker differs from its registration",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn corpus_authority_key(rooted: &RootedFs, domain: Domain) -> String {
@@ -2753,9 +3211,9 @@ mod tests {
         ACQUISITION_LOCK, BOOTSTRAP_LOCKS, BootstrapInstallControl, BootstrapRecoveryControl,
         COORDINATION_ROOT, CoordinationAccess, CoordinationGuard, LeaseMetadata,
         OWNER_TRANSACTIONS, OwnerRecord, OwnerRecordStamp, acquire_exclusive, canonical_json,
-        corpus_authority_key, install_owner_record_controlled, mutex_path, open_existing_lock,
-        open_or_bootstrap_lock, open_or_bootstrap_lock_controlled, owner_path, process_is_live,
-        recover_bootstrap_controlled, recover_owner_transactions,
+        cleanup_owner_journal, corpus_authority_key, install_owner_record_controlled, mutex_path,
+        open_existing_lock, open_or_bootstrap_lock, open_or_bootstrap_lock_controlled, owner_path,
+        process_is_live, recover_bootstrap_controlled, recover_owner_transactions,
     };
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4180,6 +4638,62 @@ mod tests {
             },
         ] {
             exercise_owner_recovery_prefixes(seed, &old_trace);
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn owner_cleanup_corruption_preserves_complete_journal() {
+        let trace = record_owner_install_trace(InitialOwner::Absent);
+        for case in ["replaced-marker", "unexpected-temporary", "linked-member"] {
+            let fixture = OwnerFixture::new(InitialOwner::Absent);
+            interrupt_owner_install(&fixture, &trace, owner_marker_index(&trace, "committed"));
+            let active = fixture.active_path();
+            match case {
+                "replaced-marker" => {
+                    let marker = fixture.corpus.join(format!("{active}/committed"));
+                    fs::remove_file(&marker).expect("replace owner outcome marker");
+                    corrupt_file(&marker, b"{invalid\n");
+                }
+                "unexpected-temporary" => corrupt_file(
+                    &fixture.corpus.join(format!("{active}/injected.tmp")),
+                    b"injected cleanup temporary\n",
+                ),
+                "linked-member" => fs::hard_link(
+                    fixture.corpus.join(format!("{active}/prepared.json")),
+                    fixture.corpus.join("linked-owner-prepared"),
+                )
+                .expect("link owner cleanup member"),
+                _ => unreachable!("fixed corruption cases"),
+            }
+            let rooted = fixture.rooted();
+            let journal_identity = rooted
+                .identity_at(&active)
+                .expect("inspect owner cleanup journal")
+                .expect("owner cleanup journal remains");
+            let authority_key = corpus_authority_key(&rooted, Domain::Layout);
+            let before = fixture.snapshot();
+
+            let error = cleanup_owner_journal(
+                &rooted,
+                Domain::Layout,
+                &authority_key,
+                OWNER_INSTALL_TOKEN,
+                &active,
+                journal_identity,
+            )
+            .expect_err("corrupt owner cleanup journal must be rejected");
+
+            assert_eq!(
+                error.kind(),
+                GeneratorErrorKind::ArtifactTransaction,
+                "{case}"
+            );
+            assert_eq!(
+                fixture.snapshot(),
+                before,
+                "direct owner cleanup did not preserve every {case} journal byte"
+            );
         }
     }
 
