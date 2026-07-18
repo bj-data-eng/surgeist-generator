@@ -141,7 +141,10 @@ impl InventoryEntry {
                 {
                     return Err(inventory_error(
                         "validate inventory entry",
-                        format!("regular-file metadata is incomplete: {}", self.path.as_str()),
+                        format!(
+                            "regular-file metadata is incomplete: {}",
+                            self.path.as_str()
+                        ),
                     ));
                 }
             }
@@ -252,9 +255,8 @@ impl Inventory {
                 format!("unsupported schema version: {}", inventory.schema_version),
             ));
         }
-        Self::new(inventory.root, inventory.entries, policy).map_err(|error| {
-            transaction_error("parse durable tree inventory", error.to_string())
-        })
+        Self::new(inventory.root, inventory.entries, policy)
+            .map_err(|error| transaction_error("parse durable tree inventory", error.to_string()))
     }
 
     pub(crate) fn scan(
@@ -336,7 +338,12 @@ impl Inventory {
     pub(crate) fn removal_order(&self) -> Vec<&InventoryEntry> {
         let mut entries: Vec<_> = self.entries.iter().collect();
         entries.sort_by(|left, right| {
-            let left_depth = left.path.as_str().bytes().filter(|byte| *byte == b'/').count();
+            let left_depth = left
+                .path
+                .as_str()
+                .bytes()
+                .filter(|byte| *byte == b'/')
+                .count();
             let right_depth = right
                 .path
                 .as_str()
@@ -421,7 +428,10 @@ fn validate_policy_identity(
             identity.mode() == CORPUS_FILE_MODE && identity.link_count() == Some(1)
         }
         (InventoryPolicy::ConstructionCorpus, NodeKind::Directory) => {
-            matches!(identity.mode(), PRIVATE_DIRECTORY_MODE | CORPUS_DIRECTORY_MODE)
+            matches!(
+                identity.mode(),
+                PRIVATE_DIRECTORY_MODE | CORPUS_DIRECTORY_MODE
+            )
         }
         (InventoryPolicy::ConstructionCorpus, NodeKind::Regular) => {
             matches!(identity.mode(), PRIVATE_FILE_MODE | CORPUS_FILE_MODE)

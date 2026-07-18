@@ -42,11 +42,7 @@ impl GenerationLease {
     }
 
     /// Creates a non-owning binding to this exact acquisition.
-    pub(crate) fn bind(
-        &self,
-        location: &CorpusLocation,
-        domain: Domain,
-    ) -> Result<LeaseBinding> {
+    pub(crate) fn bind(&self, location: &CorpusLocation, domain: Domain) -> Result<LeaseBinding> {
         if self.guard.access() != CoordinationAccess::Exclusive {
             return Err(binding_error("lease is not exclusive"));
         }
@@ -143,7 +139,6 @@ impl LeaseBinding {
         }
         Ok(LeaseOperation { state })
     }
-
 }
 
 #[derive(Debug)]
@@ -300,8 +295,14 @@ mod tests {
             "generate",
         )
         .expect("second lease");
-        assert_eq!(binding.validate(&outer, Domain::Layout).unwrap_err().kind(), GeneratorErrorKind::ArtifactTransaction);
-        assert_ne!(second.state().token(), Some(binding.original_token.as_str()));
+        assert_eq!(
+            binding.validate(&outer, Domain::Layout).unwrap_err().kind(),
+            GeneratorErrorKind::ArtifactTransaction
+        );
+        assert_ne!(
+            second.state().token(),
+            Some(binding.original_token.as_str())
+        );
     }
 
     #[test]
@@ -315,9 +316,7 @@ mod tests {
             "generate",
         )
         .expect("first lease");
-        let binding = first
-            .bind(&outer, Domain::Layout)
-            .expect("lease binding");
+        let binding = first.bind(&outer, Domain::Layout).expect("lease binding");
         let operation = binding
             .validate(&outer, Domain::Layout)
             .expect("validated operation");
@@ -355,12 +354,8 @@ mod tests {
             "generate",
         )
         .expect("lease");
-        let first_binding = lease
-            .bind(&outer, Domain::Layout)
-            .expect("first binding");
-        let second_binding = lease
-            .bind(&outer, Domain::Layout)
-            .expect("second binding");
+        let first_binding = lease.bind(&outer, Domain::Layout).expect("first binding");
+        let second_binding = lease.bind(&outer, Domain::Layout).expect("second binding");
         let first = first_binding
             .validate(&outer, Domain::Layout)
             .expect("first transaction");
@@ -385,7 +380,10 @@ mod tests {
             entries.sort_by_key(std::fs::DirEntry::file_name);
             for entry in entries {
                 let path = entry.path();
-                let relative = path.strip_prefix(root).expect("relative snapshot").to_path_buf();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("relative snapshot")
+                    .to_path_buf();
                 let metadata = fs::symlink_metadata(&path).expect("snapshot metadata");
                 if metadata.is_dir() {
                     output.push((relative, Vec::new()));

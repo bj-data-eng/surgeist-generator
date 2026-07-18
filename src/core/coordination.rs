@@ -8,9 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    CorpusLocation, GeneratorError, GeneratorErrorKind, Result, RunScope, Sha256Digest,
-};
+use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, Result, RunScope, Sha256Digest};
 
 use super::fs::{
     HeldIdentity, MutationTarget, NodeKind, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, RootedFs,
@@ -38,7 +36,6 @@ impl Domain {
             Self::Css => "css",
         }
     }
-
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,12 +99,14 @@ impl BootstrapProtocol {
     pub(crate) fn steps_are_journaled(&self) -> bool {
         self.steps()[..8].contains(&BootstrapStep::PublishIntent)
             && self.steps()[..8].contains(&BootstrapStep::PublishStageIdentity)
-            && self.steps().iter().position(|step| {
-                *step == BootstrapStep::ReleaseStageBeforeLostMarker
-            }) < self
+            && self
                 .steps()
                 .iter()
-                .position(|step| *step == BootstrapStep::PublishLostContended)
+                .position(|step| *step == BootstrapStep::ReleaseStageBeforeLostMarker)
+                < self
+                    .steps()
+                    .iter()
+                    .position(|step| *step == BootstrapStep::PublishLostContended)
             && self.domain.as_str().len() == 3 + usize::from(self.domain == Domain::Layout) * 3
     }
 }
@@ -194,7 +193,10 @@ impl CoordinationGuard {
                 "exclusive lease cannot finish as a check",
             ));
         }
-        self.state.rooted.revalidate_root().map_err(verification_from)?;
+        self.state
+            .rooted
+            .revalidate_root()
+            .map_err(verification_from)?;
         if self.absent_coordination
             && self
                 .state
@@ -259,10 +261,7 @@ pub(crate) fn acquire_exclusive(
     MutationTarget::current().require_supported("acquire generation mutation lease")?;
     let rooted = RootedFs::open_corpus(location)?;
     rooted.ensure_dir(COORDINATION_ROOT, PRIVATE_DIRECTORY_MODE)?;
-    rooted.ensure_dir(
-        ".surgeist-generator/bootstrap",
-        PRIVATE_DIRECTORY_MODE,
-    )?;
+    rooted.ensure_dir(".surgeist-generator/bootstrap", PRIVATE_DIRECTORY_MODE)?;
     rooted.ensure_dir(BOOTSTRAP_LOCKS, PRIVATE_DIRECTORY_MODE)?;
     validate_coordination_tree(&rooted, domain, false)?;
     recover_bootstrap(&rooted)?;
@@ -291,10 +290,7 @@ pub(crate) fn acquire_exclusive(
         PRIVATE_DIRECTORY_MODE,
     )?;
     rooted.ensure_dir(".surgeist-generator/transactions", PRIVATE_DIRECTORY_MODE)?;
-    let transaction_parent = format!(
-        ".surgeist-generator/transactions/{}",
-        domain.as_str()
-    );
+    let transaction_parent = format!(".surgeist-generator/transactions/{}", domain.as_str());
     rooted.ensure_dir(&transaction_parent, PRIVATE_DIRECTORY_MODE)?;
     rooted.ensure_dir(".surgeist-generator/probes", PRIVATE_DIRECTORY_MODE)?;
     let probe_parent = format!(".surgeist-generator/probes/{}", domain.as_str());
@@ -357,11 +353,11 @@ pub(crate) fn acquire_shared_check(
     MutationTarget::current().require_supported("acquire generation check guard")?;
     let rooted = RootedFs::open_corpus(location)?;
     let authority_key = corpus_authority_key(&rooted, domain);
-    let transaction_parent = format!(
-        ".surgeist-generator/transactions/{}",
-        domain.as_str()
-    );
-    if !rooted.exists(COORDINATION_ROOT).map_err(verification_from)? {
+    let transaction_parent = format!(".surgeist-generator/transactions/{}", domain.as_str());
+    if !rooted
+        .exists(COORDINATION_ROOT)
+        .map_err(verification_from)?
+    {
         let state = Arc::new(CoordinationState {
             canonical_corpus: location.corpus_root().to_path_buf(),
             corpus_identity: rooted.identity().clone(),
@@ -389,12 +385,7 @@ pub(crate) fn acquire_shared_check(
             "coordination exists without an immutable acquisition gate",
         ));
     }
-    let gate = open_existing_lock(
-        &rooted,
-        ACQUISITION_LOCK,
-        CoordinationAccess::Shared,
-        true,
-    )?;
+    let gate = open_existing_lock(&rooted, ACQUISITION_LOCK, CoordinationAccess::Shared, true)?;
     let mutex_path = mutex_path(domain);
     if !rooted.exists(&mutex_path).map_err(verification_from)? {
         inspect_read_only_residue(&rooted, domain)?;
@@ -417,12 +408,7 @@ pub(crate) fn acquire_shared_check(
             absent_coordination: false,
         });
     }
-    let mutex = match open_existing_lock(
-        &rooted,
-        &mutex_path,
-        CoordinationAccess::Shared,
-        true,
-    ) {
+    let mutex = match open_existing_lock(&rooted, &mutex_path, CoordinationAccess::Shared, true) {
         Ok(mutex) => mutex,
         Err(error) => {
             drop(gate);
@@ -536,25 +522,13 @@ fn open_or_bootstrap_lock(
         PRIVATE_FILE_MODE,
     )?;
     stage.write_all(LOCK_HEADER).map_err(|source| {
-        transaction_source(
-            "write immutable generation lock header",
-            final_path,
-            source,
-        )
+        transaction_source("write immutable generation lock header", final_path, source)
     })?;
     stage.flush().map_err(|source| {
-        transaction_source(
-            "flush immutable generation lock header",
-            final_path,
-            source,
-        )
+        transaction_source("flush immutable generation lock header", final_path, source)
     })?;
     stage.sync_all().map_err(|source| {
-        transaction_source(
-            "sync immutable generation lock header",
-            final_path,
-            source,
-        )
+        transaction_source("sync immutable generation lock header", final_path, source)
     })?;
     rooted.validate_handle_at(&stage_path, &stage, PRIVATE_FILE_MODE)?;
     lock_file(&stage, access, final_path)?;
@@ -569,7 +543,8 @@ fn open_or_bootstrap_lock(
             let final_file = match open_existing_lock(rooted, final_path, access, false) {
                 Ok(file) => file,
                 Err(error) if error.kind() == GeneratorErrorKind::LeaseActive => {
-                    let final_handle = rooted.open_file_handle(final_path, PRIVATE_FILE_MODE, false)?;
+                    let final_handle =
+                        rooted.open_file_handle(final_path, PRIVATE_FILE_MODE, false)?;
                     validate_lock_header(rooted, final_path, &final_handle, false)?;
                     let final_identity = rooted.identity_of_handle(&final_handle)?;
                     drop(final_handle);
@@ -609,13 +584,29 @@ fn open_existing_lock(
     verification: bool,
 ) -> Result<File> {
     let file = rooted
-        .open_file_handle(path, PRIVATE_FILE_MODE, access == CoordinationAccess::Exclusive)
-        .map_err(|error| if verification { verification_from(error) } else { error })?;
+        .open_file_handle(
+            path,
+            PRIVATE_FILE_MODE,
+            access == CoordinationAccess::Exclusive,
+        )
+        .map_err(|error| {
+            if verification {
+                verification_from(error)
+            } else {
+                error
+            }
+        })?;
     validate_lock_header(rooted, path, &file, verification)?;
     lock_file(&file, access, path)?;
     rooted
         .validate_handle_at(path, &file, PRIVATE_FILE_MODE)
-        .map_err(|error| if verification { verification_from(error) } else { error })?;
+        .map_err(|error| {
+            if verification {
+                verification_from(error)
+            } else {
+                error
+            }
+        })?;
     Ok(file)
 }
 
@@ -627,17 +618,21 @@ fn validate_lock_header(
 ) -> Result<()> {
     rooted
         .validate_handle_at(path, file, PRIVATE_FILE_MODE)
-        .map_err(|error| if verification { verification_from(error) } else { error })?;
-    let mut copy = file.try_clone().map_err(|source| {
-        transaction_source("clone immutable generation lock", path, source)
-    })?;
-    copy.seek(SeekFrom::Start(0)).map_err(|source| {
-        transaction_source("seek immutable generation lock", path, source)
-    })?;
+        .map_err(|error| {
+            if verification {
+                verification_from(error)
+            } else {
+                error
+            }
+        })?;
+    let mut copy = file
+        .try_clone()
+        .map_err(|source| transaction_source("clone immutable generation lock", path, source))?;
+    copy.seek(SeekFrom::Start(0))
+        .map_err(|source| transaction_source("seek immutable generation lock", path, source))?;
     let mut bytes = Vec::new();
-    copy.read_to_end(&mut bytes).map_err(|source| {
-        transaction_source("read immutable generation lock", path, source)
-    })?;
+    copy.read_to_end(&mut bytes)
+        .map_err(|source| transaction_source("read immutable generation lock", path, source))?;
     if bytes != LOCK_HEADER {
         let error = transaction_error(
             "validate immutable generation lock",
@@ -651,7 +646,13 @@ fn validate_lock_header(
     }
     rooted
         .validate_handle_at(path, file, PRIVATE_FILE_MODE)
-        .map_err(|error| if verification { verification_from(error) } else { error })?;
+        .map_err(|error| {
+            if verification {
+                verification_from(error)
+            } else {
+                error
+            }
+        })?;
     Ok(())
 }
 
@@ -705,8 +706,7 @@ fn recover_bootstrap(rooted: &RootedFs) -> Result<()> {
             let journal_identity = rooted.identity_at(&path)?.ok_or_else(|| {
                 transaction_error("claim bootstrap recovery", "bootstrap journal disappeared")
             })?;
-            if let Err(error) =
-                rooted.rename_exclusive_bound(&path, &claim_path, &journal_identity)
+            if let Err(error) = rooted.rename_exclusive_bound(&path, &claim_path, &journal_identity)
             {
                 if !rooted.exists(&path)? {
                     raced = true;
@@ -741,7 +741,10 @@ fn validate_bootstrap_state(
     parsed: &ParsedBootstrapName<'_>,
 ) -> Result<bool> {
     let identity = rooted.identity_at(path)?.ok_or_else(|| {
-        transaction_error("validate bootstrap journal", "bootstrap journal disappeared")
+        transaction_error(
+            "validate bootstrap journal",
+            "bootstrap journal disappeared",
+        )
     })?;
     if identity.kind() != NodeKind::Directory || identity.mode() != PRIVATE_DIRECTORY_MODE {
         return Err(transaction_error(
@@ -901,7 +904,10 @@ fn validate_bootstrap_state(
         )
     })?;
     let final_identity = rooted.identity_at(&intent.final_path)?.ok_or_else(|| {
-        transaction_error("validate lost-contended marker", "bound final lock is absent")
+        transaction_error(
+            "validate lost-contended marker",
+            "bound final lock is absent",
+        )
     })?;
     if lost.schema_version != 1
         || lost.final_path != intent.final_path
@@ -937,10 +943,9 @@ fn recover_bootstrap_stage(
     if !rooted.exists(&intent_path)? || !rooted.exists(&stage_record_path)? {
         return Ok(());
     }
-    let intent: BootstrapIntent = serde_json::from_slice(
-        &rooted.read_file(&intent_path, PRIVATE_FILE_MODE)?,
-    )
-    .map_err(|error| transaction_error("recover bootstrap stage", error.to_string()))?;
+    let intent: BootstrapIntent =
+        serde_json::from_slice(&rooted.read_file(&intent_path, PRIVATE_FILE_MODE)?)
+            .map_err(|error| transaction_error("recover bootstrap stage", error.to_string()))?;
     if intent.creator_pid != parsed.origin_pid || intent.token != parsed.origin_token {
         return Err(transaction_error(
             "recover bootstrap stage",
@@ -967,15 +972,10 @@ fn recover_bootstrap_stage(
         validate_lock_file_bytes(rooted, &intent.final_path)?;
         return Ok(());
     }
-    let stage_record: BootstrapStage = serde_json::from_slice(
-        &rooted.read_file(&stage_record_path, PRIVATE_FILE_MODE)?,
-    )
-    .map_err(|error| transaction_error("recover bootstrap stage", error.to_string()))?;
-    rooted.rename_exclusive_bound(
-        &stage_path,
-        &intent.final_path,
-        &stage_record.identity,
-    )?;
+    let stage_record: BootstrapStage =
+        serde_json::from_slice(&rooted.read_file(&stage_record_path, PRIVATE_FILE_MODE)?)
+            .map_err(|error| transaction_error("recover bootstrap stage", error.to_string()))?;
+    rooted.rename_exclusive_bound(&stage_path, &intent.final_path, &stage_record.identity)?;
     rooted.validate_handle_at(&intent.final_path, &stage, PRIVATE_FILE_MODE)?;
     Ok(())
 }
@@ -1048,7 +1048,10 @@ fn cleanup_bootstrap_directory(
     _moved_member: Option<&str>,
 ) -> Result<()> {
     let identity = rooted.identity_at(path)?.ok_or_else(|| {
-        transaction_error("clean bootstrap directory", "bootstrap directory disappeared")
+        transaction_error(
+            "clean bootstrap directory",
+            "bootstrap directory disappeared",
+        )
     })?;
     if identity.kind() != NodeKind::Directory || identity.mode() != PRIVATE_DIRECTORY_MODE {
         return Err(transaction_error(
@@ -1129,9 +1132,7 @@ fn cleanup_bootstrap_directory(
         )?;
         receipt
     };
-    if receipt.schema_version != 1
-        || !receipt.journal_identity.matches_recovery(&identity)
-    {
+    if receipt.schema_version != 1 || !receipt.journal_identity.matches_recovery(&identity) {
         return Err(transaction_error(
             "validate bootstrap cleanup receipt",
             "cleanup receipt journal identity differs",
@@ -1191,7 +1192,13 @@ fn validate_coordination_tree(rooted: &RootedFs, domain: Domain, verification: b
 
 fn validate_coordination_tree_inner(rooted: &RootedFs, domain: Domain) -> Result<()> {
     validate_private_directory(rooted, COORDINATION_ROOT)?;
-    let allowed = ["acquisition.lock", "bootstrap", "leases", "transactions", "probes"];
+    let allowed = [
+        "acquisition.lock",
+        "bootstrap",
+        "leases",
+        "transactions",
+        "probes",
+    ];
     for name in rooted.list_dir(COORDINATION_ROOT)? {
         if !allowed.contains(&name.as_str()) {
             return Err(transaction_error(
@@ -1255,10 +1262,7 @@ fn validate_coordination_tree_inner(rooted: &RootedFs, domain: Domain) -> Result
                         format!("unknown owner transaction: {name}"),
                     ));
                 }
-                validate_private_directory(
-                    rooted,
-                    &format!("{owner_transactions}/{name}"),
-                )?;
+                validate_private_directory(rooted, &format!("{owner_transactions}/{name}"))?;
             }
         }
     }
@@ -1303,9 +1307,7 @@ fn require_one_domain_inner(rooted: &RootedFs, domain: Domain) -> Result<()> {
         ".surgeist-generator/transactions",
         ".surgeist-generator/probes",
     ] {
-        if !rooted.exists(parent).map_err(|error| {
-            error
-        })? {
+        if !rooted.exists(parent)? {
             continue;
         }
         for name in rooted.list_dir(parent)? {
@@ -1355,9 +1357,9 @@ fn validate_private_directory(rooted: &RootedFs, path: &str) -> Result<()> {
 }
 
 fn validate_private_file(rooted: &RootedFs, path: &str) -> Result<()> {
-    let identity = rooted.identity_at(path)?.ok_or_else(|| {
-        transaction_error("validate private coordination file", path.to_owned())
-    })?;
+    let identity = rooted
+        .identity_at(path)?
+        .ok_or_else(|| transaction_error("validate private coordination file", path.to_owned()))?;
     if identity.kind() != NodeKind::Regular
         || identity.mode() != PRIVATE_FILE_MODE
         || identity.owner() != rooted.identity().owner()
@@ -1397,7 +1399,10 @@ fn inspect_read_only_residue(rooted: &RootedFs, domain: Domain) -> Result<()> {
         BOOTSTRAP_LOCKS.to_owned(),
     ] {
         if rooted.exists(&parent).map_err(verification_from)?
-            && !rooted.list_dir(&parent).map_err(verification_from)?.is_empty()
+            && !rooted
+                .list_dir(&parent)
+                .map_err(verification_from)?
+                .is_empty()
         {
             return Err(verification_error(
                 "inspect generation coordination",
@@ -1488,12 +1493,18 @@ fn recover_probe_journals(rooted: &RootedFs, domain: Domain) -> Result<()> {
         validate_token(token)?;
         let active = format!("{parent}/{name}");
         let active_identity = rooted.identity_at(&active)?.ok_or_else(|| {
-            transaction_error("recover rename capability probe", "probe journal disappeared")
+            transaction_error(
+                "recover rename capability probe",
+                "probe journal disappeared",
+            )
         })?;
         for member in rooted.list_dir(&active)? {
             let member_path = format!("{active}/{member}");
             let identity = rooted.identity_at(&member_path)?.ok_or_else(|| {
-                transaction_error("recover rename capability probe", "probe member disappeared")
+                transaction_error(
+                    "recover rename capability probe",
+                    "probe member disappeared",
+                )
             })?;
             if member == "intent.json" || member.ends_with(".tmp") {
                 rooted.remove_file_exact(&member_path, &identity)?;
@@ -1610,13 +1621,25 @@ fn install_owner_record(
         PRIVATE_FILE_MODE,
     )?;
     stage.write_all(&owner_bytes).map_err(|source| {
-        transaction_source("write historical generation owner stage", &stage_path, source)
+        transaction_source(
+            "write historical generation owner stage",
+            &stage_path,
+            source,
+        )
     })?;
     stage.flush().map_err(|source| {
-        transaction_source("flush historical generation owner stage", &stage_path, source)
+        transaction_source(
+            "flush historical generation owner stage",
+            &stage_path,
+            source,
+        )
     })?;
     stage.sync_all().map_err(|source| {
-        transaction_source("sync historical generation owner stage", &stage_path, source)
+        transaction_source(
+            "sync historical generation owner stage",
+            &stage_path,
+            source,
+        )
     })?;
     rooted.validate_handle_at(&stage_path, &stage, PRIVATE_FILE_MODE)?;
     drop(stage);
@@ -1628,12 +1651,7 @@ fn install_owner_record(
         PRIVATE_FILE_MODE,
     )?;
     if let Some(old_identity) = &intent.old_identity {
-        rooted.rename_swap_bound(
-            &stage_path,
-            &owner_path,
-            &stage_identity,
-            old_identity,
-        )?;
+        rooted.rename_swap_bound(&stage_path, &owner_path, &stage_identity, old_identity)?;
     } else {
         rooted.rename_exclusive_bound(&stage_path, &owner_path, &stage_identity)?;
     }
@@ -1785,12 +1803,10 @@ fn recover_owner_transactions(
         }
         let registration = if rooted.exists(&format!("{active}/stage-registration.json"))? {
             Some(
-                serde_json::from_slice::<HeldIdentity>(
-                    &rooted.read_file(
-                        &format!("{active}/stage-registration.json"),
-                        PRIVATE_FILE_MODE,
-                    )?,
-                )
+                serde_json::from_slice::<HeldIdentity>(&rooted.read_file(
+                    &format!("{active}/stage-registration.json"),
+                    PRIVATE_FILE_MODE,
+                )?)
                 .map_err(|error| {
                     transaction_error(
                         "recover owner transaction",
@@ -1829,7 +1845,9 @@ fn recover_owner_transactions(
         } else {
             None
         };
-        if prepared.as_ref().is_some_and(|digest| digest != &intent.new_digest)
+        if prepared
+            .as_ref()
+            .is_some_and(|digest| digest != &intent.new_digest)
             || (prepared.is_some() && registration.is_none())
         {
             return Err(transaction_error(
@@ -1914,9 +1932,7 @@ fn recover_owner_transactions(
                     }
                 }
                 rooted.remove_file_exact(&intent.stage_path, &actual)?;
-            } else if registration.is_some()
-                && !rooted.exists(&format!("{active}/aborted"))?
-            {
+            } else if registration.is_some() && !rooted.exists(&format!("{active}/aborted"))? {
                 return Err(transaction_error(
                     "recover owner transaction",
                     "registered owner stage disappeared before abort",
@@ -1987,7 +2003,10 @@ fn cleanup_simple_journal(
     for name in rooted.list_dir(journal)? {
         let path = format!("{journal}/{name}");
         let identity = rooted.identity_at(&path)?.ok_or_else(|| {
-            transaction_error("clean private journal", format!("member disappeared: {name}"))
+            transaction_error(
+                "clean private journal",
+                format!("member disappeared: {name}"),
+            )
         })?;
         if identity.kind() != NodeKind::Regular || identity.mode() != PRIVATE_FILE_MODE {
             return Err(transaction_error(
@@ -2013,10 +2032,7 @@ fn corpus_authority_key(rooted: &RootedFs, domain: Domain) -> String {
 }
 
 fn mutex_path(domain: Domain) -> String {
-    format!(
-        ".surgeist-generator/leases/{}/mutex.lock",
-        domain.as_str()
-    )
+    format!(".surgeist-generator/leases/{}/mutex.lock", domain.as_str())
 }
 
 fn owner_path(domain: Domain) -> String {
@@ -2049,9 +2065,8 @@ pub(crate) fn new_token() -> Result<String> {
     let mut token = String::with_capacity(32);
     for byte in bytes {
         use std::fmt::Write as _;
-        write!(&mut token, "{byte:02x}").map_err(|error| {
-            transaction_error("format transaction token", error.to_string())
-        })?;
+        write!(&mut token, "{byte:02x}")
+            .map_err(|error| transaction_error("format transaction token", error.to_string()))?;
     }
     Ok(token)
 }
@@ -2071,9 +2086,9 @@ fn validate_token(token: &str) -> Result<()> {
 }
 
 fn parse_pid(value: &str) -> Result<u32> {
-    let pid = value.parse::<u32>().map_err(|_| {
-        transaction_error("parse bootstrap PID", format!("invalid PID: {value}"))
-    })?;
+    let pid = value
+        .parse::<u32>()
+        .map_err(|_| transaction_error("parse bootstrap PID", format!("invalid PID: {value}")))?;
     if pid == 0 {
         return Err(transaction_error("parse bootstrap PID", "PID is zero"));
     }

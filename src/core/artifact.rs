@@ -171,11 +171,12 @@ impl ArtifactPlan {
                 if preserve {
                     desired.insert(
                         entry.path().clone(),
-                        rooted.read_file(
-                            &joined(self.final_root.as_str(), entry.path().as_str()),
-                            CORPUS_FILE_MODE,
-                        )
-                        .map_err(pre_intent_error)?,
+                        rooted
+                            .read_file(
+                                &joined(self.final_root.as_str(), entry.path().as_str()),
+                                CORPUS_FILE_MODE,
+                            )
+                            .map_err(pre_intent_error)?,
                     );
                 }
             }
@@ -212,7 +213,7 @@ impl ArtifactPlan {
             state.authority_key(),
             self.domain.as_str(),
         )?
-            .install(&request)
+        .install(&request)
     }
 
     pub(crate) fn artifact_digest(&self, path: &RelativePath) -> Option<&Sha256Digest> {
@@ -261,9 +262,9 @@ fn exact_path_set(label: &str, paths: Vec<RelativePath>) -> Result<BTreeSet<Rela
 }
 
 fn uses_reserved_component(path: &RelativePath) -> bool {
-    path.as_str().split('/').any(|component| {
-        component == ".surgeist-generator" || component.starts_with("._surgeist-")
-    })
+    path.as_str()
+        .split('/')
+        .any(|component| component == ".surgeist-generator" || component.starts_with("._surgeist-"))
 }
 
 fn joined(parent: &str, child: &str) -> String {
@@ -300,9 +301,7 @@ mod tests {
 
     use crate::{CorpusLocation, GeneratorErrorKind, RelativePath, RunScope};
 
-    use super::{
-        ArtifactPlan, Domain, GenerationLease, PublicationInventory, PublicationPolicy,
-    };
+    use super::{ArtifactPlan, Domain, GenerationLease, PublicationInventory, PublicationPolicy};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -373,11 +372,7 @@ mod tests {
         RelativePath::new(value).expect("relative path")
     }
 
-    fn inventory(
-        classified: &[&str],
-        retained: &[&str],
-        reports: &[&str],
-    ) -> PublicationInventory {
+    fn inventory(classified: &[&str], retained: &[&str], reports: &[&str]) -> PublicationInventory {
         PublicationInventory::new(
             classified.iter().map(|value| path(value)).collect(),
             retained.iter().map(|value| path(value)).collect(),
@@ -434,7 +429,13 @@ mod tests {
         plan.install().expect("install clean plan");
         assert_eq!(fixture.read("keep.xml"), b"keep");
         assert_eq!(fixture.read("new.xml"), b"new");
-        assert!(!fixture.location.corpus_root().join("xml/stale.xml").exists());
+        assert!(
+            !fixture
+                .location
+                .corpus_root()
+                .join("xml/stale.xml")
+                .exists()
+        );
     }
 
     #[test]
@@ -448,7 +449,10 @@ mod tests {
             &lease,
             path("xml"),
             PublicationPolicy::DiagnosticFull,
-            vec![(path("generation-reports/diagnostic.json"), b"diagnostic".to_vec())],
+            vec![(
+                path("generation-reports/diagnostic.json"),
+                b"diagnostic".to_vec(),
+            )],
             inventory(
                 &["stale.xml", "generation-reports/diagnostic.json"],
                 &[],
@@ -476,11 +480,7 @@ mod tests {
         let lease = fixture.lease();
         let classification = || {
             inventory(
-                &[
-                    "matched.xml",
-                    "stale.xml",
-                    "generation-reports/full.json",
-                ],
+                &["matched.xml", "stale.xml", "generation-reports/full.json"],
                 &[],
                 &["generation-reports/full.json"],
             )
@@ -542,7 +542,10 @@ mod tests {
             for entry in fs::read_dir(current).expect("snapshot directory") {
                 let entry = entry.expect("snapshot entry");
                 let path = entry.path();
-                let relative = path.strip_prefix(root).expect("relative path").to_path_buf();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("relative path")
+                    .to_path_buf();
                 let metadata = fs::symlink_metadata(&path).expect("snapshot metadata");
                 if metadata.is_dir() {
                     output.insert(relative, Vec::new());

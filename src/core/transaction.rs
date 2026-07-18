@@ -3,9 +3,7 @@ use std::error::Error as _;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    GeneratorError, GeneratorErrorKind, RelativePath, Result, Sha256Digest,
-};
+use crate::{GeneratorError, GeneratorErrorKind, RelativePath, Result, Sha256Digest};
 
 use super::fs::{
     CORPUS_DIRECTORY_MODE, CORPUS_FILE_MODE, HeldIdentity, NodeKind, PRIVATE_DIRECTORY_MODE,
@@ -117,11 +115,10 @@ impl TransactionProtocol {
     }
 
     pub(crate) fn crash_prefixes(&self) -> impl Iterator<Item = CrashPrefix> + '_ {
-        (0..=self.steps().len())
-            .map(|length| CrashPrefix {
-                commit_kind: self.commit_kind,
-                completed: self.steps()[..length].to_vec(),
-            })
+        (0..=self.steps().len()).map(|length| CrashPrefix {
+            commit_kind: self.commit_kind,
+            completed: self.steps()[..length].to_vec(),
+        })
     }
 }
 
@@ -170,7 +167,10 @@ pub(crate) struct RecoveredPrefix {
 #[cfg(test)]
 impl RecoveredPrefix {
     pub(crate) const fn one_complete_generation(&self) -> bool {
-        matches!(self.visible, VisibleGeneration::Old | VisibleGeneration::New)
+        matches!(
+            self.visible,
+            VisibleGeneration::Old | VisibleGeneration::New
+        )
     }
 
     pub(crate) const fn visible(&self) -> VisibleGeneration {
@@ -213,11 +213,8 @@ impl StagedTree {
             }
         }
         let mut directories: Vec<_> = directories.into_iter().collect();
-        directories.sort_by(|left, right| {
-            depth(left)
-                .cmp(&depth(right))
-                .then_with(|| left.cmp(right))
-        });
+        directories
+            .sort_by(|left, right| depth(left).cmp(&depth(right)).then_with(|| left.cmp(right)));
         Ok(directories)
     }
 }
@@ -520,11 +517,8 @@ impl<'a> TransactionEngine<'a> {
         if let Err(error) = self.populate_stage(stage, &request.staged_tree) {
             return self.finish_failed_install(&active_name, false, error);
         }
-        let new_inventory = match Inventory::scan(
-            self.rooted,
-            stage,
-            InventoryPolicy::FinalCorpus,
-        ) {
+        let new_inventory = match Inventory::scan(self.rooted, stage, InventoryPolicy::FinalCorpus)
+        {
             Ok(Some(inventory)) => inventory,
             Ok(None) => {
                 return self.finish_failed_install(
@@ -611,7 +605,8 @@ impl<'a> TransactionEngine<'a> {
             return self.finish_failed_install(&active_name, true, error);
         }
         if old.is_some()
-            && let Err(error) = self.remove_recorded_tree(stage, old.as_ref(), InventoryPolicy::FinalCorpus)
+            && let Err(error) =
+                self.remove_recorded_tree(stage, old.as_ref(), InventoryPolicy::FinalCorpus)
         {
             return self.finish_failed_install(&active_name, true, error);
         }
@@ -653,10 +648,8 @@ impl<'a> TransactionEngine<'a> {
     fn populate_stage(&self, stage: &str, tree: &StagedTree) -> Result<()> {
         self.rooted.ensure_dir(stage, CORPUS_DIRECTORY_MODE)?;
         for directory in tree.directories()? {
-            self.rooted.ensure_dir(
-                &joined(stage, directory.as_str()),
-                CORPUS_DIRECTORY_MODE,
-            )?;
+            self.rooted
+                .ensure_dir(&joined(stage, directory.as_str()), CORPUS_DIRECTORY_MODE)?;
         }
         for (path, bytes) in tree.files() {
             self.rooted.create_file_exclusive(
@@ -666,11 +659,8 @@ impl<'a> TransactionEngine<'a> {
             )?;
         }
         let mut directories = tree.directories()?;
-        directories.sort_by(|left, right| {
-            depth(right)
-                .cmp(&depth(left))
-                .then_with(|| right.cmp(left))
-        });
+        directories
+            .sort_by(|left, right| depth(right).cmp(&depth(left)).then_with(|| right.cmp(left)));
         for directory in directories {
             self.rooted.sync_dir(&joined(stage, directory.as_str()))?;
         }
@@ -846,9 +836,7 @@ impl<'a> TransactionEngine<'a> {
         if let Some(inventory) = new_sidecar
             .as_ref()
             .and_then(|sidecar| sidecar.inventory.as_ref())
-            && !registration
-                .stage_identity
-                .same_object(inventory.root())
+            && !registration.stage_identity.same_object(inventory.root())
         {
             return Err(transaction_error(
                 "recover active transaction",
@@ -861,7 +849,10 @@ impl<'a> TransactionEngine<'a> {
             &intent.final_name,
             InventoryPolicy::FinalCorpus,
         )?;
-        let final_digest = final_inventory.as_ref().map(Inventory::digest).transpose()?;
+        let final_digest = final_inventory
+            .as_ref()
+            .map(Inventory::digest)
+            .transpose()?;
         let outcome = match (&prepared, &new_sidecar) {
             (Some(prepared), Some(_)) if final_digest == Some(prepared.new_tree_digest.clone()) => {
                 Outcome::Committed
@@ -927,7 +918,9 @@ impl<'a> TransactionEngine<'a> {
         self.validate_or_publish_outcome(&active, &intent.token, outcome)?;
         match outcome {
             Outcome::Aborted => {
-                let stage_inventory = new_sidecar.as_ref().and_then(|sidecar| sidecar.inventory.as_ref());
+                let stage_inventory = new_sidecar
+                    .as_ref()
+                    .and_then(|sidecar| sidecar.inventory.as_ref());
                 self.remove_recorded_tree(
                     &intent.stage_name,
                     stage_inventory,
@@ -1165,7 +1158,10 @@ impl<'a> TransactionEngine<'a> {
     fn recover_completed(&self, completed_name: &str) -> Result<()> {
         let completed = joined(&self.transaction_parent, completed_name);
         let identity = self.rooted.identity_at(&completed)?.ok_or_else(|| {
-            transaction_error("recover completed transaction", "completed journal disappeared")
+            transaction_error(
+                "recover completed transaction",
+                "completed journal disappeared",
+            )
         })?;
         let names = self.rooted.list_dir(&completed)?;
         if names.is_empty() {
@@ -1212,7 +1208,10 @@ impl<'a> TransactionEngine<'a> {
         }
         let receipt_path = joined(&completed, CLEANUP_RECEIPT_FILE);
         let receipt_identity = self.rooted.identity_at(&receipt_path)?.ok_or_else(|| {
-            transaction_error("recover completed transaction", "cleanup receipt disappeared")
+            transaction_error(
+                "recover completed transaction",
+                "cleanup receipt disappeared",
+            )
         })?;
         self.rooted
             .remove_file_exact(&receipt_path, &receipt_identity)?;
@@ -1272,7 +1271,9 @@ impl<'a> TransactionEngine<'a> {
             || intent.authority_key != self.authority_key
             || intent.domain != self.domain
             || active_name != format!("active-{}", intent.token)
-            || !intent.root_identity.matches_recovery(self.rooted.identity())
+            || !intent
+                .root_identity
+                .matches_recovery(self.rooted.identity())
         {
             return Err(transaction_error(
                 "validate rooted transaction intent",
@@ -1282,7 +1283,9 @@ impl<'a> TransactionEngine<'a> {
         let parent = self
             .rooted
             .identity_at(&self.transaction_parent)?
-            .ok_or_else(|| transaction_error("validate rooted transaction intent", "parent absent"))?;
+            .ok_or_else(|| {
+                transaction_error("validate rooted transaction intent", "parent absent")
+            })?;
         if !intent.transaction_parent_identity.matches_recovery(&parent) {
             return Err(transaction_error(
                 "validate rooted transaction intent",
@@ -1293,8 +1296,7 @@ impl<'a> TransactionEngine<'a> {
         validate_token(&intent.token)?;
         validate_component(&intent.final_name)?;
         validate_component(&intent.stage_name)?;
-        if intent.stage_name
-            != format!("._surgeist-{}-stage-{}", intent.domain, intent.token)
+        if intent.stage_name != format!("._surgeist-{}-stage-{}", intent.domain, intent.token)
             || intent.final_name == ".surgeist-generator"
             || intent.final_name.starts_with("._surgeist-")
         {
@@ -1306,12 +1308,7 @@ impl<'a> TransactionEngine<'a> {
         Ok(())
     }
 
-    fn validate_active_members(
-        &self,
-        active: &str,
-        names: &[String],
-        token: &str,
-    ) -> Result<()> {
+    fn validate_active_members(&self, active: &str, names: &[String], token: &str) -> Result<()> {
         let durable = [
             INTENT_FILE,
             OLD_INVENTORY_FILE,
@@ -1396,10 +1393,7 @@ fn validate_inventory_sidecar(sidecar: &InventorySidecar) -> Result<()> {
         ));
     }
     if let Some(inventory) = &sidecar.inventory {
-        Inventory::from_json(
-            &inventory.canonical_bytes()?,
-            InventoryPolicy::FinalCorpus,
-        )?;
+        Inventory::from_json(&inventory.canonical_bytes()?, InventoryPolicy::FinalCorpus)?;
     }
     Ok(())
 }
