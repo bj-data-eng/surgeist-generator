@@ -481,6 +481,47 @@ struct BootstrapCleanup {
     members: Vec<BootstrapCleanupMember>,
 }
 
+#[cfg(test)]
+struct BootstrapInstallControl<'a> {
+    creator_pid: u32,
+    before_final_rename: Option<&'a mut dyn FnMut() -> Result<()>>,
+}
+
+#[cfg(test)]
+impl<'a> BootstrapInstallControl<'a> {
+    fn new(
+        creator_pid: u32,
+        before_final_rename: Option<&'a mut dyn FnMut() -> Result<()>>,
+    ) -> Self {
+        Self {
+            creator_pid,
+            before_final_rename,
+        }
+    }
+}
+
+#[cfg(test)]
+struct BootstrapRecoveryControl<'a> {
+    claimant_pid: u32,
+    claim_token: &'a str,
+    liveness: &'a mut dyn FnMut(u32) -> Result<bool>,
+}
+
+#[cfg(test)]
+impl<'a> BootstrapRecoveryControl<'a> {
+    fn new(
+        claimant_pid: u32,
+        claim_token: &'a str,
+        liveness: &'a mut dyn FnMut(u32) -> Result<bool>,
+    ) -> Self {
+        Self {
+            claimant_pid,
+            claim_token,
+            liveness,
+        }
+    }
+}
+
 fn open_or_bootstrap_lock(
     rooted: &RootedFs,
     final_path: &str,
@@ -489,10 +530,42 @@ fn open_or_bootstrap_lock(
     access: CoordinationAccess,
 ) -> Result<File> {
     #[cfg(test)]
+    let result = open_or_bootstrap_lock_inner(rooted, final_path, label, token, access, None);
+    #[cfg(not(test))]
+    let result = open_or_bootstrap_lock_inner(rooted, final_path, label, token, access);
+    result
+}
+
+#[cfg(test)]
+fn open_or_bootstrap_lock_controlled(
+    rooted: &RootedFs,
+    final_path: &str,
+    label: &str,
+    token: &str,
+    access: CoordinationAccess,
+    control: &mut BootstrapInstallControl<'_>,
+) -> Result<File> {
+    open_or_bootstrap_lock_inner(rooted, final_path, label, token, access, Some(control))
+}
+
+fn open_or_bootstrap_lock_inner(
+    rooted: &RootedFs,
+    final_path: &str,
+    label: &str,
+    token: &str,
+    access: CoordinationAccess,
+    #[cfg(test)] control: Option<&mut BootstrapInstallControl<'_>>,
+) -> Result<File> {
+    #[cfg(test)]
     let _observation_phase = rooted.begin_observation_phase(DurabilityPhase::BootstrapInstall);
     if rooted.exists(final_path)? {
         return open_existing_lock(rooted, final_path, access, false);
     }
+    #[cfg(test)]
+    let pid = control
+        .as_ref()
+        .map_or_else(std::process::id, |control| control.creator_pid);
+    #[cfg(not(test))]
     let pid = std::process::id();
     let active_name = format!("active-{pid}-{token}");
     let active = format!("{BOOTSTRAP_LOCKS}/{active_name}");
@@ -544,6 +617,12 @@ fn open_or_bootstrap_lock(
         })?;
     rooted.validate_handle_at(&stage_path, &stage, PRIVATE_FILE_MODE)?;
     lock_file(&stage, access, final_path)?;
+    #[cfg(test)]
+    if let Some(control) = control
+        && let Some(before_final_rename) = control.before_final_rename.as_deref_mut()
+    {
+        before_final_rename()?;
+    }
     match rooted.rename_exclusive_bound(&stage_path, final_path, &stage_record.identity) {
         Ok(()) => {
             rooted.validate_handle_at(final_path, &stage, PRIVATE_FILE_MODE)?;
@@ -694,6 +773,25 @@ fn lock_file(file: &File, access: CoordinationAccess, context: &str) -> Result<(
 
 fn recover_bootstrap(rooted: &RootedFs) -> Result<()> {
     #[cfg(test)]
+    let result = recover_bootstrap_inner(rooted, None);
+    #[cfg(not(test))]
+    let result = recover_bootstrap_inner(rooted);
+    result
+}
+
+#[cfg(test)]
+fn recover_bootstrap_controlled(
+    rooted: &RootedFs,
+    control: &mut BootstrapRecoveryControl<'_>,
+) -> Result<()> {
+    recover_bootstrap_inner(rooted, Some(control))
+}
+
+fn recover_bootstrap_inner(
+    rooted: &RootedFs,
+    #[cfg(test)] mut control: Option<&mut BootstrapRecoveryControl<'_>>,
+) -> Result<()> {
+    #[cfg(test)]
     let _observation_phase = rooted.begin_observation_phase(DurabilityPhase::BootstrapRecovery);
     for _ in 0..16 {
         let names = rooted.list_dir(BOOTSTRAP_LOCKS)?;
@@ -705,15 +803,29 @@ fn recover_bootstrap(rooted: &RootedFs) -> Result<()> {
             let parsed = parse_bootstrap_name(&name)?;
             let path = format!("{BOOTSTRAP_LOCKS}/{name}");
             let relinquished = validate_bootstrap_state(rooted, &path, &parsed)?;
-            if process_is_live(parsed.owner_pid)? && !relinquished {
+            #[cfg(test)]
+            let owner_is_live = if let Some(control) = control.as_deref_mut() {
+                (control.liveness)(parsed.owner_pid)?
+            } else {
+                process_is_live(parsed.owner_pid)?
+            };
+            #[cfg(not(test))]
+            let owner_is_live = process_is_live(parsed.owner_pid)?;
+            if owner_is_live && !relinquished {
                 return Err(GeneratorError::new(
                     GeneratorErrorKind::LeaseActive,
                     "recover generation lock bootstrap",
                     "a live bootstrap owner is active",
                 ));
             }
-            let claim_token = new_token()?;
-            let claimant_pid = std::process::id();
+            #[cfg(test)]
+            let (claim_token, claimant_pid) = if let Some(control) = control.as_deref() {
+                (control.claim_token.to_owned(), control.claimant_pid)
+            } else {
+                (new_token()?, std::process::id())
+            };
+            #[cfg(not(test))]
+            let (claim_token, claimant_pid) = (new_token()?, std::process::id());
             let claim_name = format!(
                 "recovering-{}-{}-by-{claimant_pid}-{claim_token}",
                 parsed.origin_pid, parsed.origin_token
@@ -2182,6 +2294,776 @@ fn transaction_source(
 mod tests {
     use super::{BootstrapProtocol, BootstrapStep, Domain, LOCK_HEADER};
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use std::collections::BTreeMap;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use std::fs::{self, File};
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use std::path::{Path, PathBuf};
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use crate::core::fs::{
+        DurabilityEvent, DurabilityPhase, DurabilityPrimitive, HeldIdentity,
+        PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, RootedFs, RootedObserver,
+    };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, Result};
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use super::{
+        ACQUISITION_LOCK, BOOTSTRAP_LOCKS, BootstrapInstallControl, BootstrapRecoveryControl,
+        COORDINATION_ROOT, CoordinationAccess, open_existing_lock, open_or_bootstrap_lock,
+        open_or_bootstrap_lock_controlled, process_is_live, recover_bootstrap_controlled,
+    };
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    static NEXT_BOOTSTRAP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    const SYNTHETIC_ABANDONED_PID: u32 = u32::MAX;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    const INSTALL_TOKEN: &str = "11111111111111111111111111111111";
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    const CLAIM_TOKEN_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    const CLAIM_TOKEN_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    const CLAIM_TOKEN_C: &str = "cccccccccccccccccccccccccccccccc";
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    const LATER_TOKEN: &str = "99999999999999999999999999999999";
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum SnapshotEntry {
+        Directory(u32),
+        Regular(u32, Vec<u8>),
+        Symlink(u32, PathBuf),
+        Other(u32),
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    struct BootstrapFixture {
+        owner: PathBuf,
+        corpus: PathBuf,
+        location: CorpusLocation,
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl BootstrapFixture {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_BOOTSTRAP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let owner = std::env::temp_dir().join(format!(
+                "surgeist-generator-bootstrap-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            let corpus = owner.join("corpus");
+            fs::create_dir(&owner).expect("create bootstrap fixture owner");
+            fs::create_dir(&corpus).expect("create bootstrap fixture corpus");
+            let location =
+                CorpusLocation::new(&owner, &corpus).expect("bootstrap fixture location");
+            let rooted = RootedFs::open_corpus(&location).expect("open bootstrap fixture");
+            rooted
+                .ensure_dir(COORDINATION_ROOT, PRIVATE_DIRECTORY_MODE)
+                .expect("create coordination root");
+            rooted
+                .ensure_dir(".surgeist-generator/bootstrap", PRIVATE_DIRECTORY_MODE)
+                .expect("create bootstrap root");
+            rooted
+                .ensure_dir(BOOTSTRAP_LOCKS, PRIVATE_DIRECTORY_MODE)
+                .expect("create bootstrap locks root");
+            Self {
+                owner,
+                corpus,
+                location,
+            }
+        }
+
+        fn rooted(&self) -> RootedFs {
+            RootedFs::open_corpus(&self.location).expect("open fresh bootstrap authority")
+        }
+
+        fn snapshot(&self) -> BTreeMap<PathBuf, SnapshotEntry> {
+            snapshot(&self.corpus)
+        }
+
+        fn lock_identity(&self) -> Option<HeldIdentity> {
+            self.rooted()
+                .identity_at(ACQUISITION_LOCK)
+                .expect("inspect immutable bootstrap lock")
+        }
+
+        fn assert_lock(&self, expected: Option<&HeldIdentity>) {
+            let rooted = self.rooted();
+            let actual = rooted
+                .identity_at(ACQUISITION_LOCK)
+                .expect("inspect immutable bootstrap lock");
+            match (expected, actual) {
+                (None, None) => {}
+                (Some(expected), Some(actual)) => {
+                    assert!(
+                        expected.matches_recovery(&actual),
+                        "immutable bootstrap winner identity changed"
+                    );
+                    assert_eq!(
+                        rooted
+                            .read_file(ACQUISITION_LOCK, PRIVATE_FILE_MODE)
+                            .expect("read immutable bootstrap lock"),
+                        LOCK_HEADER
+                    );
+                }
+                (None, Some(_)) => panic!("bootstrap lock published before its commit boundary"),
+                (Some(_), None) => panic!("committed bootstrap lock disappeared"),
+            }
+        }
+
+        fn assert_clean(&self, expected: Option<&HeldIdentity>) {
+            self.assert_lock(expected);
+            let mut clean = BTreeMap::from([
+                (
+                    PathBuf::from(COORDINATION_ROOT),
+                    SnapshotEntry::Directory(PRIVATE_DIRECTORY_MODE),
+                ),
+                (
+                    PathBuf::from(".surgeist-generator/bootstrap"),
+                    SnapshotEntry::Directory(PRIVATE_DIRECTORY_MODE),
+                ),
+                (
+                    PathBuf::from(BOOTSTRAP_LOCKS),
+                    SnapshotEntry::Directory(PRIVATE_DIRECTORY_MODE),
+                ),
+            ]);
+            if expected.is_some() {
+                clean.insert(
+                    PathBuf::from(ACQUISITION_LOCK),
+                    SnapshotEntry::Regular(PRIVATE_FILE_MODE, LOCK_HEADER.to_vec()),
+                );
+            }
+            assert_eq!(self.snapshot(), clean, "bootstrap residue was not cleaned");
+        }
+
+        fn later_acquire_same_lock(&self) -> HeldIdentity {
+            let before = self.lock_identity();
+            let rooted = self.rooted();
+            let lock = open_or_bootstrap_lock(
+                &rooted,
+                ACQUISITION_LOCK,
+                "acquisition",
+                LATER_TOKEN,
+                CoordinationAccess::Exclusive,
+            )
+            .expect("later production acquisition");
+            let acquired = rooted
+                .identity_of_handle(&lock)
+                .expect("inspect later acquisition handle");
+            if let Some(before) = before {
+                assert!(
+                    before.matches_recovery(&acquired),
+                    "later acquisition replaced the immutable lock"
+                );
+            }
+            drop(lock);
+            self.assert_clean(Some(&acquired));
+            acquired
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl Drop for BootstrapFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.owner).expect("remove bootstrap fixture");
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    struct SeededWinner {
+        identity: HeldIdentity,
+        handle: Option<File>,
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl SeededWinner {
+        fn assert_held(&self, fixture: &BootstrapFixture) {
+            assert!(self.handle.is_some(), "winner fixture is not held");
+            fixture.assert_lock(Some(&self.identity));
+            let error = open_existing_lock(
+                &fixture.rooted(),
+                ACQUISITION_LOCK,
+                CoordinationAccess::Exclusive,
+                false,
+            )
+            .expect_err("independent winner must remain held");
+            assert_eq!(error.kind(), GeneratorErrorKind::LeaseActive);
+        }
+
+        fn release(mut self) -> HeldIdentity {
+            drop(self.handle.take());
+            self.identity
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn mode(metadata: &fs::Metadata) -> u32 {
+        metadata.permissions().mode() & 0o7777
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn snapshot(root: &Path) -> BTreeMap<PathBuf, SnapshotEntry> {
+        fn visit(root: &Path, directory: &Path, entries: &mut BTreeMap<PathBuf, SnapshotEntry>) {
+            let mut children: Vec<_> = fs::read_dir(directory)
+                .expect("snapshot bootstrap directory")
+                .map(|entry| entry.expect("snapshot bootstrap entry"))
+                .collect();
+            children.sort_by_key(|entry| entry.file_name());
+            for child in children {
+                let path = child.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("bootstrap snapshot relative path")
+                    .to_path_buf();
+                let metadata = fs::symlink_metadata(&path).expect("bootstrap entry metadata");
+                let entry = if metadata.is_dir() {
+                    SnapshotEntry::Directory(mode(&metadata))
+                } else if metadata.is_file() {
+                    SnapshotEntry::Regular(
+                        mode(&metadata),
+                        fs::read(&path).expect("read bootstrap snapshot file"),
+                    )
+                } else if metadata.file_type().is_symlink() {
+                    SnapshotEntry::Symlink(
+                        mode(&metadata),
+                        fs::read_link(&path).expect("read bootstrap snapshot symlink"),
+                    )
+                } else {
+                    SnapshotEntry::Other(mode(&metadata))
+                };
+                let is_directory = metadata.is_dir();
+                entries.insert(relative, entry);
+                if is_directory {
+                    visit(root, &path, entries);
+                }
+            }
+        }
+
+        let mut entries = BTreeMap::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn active_path(owner_pid: u32) -> String {
+        format!("{BOOTSTRAP_LOCKS}/active-{owner_pid}-{INSTALL_TOKEN}")
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn stage_path(owner_pid: u32) -> String {
+        format!("{}/lock.stage", active_path(owner_pid))
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn claim_path(claim_token: &str) -> String {
+        format!(
+            "{BOOTSTRAP_LOCKS}/recovering-{SYNTHETIC_ABANDONED_PID}-{INSTALL_TOKEN}-by-{SYNTHETIC_ABANDONED_PID}-{claim_token}"
+        )
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn run_install(
+        fixture: &BootstrapFixture,
+        observer: RootedObserver,
+        creator_pid: u32,
+        before_final_rename: Option<&mut dyn FnMut() -> Result<()>>,
+    ) -> Result<File> {
+        let rooted = RootedFs::open_corpus_observed(&fixture.location, observer)?;
+        let mut control = BootstrapInstallControl::new(creator_pid, before_final_rename);
+        open_or_bootstrap_lock_controlled(
+            &rooted,
+            ACQUISITION_LOCK,
+            "acquisition",
+            INSTALL_TOKEN,
+            CoordinationAccess::Exclusive,
+            &mut control,
+        )
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn recover_fixture(
+        fixture: &BootstrapFixture,
+        observer: Option<RootedObserver>,
+        claim_token: &'static str,
+        abandoned_pid: u32,
+    ) -> Result<()> {
+        let rooted = if let Some(observer) = observer {
+            RootedFs::open_corpus_observed(&fixture.location, observer)?
+        } else {
+            RootedFs::open_corpus(&fixture.location)?
+        };
+        let mut liveness = |pid| {
+            if pid == abandoned_pid {
+                Ok(false)
+            } else {
+                process_is_live(pid)
+            }
+        };
+        let mut control =
+            BootstrapRecoveryControl::new(SYNTHETIC_ABANDONED_PID, claim_token, &mut liveness);
+        recover_bootstrap_controlled(&rooted, &mut control)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn expect_interruption<T: std::fmt::Debug>(operation: impl FnOnce() -> Result<T>) {
+        let payload = catch_unwind(AssertUnwindSafe(operation))
+            .expect_err("observed bootstrap operation must interrupt");
+        assert!(RootedObserver::is_interruption(payload.as_ref()));
+        assert!(payload.downcast_ref::<GeneratorError>().is_none());
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn assert_event_prefix(
+        observer: &RootedObserver,
+        trace: &[DurabilityEvent],
+        event_index: usize,
+        label: &str,
+    ) {
+        assert_eq!(
+            observer.events(),
+            trace[..=event_index],
+            "{label} trace changed at prefix {event_index}"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn event_indices(
+        events: &[DurabilityEvent],
+        phase: DurabilityPhase,
+        primitive: DurabilityPrimitive,
+        path: &str,
+    ) -> Vec<usize> {
+        events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event.phase() == phase && event.primitive() == primitive && event.path() == path
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn one_event_index(
+        events: &[DurabilityEvent],
+        phase: DurabilityPhase,
+        primitive: DurabilityPrimitive,
+        path: &str,
+    ) -> usize {
+        let matches = event_indices(events, phase, primitive, path);
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected one {primitive:?} event for {path}"
+        );
+        matches[0]
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn assert_event_exists(
+        events: &[DurabilityEvent],
+        phase: DurabilityPhase,
+        primitive: DurabilityPrimitive,
+        path: &str,
+    ) {
+        assert!(
+            events.iter().any(|event| {
+                event.phase() == phase && event.primitive() == primitive && event.path() == path
+            }),
+            "missing {phase:?} {primitive:?} event for {path}"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn header_write_indices(events: &[DurabilityEvent]) -> Vec<usize> {
+        let stage = stage_path(SYNTHETIC_ABANDONED_PID);
+        let writes: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event.phase() == DurabilityPhase::BootstrapInstall
+                    && event.path() == stage
+                    && matches!(
+                        event.primitive(),
+                        DurabilityPrimitive::WritePartial | DurabilityPrimitive::WriteFull
+                    )
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(writes.len(), LOCK_HEADER.len());
+        for index in &writes[..writes.len() - 1] {
+            assert_eq!(
+                events[*index].primitive(),
+                DurabilityPrimitive::WritePartial
+            );
+        }
+        assert_eq!(
+            events[*writes.last().expect("complete header write")].primitive(),
+            DurabilityPrimitive::WriteFull
+        );
+        writes
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn record_uncontended_trace() -> Vec<DurabilityEvent> {
+        let fixture = BootstrapFixture::new("uncontended-trace");
+        let observer = RootedObserver::recording();
+        let lock = run_install(&fixture, observer.clone(), SYNTHETIC_ABANDONED_PID, None)
+            .expect("trace uncontended bootstrap");
+        let identity = fixture
+            .rooted()
+            .identity_of_handle(&lock)
+            .expect("inspect traced bootstrap lock");
+        drop(lock);
+        fixture.assert_clean(Some(&identity));
+        let events = observer.events();
+        assert!(!events.is_empty(), "uncontended bootstrap trace is empty");
+        events
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn interrupt_uncontended_install(
+        fixture: &BootstrapFixture,
+        trace: &[DurabilityEvent],
+        event_index: usize,
+    ) {
+        let observer = RootedObserver::interrupt_after(event_index);
+        expect_interruption(|| {
+            run_install(fixture, observer.clone(), SYNTHETIC_ABANDONED_PID, None)
+        });
+        assert_event_prefix(&observer, trace, event_index, "uncontended install");
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn publish_winner(fixture: &BootstrapFixture, held: bool) -> Result<SeededWinner> {
+        let rooted = fixture.rooted();
+        let identity = rooted.publish_file_exclusive(
+            COORDINATION_ROOT,
+            "acquisition.lock",
+            "winner-publication.tmp",
+            LOCK_HEADER,
+            PRIVATE_FILE_MODE,
+        )?;
+        let handle = if held {
+            Some(open_existing_lock(
+                &rooted,
+                ACQUISITION_LOCK,
+                CoordinationAccess::Exclusive,
+                false,
+            )?)
+        } else {
+            None
+        };
+        Ok(SeededWinner { identity, handle })
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn run_winner_install(
+        fixture: &BootstrapFixture,
+        observer: RootedObserver,
+        held: bool,
+        winner: &mut Option<SeededWinner>,
+    ) -> Result<File> {
+        let mut before_final_rename = || {
+            assert!(winner.is_none(), "winner hook invoked more than once");
+            *winner = Some(publish_winner(fixture, held)?);
+            Ok(())
+        };
+        run_install(
+            fixture,
+            observer,
+            SYNTHETIC_ABANDONED_PID,
+            Some(&mut before_final_rename),
+        )
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn record_winner_trace(held: bool) -> (Vec<DurabilityEvent>, HeldIdentity) {
+        let fixture = BootstrapFixture::new(if held {
+            "winner-held-trace"
+        } else {
+            "winner-released-trace"
+        });
+        let observer = RootedObserver::recording();
+        let mut winner = None;
+        let result = run_winner_install(&fixture, observer.clone(), held, &mut winner);
+        let mut winner = winner.expect("winner hook must publish before local rename");
+        let winner_identity = winner.identity.clone();
+        if held {
+            let error = result.expect_err("held winner must reject local bootstrap");
+            assert_eq!(error.kind(), GeneratorErrorKind::LeaseActive);
+            winner.assert_held(&fixture);
+        } else {
+            let adopted = result.expect("released winner must be adopted");
+            let adopted_identity = fixture
+                .rooted()
+                .identity_of_handle(&adopted)
+                .expect("inspect adopted winner");
+            assert!(winner_identity.matches_recovery(&adopted_identity));
+            drop(adopted);
+        }
+        fixture.assert_clean(Some(&winner_identity));
+        drop(winner.handle.take());
+        let later = fixture.later_acquire_same_lock();
+        assert!(winner_identity.matches_recovery(&later));
+        let events = observer.events();
+        assert!(!events.is_empty(), "winner bootstrap trace is empty");
+        (events, winner_identity)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn interrupt_winner_install(
+        fixture: &BootstrapFixture,
+        trace: &[DurabilityEvent],
+        event_index: usize,
+        held: bool,
+    ) -> Option<SeededWinner> {
+        let observer = RootedObserver::interrupt_after(event_index);
+        let mut winner = None;
+        expect_interruption(|| run_winner_install(fixture, observer.clone(), held, &mut winner));
+        assert_event_prefix(
+            &observer,
+            trace,
+            event_index,
+            if held {
+                "held-winner install"
+            } else {
+                "released-winner install"
+            },
+        );
+        winner
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn recover_and_assert_idempotent(fixture: &BootstrapFixture, expected: Option<&HeldIdentity>) {
+        recover_fixture(fixture, None, CLAIM_TOKEN_B, SYNTHETIC_ABANDONED_PID)
+            .expect("fresh production bootstrap recovery");
+        fixture.assert_clean(expected);
+        let stable = fixture.snapshot();
+        recover_fixture(fixture, None, CLAIM_TOKEN_C, SYNTHETIC_ABANDONED_PID)
+            .expect("repeat production bootstrap recovery");
+        fixture.assert_clean(expected);
+        assert_eq!(fixture.snapshot(), stable, "repeat recovery changed state");
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn assert_cleanup_inventory(events: &[DurabilityEvent], journal: &str) {
+        let receipt = format!("{journal}/cleanup-started");
+        let member_prefix = format!("{journal}/");
+        assert_event_exists(
+            events,
+            DurabilityPhase::BootstrapCleanup,
+            DurabilityPrimitive::RenameExclusive,
+            &receipt,
+        );
+        assert_event_exists(
+            events,
+            DurabilityPhase::BootstrapCleanup,
+            DurabilityPrimitive::RemoveFile,
+            &receipt,
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.phase() == DurabilityPhase::BootstrapCleanup
+                    && event.primitive() == DurabilityPrimitive::RemoveFile
+                    && event.path().starts_with(&member_prefix)
+                    && event.path() != receipt
+            }),
+            "cleanup trace omitted receipt-bound member removal for {journal}"
+        );
+        assert_event_exists(
+            events,
+            DurabilityPhase::BootstrapCleanup,
+            DurabilityPrimitive::RemoveDirectory,
+            journal,
+        );
+        assert_event_exists(
+            events,
+            DurabilityPhase::BootstrapCleanup,
+            DurabilityPrimitive::SyncDirectory,
+            BOOTSTRAP_LOCKS,
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn record_recovery_trace(
+        install_trace: &[DurabilityEvent],
+        install_event: usize,
+        expected_lock: bool,
+    ) -> Vec<DurabilityEvent> {
+        let fixture = BootstrapFixture::new("recovery-trace");
+        interrupt_uncontended_install(&fixture, install_trace, install_event);
+        let observer = RootedObserver::recording();
+        recover_fixture(
+            &fixture,
+            Some(observer.clone()),
+            CLAIM_TOKEN_A,
+            SYNTHETIC_ABANDONED_PID,
+        )
+        .expect("trace production bootstrap recovery");
+        let identity = fixture.lock_identity();
+        assert_eq!(identity.is_some(), expected_lock);
+        fixture.assert_clean(identity.as_ref());
+        let events = observer.events();
+        assert!(!events.is_empty(), "bootstrap recovery trace is empty");
+        events
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn exercise_uncontended_recovery_prefixes(
+        install_trace: &[DurabilityEvent],
+        install_event: usize,
+        expected_lock: bool,
+    ) {
+        let recovery_trace = record_recovery_trace(install_trace, install_event, expected_lock);
+        let claim = claim_path(CLAIM_TOKEN_A);
+        assert_event_exists(
+            &recovery_trace,
+            DurabilityPhase::BootstrapRecovery,
+            DurabilityPrimitive::RenameExclusive,
+            &claim,
+        );
+        assert_cleanup_inventory(&recovery_trace, &claim);
+        for event_index in 0..recovery_trace.len() {
+            let fixture = BootstrapFixture::new("recovery-prefix");
+            interrupt_uncontended_install(&fixture, install_trace, install_event);
+            let observer = RootedObserver::interrupt_after(event_index);
+            expect_interruption(|| {
+                recover_fixture(
+                    &fixture,
+                    Some(observer.clone()),
+                    CLAIM_TOKEN_A,
+                    SYNTHETIC_ABANDONED_PID,
+                )
+            });
+            assert_event_prefix(
+                &observer,
+                &recovery_trace,
+                event_index,
+                "uncontended recovery",
+            );
+            recover_fixture(&fixture, None, CLAIM_TOKEN_B, SYNTHETIC_ABANDONED_PID)
+                .expect("complete interrupted uncontended recovery");
+            let after_recovery = fixture.lock_identity();
+            assert_eq!(after_recovery.is_some(), expected_lock);
+            fixture.assert_clean(after_recovery.as_ref());
+            let stable = fixture.snapshot();
+            recover_fixture(&fixture, None, CLAIM_TOKEN_C, SYNTHETIC_ABANDONED_PID)
+                .expect("repeat completed uncontended recovery");
+            fixture.assert_clean(after_recovery.as_ref());
+            assert_eq!(fixture.snapshot(), stable, "repeat recovery changed state");
+            let later = fixture.later_acquire_same_lock();
+            if let Some(after_recovery) = after_recovery {
+                assert!(after_recovery.matches_recovery(&later));
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn record_winner_recovery_trace(
+        install_trace: &[DurabilityEvent],
+        install_event: usize,
+        held: bool,
+    ) -> Vec<DurabilityEvent> {
+        let fixture = BootstrapFixture::new(if held {
+            "held-recovery-trace"
+        } else {
+            "released-recovery-trace"
+        });
+        let winner = interrupt_winner_install(&fixture, install_trace, install_event, held)
+            .expect("winner must exist at recovery seed");
+        if held {
+            winner.assert_held(&fixture);
+        }
+        let observer = RootedObserver::recording();
+        recover_fixture(
+            &fixture,
+            Some(observer.clone()),
+            CLAIM_TOKEN_A,
+            SYNTHETIC_ABANDONED_PID,
+        )
+        .expect("trace winner bootstrap recovery");
+        fixture.assert_clean(Some(&winner.identity));
+        if held {
+            winner.assert_held(&fixture);
+        }
+        let identity = winner.release();
+        let later = fixture.later_acquire_same_lock();
+        assert!(identity.matches_recovery(&later));
+        let events = observer.events();
+        assert!(!events.is_empty(), "winner recovery trace is empty");
+        events
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn exercise_winner_recovery_prefixes(
+        install_trace: &[DurabilityEvent],
+        install_event: usize,
+        held: bool,
+    ) {
+        let recovery_trace = record_winner_recovery_trace(install_trace, install_event, held);
+        let claim = claim_path(CLAIM_TOKEN_A);
+        assert_event_exists(
+            &recovery_trace,
+            DurabilityPhase::BootstrapRecovery,
+            DurabilityPrimitive::RenameExclusive,
+            &claim,
+        );
+        assert_cleanup_inventory(&recovery_trace, &claim);
+        for event_index in 0..recovery_trace.len() {
+            let fixture = BootstrapFixture::new(if held {
+                "held-recovery-prefix"
+            } else {
+                "released-recovery-prefix"
+            });
+            let winner = interrupt_winner_install(&fixture, install_trace, install_event, held)
+                .expect("winner must exist at recovery prefix seed");
+            if held {
+                winner.assert_held(&fixture);
+            }
+            let observer = RootedObserver::interrupt_after(event_index);
+            expect_interruption(|| {
+                recover_fixture(
+                    &fixture,
+                    Some(observer.clone()),
+                    CLAIM_TOKEN_A,
+                    SYNTHETIC_ABANDONED_PID,
+                )
+            });
+            assert_event_prefix(
+                &observer,
+                &recovery_trace,
+                event_index,
+                if held {
+                    "held-winner recovery"
+                } else {
+                    "released-winner recovery"
+                },
+            );
+            if held {
+                winner.assert_held(&fixture);
+            }
+            recover_and_assert_idempotent(&fixture, Some(&winner.identity));
+            if held {
+                winner.assert_held(&fixture);
+            }
+            let identity = winner.release();
+            let later = fixture.later_acquire_same_lock();
+            assert!(identity.matches_recovery(&later));
+        }
+    }
+
     #[test]
     fn bootstrap_protocol_publishes_complete_immutable_header_before_adoption() {
         assert_eq!(LOCK_HEADER, b"surgeist-generator-lock-v1\n");
@@ -2200,5 +3082,232 @@ mod tests {
                 .unwrap();
             assert!(release < marker);
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "exhaustive opt-in diagnostic"]
+    fn bootstrap_header_every_byte_prefix_recovers() {
+        let trace = record_uncontended_trace();
+        let writes = header_write_indices(&trace);
+        let zero_prefix = writes[0]
+            .checked_sub(1)
+            .expect("header write has a preceding registered-stage event");
+        for byte_count in 0..=LOCK_HEADER.len() {
+            let fixture = BootstrapFixture::new("header-prefix");
+            let event_index = if byte_count == 0 {
+                zero_prefix
+            } else {
+                writes[byte_count - 1]
+            };
+            interrupt_uncontended_install(&fixture, &trace, event_index);
+            fixture.assert_lock(None);
+            recover_fixture(&fixture, None, CLAIM_TOKEN_B, SYNTHETIC_ABANDONED_PID)
+                .expect("recover immutable header prefix");
+            let recovered = fixture.lock_identity();
+            assert_eq!(
+                recovered.is_some(),
+                byte_count == LOCK_HEADER.len(),
+                "only a complete immutable header may publish"
+            );
+            fixture.assert_clean(recovered.as_ref());
+            recover_and_assert_idempotent(&fixture, recovered.as_ref());
+            let later = fixture.later_acquire_same_lock();
+            if let Some(recovered) = recovered {
+                assert!(recovered.matches_recovery(&later));
+            }
+        }
+
+        let corrupt = BootstrapFixture::new("header-corruption");
+        interrupt_uncontended_install(&corrupt, &trace, writes[0]);
+        fs::write(
+            corrupt.corpus.join(stage_path(SYNTHETIC_ABANDONED_PID)),
+            b"not-a-header-prefix\n",
+        )
+        .expect("corrupt registered bootstrap stage");
+        let corrupt_before = corrupt.snapshot();
+        let error = recover_fixture(&corrupt, None, CLAIM_TOKEN_B, SYNTHETIC_ABANDONED_PID)
+            .expect_err("corrupt bootstrap header must remain evidence");
+        assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+        assert_eq!(corrupt.snapshot(), corrupt_before);
+        corrupt.assert_lock(None);
+
+        let live = BootstrapFixture::new("live-owner");
+        let observer = RootedObserver::interrupt_after(0);
+        expect_interruption(|| run_install(&live, observer, std::process::id(), None));
+        let live_before = live.snapshot();
+        let error = recover_fixture(&live, None, CLAIM_TOKEN_B, SYNTHETIC_ABANDONED_PID)
+            .expect_err("genuinely live bootstrap owner must block recovery");
+        assert_eq!(error.kind(), GeneratorErrorKind::LeaseActive);
+        assert_eq!(live.snapshot(), live_before);
+        live.assert_lock(None);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "exhaustive opt-in diagnostic"]
+    fn bootstrap_uncontended_every_prefix_recovers() {
+        let trace = record_uncontended_trace();
+        let stage = stage_path(SYNTHETIC_ABANDONED_PID);
+        let writes = header_write_indices(&trace);
+        let full_header = *writes.last().expect("complete header event");
+        let commit = one_event_index(
+            &trace,
+            DurabilityPhase::BootstrapInstall,
+            DurabilityPrimitive::RenameExclusive,
+            ACQUISITION_LOCK,
+        );
+        assert!(full_header < commit);
+        let active = active_path(SYNTHETIC_ABANDONED_PID);
+        assert_cleanup_inventory(&trace, &active);
+        assert_event_exists(
+            &trace,
+            DurabilityPhase::BootstrapInstall,
+            DurabilityPrimitive::SyncFile,
+            &stage,
+        );
+        for event_index in 0..trace.len() {
+            let fixture = BootstrapFixture::new("uncontended-prefix");
+            interrupt_uncontended_install(&fixture, &trace, event_index);
+            let committed = fixture.lock_identity();
+            assert_eq!(committed.is_some(), event_index >= commit);
+            fixture.assert_lock(committed.as_ref());
+            recover_fixture(&fixture, None, CLAIM_TOKEN_B, SYNTHETIC_ABANDONED_PID)
+                .expect("recover uncontended bootstrap prefix");
+            let recovered = fixture.lock_identity();
+            assert_eq!(recovered.is_some(), event_index >= full_header);
+            if let (Some(committed), Some(recovered)) = (&committed, &recovered) {
+                assert!(committed.matches_recovery(recovered));
+            }
+            fixture.assert_clean(recovered.as_ref());
+            recover_and_assert_idempotent(&fixture, recovered.as_ref());
+            let later = fixture.later_acquire_same_lock();
+            if let Some(recovered) = recovered {
+                assert!(recovered.matches_recovery(&later));
+            }
+        }
+
+        exercise_uncontended_recovery_prefixes(&trace, writes[0], false);
+        exercise_uncontended_recovery_prefixes(&trace, full_header, true);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "exhaustive opt-in diagnostic"]
+    fn bootstrap_winner_held_every_prefix_recovers() {
+        let (trace, _) = record_winner_trace(true);
+        let stage = stage_path(SYNTHETIC_ABANDONED_PID);
+        let release = one_event_index(
+            &trace,
+            DurabilityPhase::BootstrapInstall,
+            DurabilityPrimitive::DropHandle,
+            &stage,
+        );
+        let active = active_path(SYNTHETIC_ABANDONED_PID);
+        let lost = format!("{active}/lost-contended");
+        let lost_publication = one_event_index(
+            &trace,
+            DurabilityPhase::BootstrapInstall,
+            DurabilityPrimitive::RenameExclusive,
+            &lost,
+        );
+        assert!(release < lost_publication);
+        assert_cleanup_inventory(&trace, &active);
+        assert_event_exists(
+            &trace,
+            DurabilityPhase::BootstrapCleanup,
+            DurabilityPrimitive::RemoveFile,
+            &lost,
+        );
+
+        for event_index in 0..trace.len() {
+            let fixture = BootstrapFixture::new("held-winner-prefix");
+            let winner = interrupt_winner_install(&fixture, &trace, event_index, true);
+            if event_index < release {
+                assert!(winner.is_none());
+                recover_fixture(&fixture, None, CLAIM_TOKEN_B, SYNTHETIC_ABANDONED_PID)
+                    .expect("recover pre-winner bootstrap prefix");
+                let recovered = fixture.lock_identity();
+                fixture.assert_clean(recovered.as_ref());
+                recover_and_assert_idempotent(&fixture, recovered.as_ref());
+                fixture.later_acquire_same_lock();
+                continue;
+            }
+            let winner = winner.expect("held winner published before stage release");
+            winner.assert_held(&fixture);
+            recover_fixture(&fixture, None, CLAIM_TOKEN_B, SYNTHETIC_ABANDONED_PID)
+                .expect("recover losing bootstrap while winner is held");
+            fixture.assert_clean(Some(&winner.identity));
+            winner.assert_held(&fixture);
+            recover_and_assert_idempotent(&fixture, Some(&winner.identity));
+            winner.assert_held(&fixture);
+            let identity = winner.release();
+            let later = fixture.later_acquire_same_lock();
+            assert!(identity.matches_recovery(&later));
+        }
+
+        exercise_winner_recovery_prefixes(&trace, lost_publication, true);
+
+        let corrupt = BootstrapFixture::new("held-winner-corruption");
+        let winner = interrupt_winner_install(&corrupt, &trace, lost_publication, true)
+            .expect("held winner corruption seed");
+        fs::write(corrupt.corpus.join(&lost), b"{invalid\n")
+            .expect("corrupt lost-contended marker");
+        let before = corrupt.snapshot();
+        let error = recover_fixture(&corrupt, None, CLAIM_TOKEN_B, SYNTHETIC_ABANDONED_PID)
+            .expect_err("corrupt lost-contended marker must remain evidence");
+        assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+        assert_eq!(corrupt.snapshot(), before);
+        winner.assert_held(&corrupt);
+        drop(winner);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "exhaustive opt-in diagnostic"]
+    fn bootstrap_winner_released_every_prefix_recovers() {
+        let (trace, _) = record_winner_trace(false);
+        let stage = stage_path(SYNTHETIC_ABANDONED_PID);
+        let release = one_event_index(
+            &trace,
+            DurabilityPhase::BootstrapInstall,
+            DurabilityPrimitive::DropHandle,
+            &stage,
+        );
+        let active = active_path(SYNTHETIC_ABANDONED_PID);
+        assert_cleanup_inventory(&trace, &active);
+        assert!(
+            event_indices(
+                &trace,
+                DurabilityPhase::BootstrapInstall,
+                DurabilityPrimitive::RenameExclusive,
+                &format!("{active}/lost-contended"),
+            )
+            .is_empty(),
+            "released winner adoption must not publish a lost marker"
+        );
+
+        for event_index in 0..trace.len() {
+            let fixture = BootstrapFixture::new("released-winner-prefix");
+            let winner = interrupt_winner_install(&fixture, &trace, event_index, false);
+            if event_index < release {
+                assert!(winner.is_none());
+                recover_fixture(&fixture, None, CLAIM_TOKEN_B, SYNTHETIC_ABANDONED_PID)
+                    .expect("recover pre-winner bootstrap prefix");
+                let recovered = fixture.lock_identity();
+                fixture.assert_clean(recovered.as_ref());
+                recover_and_assert_idempotent(&fixture, recovered.as_ref());
+                fixture.later_acquire_same_lock();
+                continue;
+            }
+            let winner = winner.expect("released winner published before stage release");
+            fixture.assert_lock(Some(&winner.identity));
+            recover_and_assert_idempotent(&fixture, Some(&winner.identity));
+            let identity = winner.release();
+            let later = fixture.later_acquire_same_lock();
+            assert!(identity.matches_recovery(&later));
+        }
+
+        exercise_winner_recovery_prefixes(&trace, release, false);
     }
 }
