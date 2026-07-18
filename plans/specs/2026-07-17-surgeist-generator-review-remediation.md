@@ -80,8 +80,9 @@ removed.
 
 Library request fronts are selected rather than binary-only behavior because
 separate Cargo binary targets can consume only the library's public API. Exact
-checked request types keep parsing out of the thin binaries and make the command
-matrix testable without processes. No domain implementation type is public.
+checked request types keep parsing out of the thin binaries, make invalid command
+payloads unconstructable, and keep the CLI option matrix testable without
+processes. No domain implementation type is public.
 
 Canonical import sidecars are selected because offline corpus verification
 cannot prove an imported tree's source revision from a mutable manifest alone.
@@ -1011,21 +1012,28 @@ Only with `layout-browser`, `lib.rs` exposes `pub mod layout` with exactly:
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum LayoutCommand {
-    Generate,
     CheckCorpus,
     CheckTaffyCorpus,
     ImportTaffy,
+    Generate,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LayoutRequest { /* private fields */ }
 
 impl LayoutRequest {
-    pub fn new(
+    pub fn check_corpus(location: CorpusLocation) -> Self;
+    pub fn check_taffy_corpus(
         location: CorpusLocation,
-        command: LayoutCommand,
-        browser_path: Option<RelativePath>,
-        source_root: Option<std::path::PathBuf>,
+        source_root: std::path::PathBuf,
+    ) -> Result<Self>;
+    pub fn import_taffy(
+        location: CorpusLocation,
+        source_root: std::path::PathBuf,
+    ) -> Result<Self>;
+    pub fn generate(
+        location: CorpusLocation,
+        browser_path: RelativePath,
         filter: Option<RelativePath>,
     ) -> Result<Self>;
     pub const fn location(&self) -> &CorpusLocation;
@@ -1039,9 +1047,26 @@ pub fn run(request: LayoutRequest) -> Result<()>;
 pub fn run_from_env() -> Result<()>;
 ```
 
-The private fields correspond one-for-one to constructor arguments. The
-constructor performs no filesystem access. It rejects an empty source path and
-enforces this exact matrix as `Cli`:
+The private representation stores the command and only its associated payload.
+Constructors perform no filesystem access. `check_corpus` has no additional
+payload; `check_taffy_corpus` and `import_taffy` reject an empty source path as
+`Cli`; and `generate` requires the checked browser path and rejects a reserved
+filter as `Cli` under SR-04.5. Consequently the library API cannot construct a
+browser or filter for a check/import request, a source root for generation, or
+any other command-option mismatch. The accessors return `Some` only for the
+payload owned by the request's constructor.
+
+The layout surface consists of two complete, monotonic capability sets. The
+browser-free set is `CheckCorpus`, `CheckTaffyCorpus`, `ImportTaffy`, their three
+constructors, `location`, `command`, `source_root`, `run`, and `run_from_env`;
+it is independently usable by the production binary and library callers. The
+generation set is `Generate`, `generate`, `browser_path`, and `filter`, and must
+be exposed atomically with working generation behavior. Adding that set is an
+additive extension: `LayoutCommand` is non-exhaustive and the new inherent
+constructor/accessors do not alter the browser-free signatures or semantics.
+Neither set permits a crate-private-only or provisional production boundary.
+
+The final CLI parser enforces this exact matrix as `Cli`:
 
 | Command | browser_path | source_root | filter |
 | --- | --- | --- | --- |
@@ -1097,7 +1122,8 @@ only the shown traits; enums are non-exhaustive so new commands are not a
 breaking match promise. No Tokio, Chromiumoxide, JSON value, descriptor, lease,
 or transaction type appears publicly. Public items have rustdoc with an
 acquisition-free example; feature-specific public API tests assert construction,
-traits, accessors, invalid matrices, and examples.
+traits, accessors, the layout capability-set isolation, CSS invalid matrices,
+and examples.
 
 ### SR-05.4 CLI and supervisor boundary
 
@@ -1149,9 +1175,9 @@ surgeist-layout-generate --owner-root <path> --corpus-root <path> \
   [--filter <html-relative-file-or-prefix>]
 ```
 
-Its option matrix is SR-05.2. There is no `generate-existing` distinction and no
-managed acquisition: the one generate command always requires the existing
-browser path.
+Its final CLI option matrix is SR-05.2. There is no `generate-existing`
+distinction and no managed acquisition: the one generate command always requires
+the existing browser path.
 
 The exact schema-2 TOML object structure is:
 
