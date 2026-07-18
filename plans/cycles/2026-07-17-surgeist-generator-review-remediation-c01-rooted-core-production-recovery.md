@@ -52,8 +52,10 @@
   `20c55499a3e0485f1f8dabbd93b0459e05250720` and
   `135e1a6afabe09f739e16e1bde8395fd46ef7d4c`. C01-T03 has an unreviewed initial
   worker span `135e1a6afabe09f739e16e1bde8395fd46ef7d4c..3080113df920862302b397d7cfb84e28c72578c0`;
-  a fresh worker must reconcile its ordinary exhaustive tests with this amended
-  plan before task review. No implementation test runs during this correction.
+  after this plan is clean, a fresh worker must reconcile its ordinary exhaustive
+  tests, append a new T03 correction span, and rerun every T03 acceptance command.
+  A fresh task reviewer then reviews the complete ordered initial-plus-correction
+  T03 range. No implementation test ran while this plan correction was authored.
 - The supported mutation host is `Darwin arm64`; portable default-library
   verification is warning-denied `wasm32-unknown-unknown`. Unsupported targets
   retain their semantic stop before mutation.
@@ -335,8 +337,27 @@
   - `cargo fmt --check`
   - `git diff --check`
   - `shasum -a 256 src/layout/legacy_generator.rs`
-  - `git ls-files -co --exclude-standard -z -- '*.rs' ':(exclude)vendor/**' ':(exclude)target/**' | LC_ALL=C sort -zu | tr '\0' '\n'`
-  - `! git ls-files -co --exclude-standard -z -- '*.rs' ':(exclude)vendor/**' ':(exclude)target/**' | LC_ALL=C sort -zu | xargs -0 rg -n --pcre2 '#\s*\[\s*(?:unsafe\s*\(|no_mangle\b|export_name\b)|\bunsafe\s*(?:\{|fn\b|trait\b|impl\b|extern\b)|\bstatic\s+mut\b|\bextern\s*(?:"[^"]*")?\s*\{' --`
+  - Run this failure-propagating owned-Rust manifest and unsafe scan:
+    ```zsh
+    (
+      set -eu
+      manifest="$(mktemp)"
+      trap 'rm "$manifest"' EXIT
+      git ls-files -co --exclude-standard -z -- '*.rs' ':(exclude)vendor/**' ':(exclude)target/**' >"$manifest"
+      LC_ALL=C sort -zu "$manifest" -o "$manifest"
+      test -s "$manifest"
+      tr '\0' '\n' <"$manifest"
+      pattern='#\s*\[\s*(?:unsafe\s*\(|no_mangle\b|export_name\b)|\bunsafe\s*(?:\{|fn\b|trait\b|impl\b|extern\b)|\bstatic\s+mut\b|\bextern\s*(?:"[^"]*")?\s*\{'
+      while IFS= read -r -d '' rust_path; do
+        if rg -n --pcre2 "$pattern" -- "$rust_path"; then
+          exit 1
+        else
+          scan_exit=$?
+          test "$scan_exit" -eq 1 || exit "$scan_exit"
+        fi
+      done <"$manifest"
+    )
+    ```
   - `cargo test --locked --offline -p surgeist-generator --lib transaction_install_every_prefix -- --ignored`
   - `cargo test --locked --offline -p surgeist-generator --lib transaction_recovery_every_prefix -- --ignored`
   - `cargo test --locked --offline -p surgeist-generator --lib bootstrap_ -- --ignored`
