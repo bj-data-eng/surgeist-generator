@@ -2987,14 +2987,17 @@ fn validate_owner_cleanup_intent(
         ));
     }
     validate_recorded_owner_identity(rooted, intent.old_identity.as_ref())?;
-    let expected_marker = expected_owner_outcome(
-        &intent,
-        outcome,
-        &OwnerVisibility {
+    let expected_visibility = match outcome {
+        OwnerOutcomeKind::Aborted => OwnerVisibility {
+            digest: intent.old_digest.clone(),
+            identity: intent.old_identity.clone(),
+        },
+        OwnerOutcomeKind::Committed => OwnerVisibility {
             digest: marker.visible_digest.clone(),
             identity: marker.visible_identity.clone(),
         },
-    );
+    };
+    let expected_marker = expected_owner_outcome(&intent, outcome, &expected_visibility);
     if marker != &expected_marker {
         return Err(transaction_error(
             "clean private journal",
@@ -3210,10 +3213,11 @@ mod tests {
     use super::{
         ACQUISITION_LOCK, BOOTSTRAP_LOCKS, BootstrapInstallControl, BootstrapRecoveryControl,
         COORDINATION_ROOT, CoordinationAccess, CoordinationGuard, LeaseMetadata,
-        OWNER_TRANSACTIONS, OwnerRecord, OwnerRecordStamp, acquire_exclusive, canonical_json,
-        cleanup_owner_journal, corpus_authority_key, install_owner_record_controlled, mutex_path,
-        open_existing_lock, open_or_bootstrap_lock, open_or_bootstrap_lock_controlled, owner_path,
-        process_is_live, recover_bootstrap_controlled, recover_owner_transactions,
+        OWNER_TRANSACTIONS, OwnerOutcomeKind, OwnerOutcomeMarker, OwnerRecord, OwnerRecordStamp,
+        acquire_exclusive, canonical_json, cleanup_owner_journal, corpus_authority_key,
+        install_owner_record_controlled, mutex_path, open_existing_lock, open_or_bootstrap_lock,
+        open_or_bootstrap_lock_controlled, owner_path, process_is_live,
+        recover_bootstrap_controlled, recover_owner_transactions,
     };
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4693,6 +4697,70 @@ mod tests {
                 fixture.snapshot(),
                 before,
                 "direct owner cleanup did not preserve every {case} journal byte"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn owner_cleanup_rejects_aborted_outcome_bound_to_visible_new_owner() {
+        for initial in [InitialOwner::Absent, InitialOwner::Old] {
+            let trace = record_owner_install_trace(initial);
+            let fixture = OwnerFixture::new(initial);
+            let active = fixture.active_path();
+            let seed_index = match initial {
+                InitialOwner::Absent => owner_marker_index(&trace, "committed"),
+                InitialOwner::Old => one_event_index(
+                    &trace,
+                    DurabilityPhase::OwnerInstall,
+                    DurabilityPrimitive::RemoveFile,
+                    &format!("{active}/owner.stage"),
+                ),
+            };
+            interrupt_owner_install(&fixture, &trace, seed_index);
+            let expected_new = fixture.expected_new_bytes();
+            fixture.assert_visibility(Some(&expected_new));
+
+            let committed = fixture.corpus.join(format!("{active}/committed"));
+            let mut marker: OwnerOutcomeMarker = serde_json::from_slice(
+                &fs::read(&committed).expect("read committed owner outcome"),
+            )
+            .expect("parse committed owner outcome");
+            marker.outcome = OwnerOutcomeKind::Aborted;
+            fs::remove_file(&committed).expect("replace committed owner outcome");
+            corrupt_file(
+                &fixture.corpus.join(format!("{active}/aborted")),
+                &canonical_json(&marker, "serialize forged aborted owner outcome")
+                    .expect("serialize forged aborted owner outcome"),
+            );
+
+            let rooted = fixture.rooted();
+            let journal_identity = rooted
+                .identity_at(&active)
+                .expect("inspect owner cleanup journal")
+                .expect("owner cleanup journal remains");
+            let authority_key = corpus_authority_key(&rooted, Domain::Layout);
+            let before = fixture.snapshot();
+
+            let error = cleanup_owner_journal(
+                &rooted,
+                Domain::Layout,
+                &authority_key,
+                OWNER_INSTALL_TOKEN,
+                &active,
+                journal_identity,
+            )
+            .expect_err("aborted outcome bound to the visible new owner must be rejected");
+
+            assert_eq!(
+                error.kind(),
+                GeneratorErrorKind::ArtifactTransaction,
+                "{initial:?}"
+            );
+            assert_eq!(
+                fixture.snapshot(),
+                before,
+                "direct owner cleanup did not preserve the complete {initial:?} journal"
             );
         }
     }
