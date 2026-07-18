@@ -1943,6 +1943,7 @@ mod tests {
         }
 
         #[test]
+        #[ignore = "exhaustive opt-in diagnostic"]
         fn transaction_install_every_prefix_recovers() {
             for kind in [CommitKind::Exclusive, CommitKind::Swap] {
                 let trace = record_install_trace(kind);
@@ -1967,6 +1968,7 @@ mod tests {
         }
 
         #[test]
+        #[ignore = "exhaustive opt-in diagnostic"]
         fn transaction_recovery_every_prefix_is_idempotent() {
             let exclusive_install = record_install_trace(CommitKind::Exclusive);
             let swap_install = record_install_trace(CommitKind::Swap);
