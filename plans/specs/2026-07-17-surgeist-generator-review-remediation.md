@@ -170,14 +170,16 @@ alias, probe file, coordination directory, import root, profile, or stage is
 created during this preflight.
 
 Source verification and immutable snapshot construction are read-only and launch
-no external resource executable. After
-preflight, exclusive lease acquisition may create/recover only the already-proved
-disjoint coordination namespace. While the domain mutex is held and before any
-publication/profile write or external process launch, the command reopens every
-protected directory without following links, requires its recorded identity,
-and repeats the complete disjointness matrix through a crate-private protected
-revalidation callback. A changed path or identity fails closed. The snapshot
-bytes—not a reread checkout—feed import publication.
+no external resource executable. After preflight, exclusive acquisition may run
+only the prerequisite transaction/coordination recovery protocols over namespaces
+already proved writable and disjoint; those protocols consume no protected-source
+snapshot and create no new command publication intent. While the domain mutex is
+held and before any new command publication intent, profile creation or cleanup,
+or external process launch, the command reopens every protected directory without
+following links, requires its recorded identity, and repeats the complete
+disjointness matrix through a crate-private protected revalidation callback. A
+changed path or identity fails closed. The snapshot bytes—not a reread
+checkout—feed import publication.
 
 Existing browser validation performs the same canonical and identity checks on
 the manifest cache root and CLI executable, rejects any resolution outside the
@@ -398,24 +400,36 @@ cleanup contexts and preserves the cleanup journal. During an unexpected panic,
 the same terminalization runs; the original panic payload is resumed afterward,
 including when cleanup evidence must remain for the next acquisition.
 
-After abrupt parent death, the next exclusive layout acquisition inspects profile
-journals before source revalidation or new profile creation. A held transition
-lock or live/permission-inconclusive recorded process group returns `LeaseActive`
-without signaling or deleting anything. This deliberately treats PID/group reuse
-as a safe false positive. Once the group is provably absent, a complete active
-journal is renamed and erased; an already renamed cleanup journal resumes erasure;
-an interrupted pre-`running.json` creation prefix is erased only when the
-transition lock is free and its exact prefix/identities validate. Unknown or
-corrupt metadata, replacement, a mount, or unsafe erasure returns
-`ArtifactTransaction` and preserves evidence. Recovery never sends a signal;
-operators terminate an orphaned trusted browser group and retry.
+After abrupt parent death, the next exclusive layout acquisition first inspects
+and classifies profile journals read-only before protected-source revalidation or
+new profile creation. A held transition lock or live/permission-inconclusive
+recorded process group returns `LeaseActive` without signaling or deleting
+anything. This deliberately treats PID/group reuse as a safe false positive. A
+provably dead complete active journal, already-renamed cleanup journal, or
+interrupted pre-`running.json` creation prefix becomes a deterministic pending
+cleanup plan with every journal/profile identity held; no rename, unlink, or
+directory removal occurs yet. Unknown or corrupt metadata, replacement, a mount,
+or unsafe planned erasure returns `ArtifactTransaction` with byte-identical
+evidence. Recovery never sends a signal; operators terminate an orphaned trusted
+browser group and retry.
+
+Only after protected-source closing revalidation succeeds does acquisition
+revalidate every held profile/journal identity and execute that pending plan: a
+dead complete active journal is renamed and erased, an existing cleanup journal
+resumes erasure, and a validated interrupted prefix is erased only while the
+transition lock remains free. Identity drift between classification and cleanup,
+or any rename/erase/sync failure, returns `ArtifactTransaction` and preserves the
+exact recoverable evidence; no owner-record install begins. Thus revalidation
+failure leaves even dead profile evidence byte-identical, while successful
+cleanup is terminal before owner installation and guard return.
 
 At most one active, cleanup, or interrupted-prefix journal may exist because a
 new version/measurement journal is never created until the preceding one is
 terminal. Recovery first enumerates and validates the complete journal-level
 inventory without mutation. A second journal or any unknown member is
 `ArtifactTransaction` with every byte preserved; one valid dead journal is then
-recovered through its deterministic primitive trace.
+held as the pending plan and, only after closing revalidation, recovered through
+its deterministic primitive trace.
 
 The profile subtree is opaque browser output only below the bound `profile/`
 directory. A dedicated descriptor-relative eraser enumerates raw OS names,
@@ -439,6 +453,9 @@ Named synthetic tests are
 `layout_profile_forced_group_kill_is_terminal`,
 `layout_profile_parent_crash_live_group_blocks`,
 `layout_profile_parent_crash_dead_group_recovers`,
+`layout_profile_revalidation_failure_preserves_dead_journal`,
+`layout_profile_cleanup_begins_only_after_revalidation`,
+`layout_profile_identity_drift_after_classification_preserves_evidence`,
 `layout_profile_transition_lock_closes_launch_race`,
 `layout_profile_cleanup_every_prefix_recovers`,
 `layout_profile_opaque_entries_never_escape`,
@@ -583,18 +600,23 @@ The complete normative exclusive-acquisition order is:
 2. run `TransactionEngine::recover_all`;
 3. run `recover_owner_transactions`;
 4. run `recover_probe_journals`, then `run_rename_probe`;
-5. for layout only, recover/classify SR-03.3 profile journals;
+5. for layout only, read-only classify SR-03.3 profile journals and hold any
+   valid dead-journal cleanup plan;
 6. run the protected-source closing revalidation callback;
-7. only after it succeeds, run `install_owner_record`; and
-8. return the live guard.
+7. for layout only, revalidate the held profile identities and execute the
+   pending dead-profile cleanup plan;
+8. only after all preceding steps succeed, run `install_owner_record`; and
+9. return the live guard.
 
 The same normative observer drives the owner-record and rename-probe protocols,
-but their positions are intentionally different: probe execution is before
-closing revalidation and owner installation is after it. A probe/profile/
-revalidation failure creates no owner transaction and leaves the historical
-owner byte-identical. An owner-install failure follows the owner visibility
-oracle below and returns no guard. The mutex is released on every failed
-acquisition after durable recovery/evidence decisions complete.
+but their positions are intentionally different: prerequisite probe execution and
+read-only profile classification are before closing revalidation; profile cleanup
+and owner installation are after it. A probe/profile-classification/revalidation/
+profile-cleanup failure creates no owner transaction and leaves the historical
+owner byte-identical. Revalidation failure also leaves the classified profile
+byte-identical. An owner-install failure follows the owner visibility oracle below
+and returns no guard. The mutex is released on every failed acquisition after
+durable recovery/evidence decisions complete.
 
 Owner-record install runs twice: once with no prior `owner.json` and once with a
 valid old record. Its trace includes active-journal creation; every intent,
@@ -653,8 +675,9 @@ Named production-path tests are
 `rename_probe_recovery_every_prefix_is_idempotent`,
 `rename_probe_corruption_preserves_evidence`, and
 `lease_acquisition_recovers_owner_and_probe_prefixes`. The acquisition boundary
-also has `lease_revalidation_failure_preserves_historical_owner` and
-`lease_owner_install_begins_only_after_revalidation`.
+also has `lease_revalidation_failure_preserves_historical_owner`,
+`lease_owner_install_begins_only_after_revalidation`, and
+`lease_owner_install_begins_only_after_profile_recovery`.
 
 ### SR-04.5 Shared publication state and error matrix
 
@@ -673,7 +696,8 @@ the validated historical-plus-desired inventory authority below.
 | classifiable but stale current root | full import/generate | swap to the new complete root; only classified stale entries disappear |
 | unknown/unclassifiable entry | any mutation | `InvalidInventory` before transaction intent; final tree unchanged |
 | final root absent | filtered generate | `Verification`; no partial corpus is established |
-| structurally classifiable current root | filtered generate | selected artifacts updated; reports and every other entry preserved |
+| structurally classifiable current root whose historical full report owns every selected output the command could publish | filtered generate | selected artifacts updated; reports and every other entry preserved |
+| selected output the command could publish is absent from historical full-report authority | filtered generate | `Verification` before lease; a full generation is required so no ownerless path is created |
 
 The exact command-level state transitions are:
 
@@ -681,12 +705,12 @@ The exact command-level state transitions are:
 | --- | --- | --- | --- |
 | Layout `import-taffy` | manifest-authored HTML is exact; the Taffy-owned portion is absent/current/stale; downstream XML is absent/current/stale | `Ok`; HTML becomes current. If the canonical Taffy sidecar digest changed, existing classifiable downstream becomes stale and absent downstream remains absent; if it did not change, downstream retains its prior state. | A changed import requires full layout generate before `check-corpus` can return `Ok`; an unchanged import does not manufacture staleness. |
 | Layout full `generate` | XML absent/current/stale and current HTML/sidecar | Clean completion returns `Ok` and XML/reports become current. A complete diagnostic publication returns `Generation` and leaves a classifiable stale diagnostic generation. | Diagnostic output requires another successful clean full generate. |
-| Layout filtered `generate` | classifiable XML current/stale | `Ok`; selected XML is replaced and every other XML/report byte is preserved. The resulting full state is current only if the preserved reports still validate against all resulting XML; otherwise it is stale. | If stale, run a successful clean full generate before `check-corpus` can return `Ok`. |
+| Layout filtered `generate` | classifiable XML current/stale; every possible scheduled selected XML path is owned by the validated current-schema historical full report | `Ok`; selected generated XML is replaced, selected paths now classified unsupported are removed, and every unselected XML/report byte is preserved. The resulting full state is current only if the preserved reports still validate against all resulting XML; otherwise it is stale. | If selection is unowned, return `Verification` before lease and require full generation. If the result is stale, run a successful clean full generate before `check-corpus` can return `Ok`. |
 | Layout `check-taffy-corpus` | any HTML state plus explicit source | `Ok` only when the checkout pin/snapshot and imported sidecar/files match; otherwise `SourceVerification` for checkout pin/object/snapshot drift, `Verification` for absent/stale known imported state, or `InvalidInventory` for unknown/malformed corpus shape. No bytes change. | Correct or re-import the named source; the command never repairs it. |
 | Layout `check-corpus` | HTML and XML current/stale/absent/invalid | `Ok` only when both are current; `Verification` for absent/stale/diagnostic known state; `InvalidInventory` for unknown entries or malformed known artifacts. No bytes change. | Run the indicated import or clean full generate; the command never repairs state. |
 | CSS `import-csstree` | import root absent/current/stale; downstream expectations absent/current/stale | `Ok`; import root becomes current. If the canonical CSSTree sidecar digest changed, existing classifiable downstream becomes stale and absent downstream remains absent; if it did not change, downstream retains its prior state. | A changed import requires full CSS generate before `check-corpus` can return `Ok`; an unchanged import does not manufacture staleness. |
 | CSS full `generate` | expectation root absent/current/stale and current import sidecar/files | `Ok`; expectations/report become current. | None. |
-| CSS filtered `generate` | classifiable expectations current/stale | `Ok`; selected expectations are replaced and every other expectation/report byte is preserved. The resulting full state is current only if the preserved report still validates against all resulting expectations; otherwise it is stale. | If stale, run a successful full generate before `check-corpus` can return `Ok`. |
+| CSS filtered `generate` | classifiable expectations current/stale; every selected expectation is owned by the validated historical full report | `Ok`; selected expectations are replaced and every other expectation/report byte is preserved. The resulting full state is current only if the preserved report still validates against all resulting expectations; otherwise it is stale. | If selection is unowned, return `Verification` before lease and require full generation. If the result is stale, run a successful full generate before `check-corpus` can return `Ok`. |
 | CSS `check-corpus` | import and expectation roots current/stale/absent/invalid | `Ok` only when both are current; `Verification` for absent/stale known state; `InvalidInventory` for unknown entries or malformed known artifacts. No bytes change. | Run the indicated import or full generate; the command never repairs state. |
 
 #### Historical downstream inventory authority
@@ -734,7 +758,10 @@ historical output/report paths from the validated old authority plus output/repo
 paths derived from the current source/manifest. Every visible downstream entry
 must belong to that union or an implied directory. Clean full publication retains
 only the new desired set, so removed/renamed historical outputs disappear;
-additions are created. Filtered publication writes no authority and preserves all
+additions are created. Filtered publication writes no authority and therefore may
+replace only output paths already recorded by the validated current-schema
+historical full report; an absent report, migration-only report, failed/non-output
+entry, or newly desired path cannot authorize filtered creation. It preserves all
 other union members. A layout `DiagnosticFull` publishes the complete current
 report set, retains only successfully generated current XML, and removes every
 other historical-union XML/report path; failed current jobs have report entries
@@ -748,8 +775,76 @@ Named cross-generation tests are
 `layout_legacy_report_requires_complete_report_migration`,
 `layout_historical_inventory_rejects_malformed_authority`,
 `layout_membership_delta_diagnostic_replaces_authority`,
-`css_historical_inventory_removal_rename_addition_regenerates`, and
-`css_historical_inventory_rejects_malformed_authority`.
+`layout_filtered_add_then_remove_requires_full_before_creation`,
+`css_historical_inventory_removal_rename_addition_regenerates`,
+`css_historical_inventory_rejects_malformed_authority`, and
+`css_filtered_add_then_rename_requires_full_before_creation`.
+The two filtered-addition tests execute the complete sequence: publish `A` by a
+full run; import desired `B`; prove filtered `B` returns `Verification` and creates
+no bytes because the `A` report does not own it; import a removal/rename of `B`;
+then prove the next full run succeeds and leaves one current, fully owned root.
+
+#### Exact filtered selection and ownership
+
+A filter is a nonempty strict `RelativePath` relative to the domain input root;
+it never includes the physical root component (`html` or the manifest import-root
+name). Request construction and CLI parsing reject empty/dot paths, trailing
+separators, backslashes, absolute/parent/prefix components, and the domain's exact
+reserved path as `Cli` without I/O. Layout reserves `.surgeist-source.json`; CSS
+reserves `generation-reports/all.json`. No filesystem `is_file`/`is_dir` probe
+chooses matching mode.
+
+Layout uses exact-file mode when the final component ends in `.html`; otherwise
+it uses directory-prefix mode. The current fixture inventory is exactly the union
+of manifest-owned Surgeist case sources and Taffy HTML paths in the validated
+import sidecar; Taffy compatibility case records retain their SR-06.1 no-filter
+effect. Exact mode matches one inventory path, relative to `html`, by equal
+normalized components. Prefix mode matches every such path whose component vector
+starts with the filter's complete component vector; `grid/a` does not match
+`grid/ab/case.html`. This validated manifest-plus-sidecar inventory—not historical
+XML and not directory existence—is the match authority. Every matching Surgeist
+case remains in the selection ledger. Each matched Taffy fixture and each active
+or expected-fail Surgeist case schedules its exact four variant paths;
+expected-fail additionally contributes its preserved disposition entry. A
+manifest-unsupported case contributes the preserved `variant = "manifest"`
+unsupported entry and no browser job; a quarantined case contributes its status
+entry and no browser job. A selection with no fixture is `Verification` before
+lease. A nonempty selection containing only manifest-unsupported/quarantined
+fixtures returns `Ok` before lease as a byte-identical no-op, preserving the
+legacy disposition-only result. For filtered publication, all four possible paths
+for every scheduled fixture must already be generated entries in the historical
+full report, even if a recorded file is
+currently missing/stale; otherwise the whole request is `Verification` before
+lease and publishes nothing.
+
+CSS uses exact-file mode when the final component ends in `.json`; otherwise it
+uses component-prefix mode with the same whole-component rule. Its match authority
+is the current validated import sidecar. Exact/prefix selection includes whole
+fixture artifacts and every derived case/disposition inside each fixture. A
+selection with no fixture is `Verification` before lease. Every selected mapped
+expectation path must already be a `ReportArtifact` in the historical full report;
+otherwise the whole request is `Verification` before lease and publishes nothing.
+
+Precedence is exact: syntax/reserved-filter `Cli`; then manifest, current import/
+sidecar, and complete downstream authority/inventory validation with their owning
+error kinds; then zero-match/unowned-selection `Verification`; then
+lease acquisition. A partial string component never counts as a match, and a
+syntactically valid absent exact file is the zero-match case. Layout manifest
+scoped-report filters use the same matcher over the complete full-run outcome
+ledger. Each scoped report is the exact matched subset, including every
+disposition/failure bucket, while an interface filtered run never writes a report.
+CSS has no scoped reports.
+
+Named selection tests are `layout_filter_exact_file`,
+`layout_filter_component_prefix`, `layout_filter_rejects_partial_component`,
+`layout_filter_rejects_reserved`, `layout_filter_absent_is_verification`,
+`layout_filter_disposition_only_is_noop`,
+`layout_filter_expected_fail_schedules_and_accounts`,
+`layout_filter_manifest_unsupported_has_no_job`,
+`layout_filter_matches_taffy_sidecar_fixture`,
+`layout_scoped_report_uses_filter_matcher`, `css_filter_exact_file`,
+`css_filter_component_prefix`, `css_filter_rejects_partial_component`,
+`css_filter_rejects_reserved`, and `css_filter_absent_is_verification`.
 
 For both filtered commands, an absent final root returns `Verification` before
 transaction intent. For every mutation command, an invalid current root returns
@@ -772,11 +867,12 @@ public call returned `Err`:
 | --- | --- | --- | --- |
 | CLI/manifest/inventory/source/namespace/capability or required-import validation before lease | prior absent/current tree | none created by the command | owning `Cli`, `InvalidManifest`, `InvalidInventory`, `SourceVerification`, `InvalidPath`, `UnsupportedPlatform`, or `Verification` kind |
 | read-only coordination acquisition/finish | prior tree | byte-identical coordination/profile state | `Verification`; underlying safe I/O/parse context retained in its diagnostic/source |
-| mutation lease/bootstrap/profile recovery before publication intent | prior tree | active live evidence preserved; dead valid profile state either fully cleaned or retained as resumable cleanup evidence | `LeaseActive` for a held lease/transition or live/permission-inconclusive recorded group; `ArtifactTransaction` for corrupt metadata or unclassifiable recovery/cleanup; safe source retained |
+| mutation lease/bootstrap/prerequisite transaction or coordination recovery, plus layout read-only profile classification | prior tree except the visibility dictated by a prerequisite recovery oracle | active/live/dead profile evidence byte-identical; valid transaction/coordination recovery either completes or retains its exact evidence | `LeaseActive` for a held lease/transition or live/permission-inconclusive recorded group; `ArtifactTransaction` for corrupt metadata or unclassifiable prerequisite recovery/profile state; safe source retained |
 | exclusive- or swap-rename capability probe fails and all failure cleanup completes | prior tree | no probe residue; historical owner byte-identical; mutex released | `UnsupportedPlatform` with the original capability source |
 | rename-probe recovery or failure cleanup cannot complete | prior tree | exact valid active probe journal retained; historical owner byte-identical; mutex released | `ArtifactTransaction` containing capability/recovery and cleanup context |
-| protected closing revalidation rejects after prerequisite recovery/probe/profile work | prior tree | no owner transaction; historical owner byte-identical; mutex released | exact owning `InvalidPath`, `InvalidInventory`, or `SourceVerification` with safe source |
-| owner-record install fails after successful closing revalidation but before domain publication intent | prior tree | owner remains absent/old before owner commit or complete new after it; valid resumable owner journal retained only when cleanup cannot finish | `ArtifactTransaction` under the owner install/recovery oracle; no live guard returned |
+| protected closing revalidation rejects after prerequisite recovery/probe and read-only profile classification | prior tree except completed prerequisite recovery visibility | no owner transaction; historical owner and every profile journal byte-identical; mutex released | exact owning `InvalidPath`, `InvalidInventory`, or `SourceVerification` with safe source |
+| post-revalidation dead-profile identity check or cleanup cannot complete | prior generation tree | no owner transaction; historical owner byte-identical; exact active/cleanup/prefix journal evidence retained | `ArtifactTransaction` with profile classification/cleanup context; no live guard returned |
+| owner-record install fails after successful closing revalidation and any profile cleanup, but before domain publication intent | prior tree | owner remains absent/old before owner commit or complete new after it; valid resumable owner journal retained only when cleanup cannot finish; profile cleanup is already terminal | `ArtifactTransaction` under the owner install/recovery oracle; no live guard returned |
 | after intent but before commit, with synchronous recovery successful | absent for exclusive or complete old for swap | no transaction residue | original owning error kind |
 | commit completed but root sync/outcome/cleanup fails, with recovery successful | complete new | no residue after successful recovery | `ArtifactTransaction` because commit occurred |
 | any recovery or cleanup cannot safely complete | absence/old/new dictated by the commit oracle | valid resumable evidence retained | `ArtifactTransaction` containing operation and recovery context |
@@ -1050,7 +1146,7 @@ The CLI is:
 surgeist-layout-generate --owner-root <path> --corpus-root <path> \
   <generate|check-corpus|check-taffy-corpus|import-taffy> \
   [--browser-path <owner-relative-path>] [--source-root <path>] \
-  [--filter <html-relative-path>]
+  [--filter <html-relative-file-or-prefix>]
 ```
 
 Its option matrix is SR-05.2. There is no `generate-existing` distinction and no
@@ -1135,6 +1231,18 @@ excluded destination directories are exactly the shown unique set in either
 order. The Taffy repository, revision, source directory, pre-exclusion count,
 destination, source-root kinds/paths, and upstream commit are exact.
 
+`provenance_format` contains `{version}` and
+`{repository_relative_executable}` exactly once each and contains no other `{` or
+`}` byte, so both generation substitution and offline parsing are unambiguous.
+
+The full report's five counts are CleanFull acceptance expectations, not values
+copied into an actual report summary. They retain the preserved nonnegative input
+grammar. A nonzero declared `failed_to_generate` remains schema-2 compatible but
+cannot be satisfied by `CleanFull`, which has no runtime failure, and therefore
+cannot make a corpus current. A scoped declaration supplies only its shown clean
+expected `generated` count; the other four scoped summary fields are actual
+derived counts, not hidden manifest constants.
+
 Paths are strict normalized relative paths. `cache_root` resolves beneath owner
 and outside corpus; the CLI browser executable resolves beneath that exact cache
 root. Report files are unique one-component JSON names; full is exactly
@@ -1174,7 +1282,10 @@ tightenings of inputs formerly accepted by the loose parser are:
 3. launch strings undergo SR-03.2 normalization and reject duplicate normalized
    keys, non-printable/path-bearing strings, driver-owned or redirecting keys,
    and malformed leading-hyphen forms. One optional leading `--` is normalized
-   before invocation while the raw manifest spelling remains in the digest.
+   before invocation while the raw manifest spelling remains in the digest;
+4. `browser.provenance_format` requires each of its two preserved placeholders
+   exactly once and rejects any other brace, closing the loose parser's ambiguous
+   repeat/unknown-placeholder acceptance.
 
 Named compatibility fixtures are
 `layout_schema2_preserves_taffy_compatibility_records`,
@@ -1330,15 +1441,33 @@ is the exact 40- or 64-hex sidecar revision. `browser` is the exact manifest
 `{repository_relative_executable}`. Raw browser SHA-256 is therefore persisted
 separately rather than implied by that string.
 
-All attribute values use the preserved XML escaping order (`&`, `"`, `<`, `>`).
-The linked-resource value, when nonempty, is the strictly path-sorted comma-joined
-list `<strict-relative-path>=<sha256>` and is omitted when empty. The constrained
+The preserved attribute renderer replaces, in order, `&` with `&amp;`, `"` with
+`&quot;`, and `<` with `&lt;`; it does not replace `>`. Preserved text rendering
+replaces only `&` and then `<`; quotes and `>` remain literal. The linked-resource
+value, when nonempty, is the strictly path-sorted comma-joined list
+`<strict-relative-path>=<sha256>` and is omitted when empty. The constrained
 contract currently produces the empty list. `base-style-sha256` exists exactly
 when the snapshotted source contains the literal `test_base_style.css`. The
 checker requires the comment as the first line, rejects duplicate/unknown/
-misordered attributes, requires exactly the applicable optional fields, and
-recomputes every value. Unsupported measured variants have no XML and are
-reported with reason.
+misordered attributes, and requires exactly the applicable optional fields.
+Unsupported measured variants have no XML and are reported with reason.
+
+Generation computes `browser-executable-sha256` from the held executable at the
+validated launch boundary. `check-corpus` is intentionally offline: it receives
+no browser path, never opens the owner cache/executable, and does not claim to
+authenticate that historical byte digest. It recomputes every corpus-derived
+comment/report value—source and linked-resource digests, helper/base-style,
+launch-profile, manifest, Taffy revision/sidecar, and complete XML output digest.
+It requires report browser source/version to equal the manifest, parses the
+recorded provenance through the manifest format into one strict owner-relative
+executable beneath `cache_root`, requires lowercase SHA-256 grammar for the
+recorded executable digest, and requires exact browser provenance/digest equality
+between full/scoped reports and every XML comment. These values are a historical
+generation attestation only: an absent, replaced, or byte-drifted cache executable
+does not change offline check results, and a canonical self-consistent rewrite of
+every full/scoped report, XML attestation, and resulting XML output digest is
+accepted. README/rustdoc state this non-authentication boundary; generation
+remains the command that revalidates and rehashes the actual executable.
 
 This is the complete-byte zero-layout golden, including its one final LF (the
 repeated digits are valid example digest/revision values):
@@ -1374,10 +1503,34 @@ entries are `{name, source, reason}`, each in shown field order. All buckets are
 deterministically sorted by `(source, name, variant-or-empty, output-or-empty,
 output_sha256-or-empty, reason-or-empty)`. The report decoder's duplicate-member
 prepass and typed objects reject duplicate or unknown fields at every level. Each
-scoped/diagnostic report carries the same digest for each generated entry,
-identical metadata, its declared filter when scoped, the exact sorted subset of
-the full result, and its manifest counts. Serde pretty JSON uses two-space
-indentation and one final LF.
+scoped/diagnostic report carries the same digest for each generated entry and
+identical metadata. Every summary field always equals the exact length of its
+corresponding bucket. A full result has one complete fixture outcome ledger. Each
+Taffy or active Surgeist fixture has either one failed entry and no generated/
+unsupported variant entry, or exactly four variant entries partitioned between
+generated and unsupported. Each expected-fail Surgeist fixture has exactly one
+expected-fail entry plus that same failed-or-four-variant job outcome. Each
+manifest-unsupported fixture has one unsupported entry with
+`variant = "manifest"` and no job outcome; each quarantined fixture has one
+quarantined entry and no job outcome.
+
+A `CleanFull` ledger has no failed entry, matches all five full clean expectations,
+and each scoped report is the exact SR-04.5 matcher subset whose generated count
+matches its one declared clean expectation. Its other scoped summary fields remain
+their actual bucket lengths. A `DiagnosticFull` ledger has at least one failed
+entry; its full and scoped summaries are actual bucket lengths and are never
+rewritten to manifest expectations. For the full diagnostic, the manifest
+`generated`, `unsupported`, and `failed_to_generate` CleanFull expectations are
+not compared; `expected_fail` and `quarantined` still match exactly because runtime
+job failure cannot change manifest dispositions. A scoped diagnostic with no
+failed browser-job fixture must still meet its declared generated expectation. If
+that scope contains at least one failed browser-job fixture, its declared
+generated value is not compared and remains a clean-run expectation only;
+failures outside the scope do not relax it. Every scoped bucket is the exact
+sorted subset of the full ledger under the same component matcher. Any other
+count/coverage discrepancy is an incomplete diagnostic result: return
+`Generation` without publication. Serde
+pretty JSON uses two-space indentation and one final LF.
 
 The complete single-generated report golden binds the XML golden above; its
 `output_sha256` is the SHA-256 of that exact fenced XML payload:
@@ -1424,25 +1577,40 @@ The complete single-generated report golden binds the XML golden above; its
 
 Named complete-byte tests are `layout_xml_provenance_complete_golden`,
 `layout_xml_optional_provenance_complete_golden`,
+`layout_xml_preserved_escape_complete_golden`,
 `layout_report_generated_digest_complete_golden`, and
 `layout_provenance_rejects_duplicate_unknown_or_misordered_fields`.
+The preserved-escape golden contains `&`, `"`, `<`, and `>` in attribute and text
+inputs and proves the exact replacements and literal `>` bytes above. Diagnostic
+count/byte tests are `layout_diagnostic_full_failure_inside_scope_golden`,
+`layout_diagnostic_full_failure_outside_scope_golden`,
+`layout_diagnostic_summary_is_actual_bucket_lengths`, and
+`layout_diagnostic_rejects_unexplained_count_divergence`.
+
+Offline-attestation tests are `layout_check_ignores_absent_browser_cache`,
+`layout_check_ignores_replaced_browser_identity`,
+`layout_check_ignores_browser_byte_drift`,
+`layout_check_rejects_cross_artifact_browser_digest_mismatch`, and
+`layout_check_accepts_self_consistent_historical_browser_attestation_rewrite`.
 
 `check-corpus` recomputes each generated entry's digest before accepting its XML
 provenance/body. A body edit with an unchanged valid first-line comment is stale
 `Verification`, not current. Filtered generation preserves reports: if every
-selected XML byte sequence retains the recorded digest, the prior full report may
-remain current; any changed selected digest makes the composed corpus stale until
-a clean full run replaces the report. Named behavior tests are
-`layout_report_rejects_tampered_xml_body` and
-`layout_filtered_digest_change_makes_preserved_report_stale`.
+selected variant remains generated with the recorded digest, the prior full
+report may remain current; any changed selected digest or selected transition to
+unsupported/removal makes the composed corpus stale until a clean full run
+replaces the report. Named behavior tests are
+`layout_report_rejects_tampered_xml_body`,
+`layout_filtered_digest_change_makes_preserved_report_stale`, and
+`layout_filtered_unsupported_removes_owned_xml_and_stales_report`.
 
 The publication matrix is exact:
 
 | Run outcome | Policy/result | Artifacts | Stale/unknown behavior |
 | --- | --- | --- | --- |
-| Full, every browser job reaches a classified generated/unsupported result and no lifecycle failure | `CleanFull`, then `Ok` | all generated XML plus every full/scoped report | remove historical-union members absent from the desired set; unknown entry fails before intent |
+| Full, every browser job reaches a classified generated/unsupported result, no lifecycle failure occurs, and all full/scoped CleanFull expectations match | `CleanFull`, then `Ok` | all generated XML plus every full/scoped report | remove historical-union members absent from the desired set; unknown entry fails before intent |
 | Full, one or more jobs exhaust retry but SR-03.3 terminalization succeeds and a complete diagnostic report exists | `DiagnosticFull`, install, then return `Generation` | successful current XML plus all current diagnostic reports; failed entries have no XML | remove every historical-union XML/report absent from that installed set, including superseded output for failed or removed jobs; unknown entry fails before intent |
-| Filtered, all selected jobs succeed/classify | `Filtered`, then `Ok` | selected generated XML only | write no report; preserve every other XML/report; remove nothing |
+| Filtered, every possible scheduled selected output is historically owned and all selected jobs succeed/classify | `Filtered`, then `Ok` | replace selected generated XML and remove selected historically owned XML now classified unsupported | write no report; preserve every unselected XML/report; remove no unselected path; an unowned scheduled output is `Verification` before lease |
 | Validation before lease | no plan/install; exact pre-lease kind from SR-04.5 | none | prior generated tree remains; no profile exists |
 | Version/launch/handler/filtered-job/incomplete-report failure with successful profile terminalization | no plan/install; `SourceVerification`, `Process`, or `Generation` exactly per SR-04.5 | none | prior generated tree remains; no profile residue |
 | Browser/profile terminalization failure | no plan/install; `Process` or `ArtifactTransaction` exactly per SR-04.5 | none | prior generated tree remains; active/cleanup evidence retained |
@@ -1450,9 +1618,10 @@ The publication matrix is exact:
 | Artifact transaction fails before commit and synchronous recovery succeeds | error per SR-04.5 | none installed | prior absent/old tree remains; no transaction residue |
 | Artifact transaction commits but root sync/outcome/cleanup reports failure | return `ArtifactTransaction` | complete new XML/report set remains visible | recovery completes or retains valid resumable evidence; never restore old |
 
-Desired XML is the four exact paths for every currently manifest-admitted HTML
-fixture; historical XML/report ownership comes only from the validated SR-04.5
-authority. The classifiable set is their union. Retained desired XML is only
+Desired XML is the four exact paths for every fixture in the current validated
+Surgeist-case-plus-Taffy-sidecar inventory; historical XML/report ownership comes
+only from the validated SR-04.5 authority. The classifiable set is their union.
+Retained desired XML is only
 successfully generated variants, and current report paths are exactly the
 manifest-declared full/scoped set. Unsupported/quarantined and removed/renamed
 historical paths are therefore removed only by a complete `CleanFull` or
@@ -1639,7 +1808,7 @@ The publication matrix is:
 | Command/outcome | Policy | Exact retained set |
 | --- | --- | --- |
 | Full generate success | `CleanFull` | one expectation per sidecar-listed fixture plus the one report |
-| Filtered generate success | `Filtered` | selected expectations only; no report write/removal and no stale removal |
+| Filtered generate success after every selected expectation is proven historically owned | `Filtered` | selected expectations only; no report write/removal and no stale removal; unowned selection is `Verification` before lease |
 | Validation/derivation failure before plan | no install | prior expectation tree remains |
 | Artifact failure before commit with successful recovery | no completed install | prior absent/old expectation tree remains |
 | Artifact failure after commit | return `ArtifactTransaction` | complete new expectation/report root remains; cleanup completes or retains resumable evidence |
