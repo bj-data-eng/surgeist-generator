@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{GeneratorError, GeneratorErrorKind, RelativePath, Result, Sha256Digest};
 
+#[cfg(test)]
+use super::fs::DurabilityPhase;
 use super::fs::{
     CORPUS_DIRECTORY_MODE, CORPUS_FILE_MODE, HeldIdentity, NodeKind, PRIVATE_DIRECTORY_MODE,
     PRIVATE_FILE_MODE, RootedFs,
@@ -397,6 +399,10 @@ impl<'a> TransactionEngine<'a> {
     }
 
     pub(crate) fn recover_all(&self) -> Result<()> {
+        #[cfg(test)]
+        let _observation_phase = self
+            .rooted
+            .begin_observation_phase(DurabilityPhase::TransactionRecovery);
         let names = self.rooted.list_dir(&self.transaction_parent)?;
         for name in names {
             if name.starts_with("active-") {
@@ -414,6 +420,10 @@ impl<'a> TransactionEngine<'a> {
     }
 
     pub(crate) fn install(&self, request: &TransactionRequest) -> Result<()> {
+        #[cfg(test)]
+        let _observation_phase = self
+            .rooted
+            .begin_observation_phase(DurabilityPhase::TransactionInstall);
         if request.authority_key != self.authority_key || request.domain != self.domain {
             return Err(transaction_error(
                 "install rooted transaction",
@@ -646,6 +656,10 @@ impl<'a> TransactionEngine<'a> {
     }
 
     fn populate_stage(&self, stage: &str, tree: &StagedTree) -> Result<()> {
+        #[cfg(test)]
+        let _observation_phase = self
+            .rooted
+            .begin_observation_phase(DurabilityPhase::TransactionStage);
         self.rooted.ensure_dir(stage, CORPUS_DIRECTORY_MODE)?;
         for directory in tree.directories()? {
             self.rooted
@@ -668,6 +682,10 @@ impl<'a> TransactionEngine<'a> {
     }
 
     fn recover_active(&self, active_name: &str) -> Result<()> {
+        #[cfg(test)]
+        let _observation_phase = self
+            .rooted
+            .begin_observation_phase(DurabilityPhase::TransactionRecovery);
         let active = joined(&self.transaction_parent, active_name);
         let active_identity = self.rooted.identity_at(&active)?.ok_or_else(|| {
             transaction_error("recover active transaction", "active journal disappeared")
@@ -1008,6 +1026,10 @@ impl<'a> TransactionEngine<'a> {
         active_identity: HeldIdentity,
         receipt: &CleanupReceipt,
     ) -> Result<()> {
+        #[cfg(test)]
+        let _observation_phase = self
+            .rooted
+            .begin_observation_phase(DurabilityPhase::TransactionCleanup);
         self.validate_receipt(receipt, &active_identity)?;
         let allowed: BTreeSet<_> = receipt
             .members
@@ -1100,6 +1122,10 @@ impl<'a> TransactionEngine<'a> {
         recorded: Option<&Inventory>,
         policy: InventoryPolicy,
     ) -> Result<()> {
+        #[cfg(test)]
+        let _observation_phase = self
+            .rooted
+            .begin_observation_phase(DurabilityPhase::TransactionCleanup);
         let Some(current) = Inventory::scan(self.rooted, tree_path, policy)? else {
             return Ok(());
         };
@@ -1128,6 +1154,10 @@ impl<'a> TransactionEngine<'a> {
         outcome: Outcome,
         final_digest: Option<Sha256Digest>,
     ) -> Result<()> {
+        #[cfg(test)]
+        let _observation_phase = self
+            .rooted
+            .begin_observation_phase(DurabilityPhase::TransactionCleanup);
         let active = joined(&self.transaction_parent, active_name);
         if !self.rooted.exists(&joined(&active, CLEANUP_RECEIPT_FILE))? {
             let names = self.rooted.list_dir(&active)?;
@@ -1156,6 +1186,10 @@ impl<'a> TransactionEngine<'a> {
     }
 
     fn recover_completed(&self, completed_name: &str) -> Result<()> {
+        #[cfg(test)]
+        let _observation_phase = self
+            .rooted
+            .begin_observation_phase(DurabilityPhase::TransactionCleanup);
         let completed = joined(&self.transaction_parent, completed_name);
         let identity = self.rooted.identity_at(&completed)?.ok_or_else(|| {
             transaction_error(

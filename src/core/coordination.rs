@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, Result, RunScope, Sha256Digest};
 
+#[cfg(test)]
+use super::fs::DurabilityPhase;
 use super::fs::{
     HeldIdentity, MutationTarget, NodeKind, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, RootedFs,
 };
@@ -486,6 +488,8 @@ fn open_or_bootstrap_lock(
     token: &str,
     access: CoordinationAccess,
 ) -> Result<File> {
+    #[cfg(test)]
+    let _observation_phase = rooted.begin_observation_phase(DurabilityPhase::BootstrapInstall);
     if rooted.exists(final_path)? {
         return open_existing_lock(rooted, final_path, access, false);
     }
@@ -510,6 +514,8 @@ fn open_or_bootstrap_lock(
     let stage_path = format!("{active}/lock.stage");
     let mut stage = rooted.create_file_handle_exclusive(&stage_path, b"", PRIVATE_FILE_MODE)?;
     let stage_identity = rooted.identity_of_handle(&stage)?;
+    #[cfg(test)]
+    rooted.observe_handle_identity(&stage_path);
     let stage_record = BootstrapStage {
         schema_version: 1,
         identity: stage_identity,
@@ -521,15 +527,21 @@ fn open_or_bootstrap_lock(
         &canonical_json(&stage_record, "serialize bootstrap stage identity")?,
         PRIVATE_FILE_MODE,
     )?;
-    stage.write_all(LOCK_HEADER).map_err(|source| {
-        transaction_source("write immutable generation lock header", final_path, source)
-    })?;
-    stage.flush().map_err(|source| {
-        transaction_source("flush immutable generation lock header", final_path, source)
-    })?;
-    stage.sync_all().map_err(|source| {
-        transaction_source("sync immutable generation lock header", final_path, source)
-    })?;
+    rooted
+        .write_file_handle_all(&stage_path, &mut stage, LOCK_HEADER)
+        .map_err(|source| {
+            transaction_source("write immutable generation lock header", final_path, source)
+        })?;
+    rooted
+        .flush_file_handle(&stage_path, &mut stage)
+        .map_err(|source| {
+            transaction_source("flush immutable generation lock header", final_path, source)
+        })?;
+    rooted
+        .sync_file_handle(&stage_path, &stage)
+        .map_err(|source| {
+            transaction_source("sync immutable generation lock header", final_path, source)
+        })?;
     rooted.validate_handle_at(&stage_path, &stage, PRIVATE_FILE_MODE)?;
     lock_file(&stage, access, final_path)?;
     match rooted.rename_exclusive_bound(&stage_path, final_path, &stage_record.identity) {
@@ -539,7 +551,7 @@ fn open_or_bootstrap_lock(
             Ok(stage)
         }
         Err(_rename_error) if rooted.exists(final_path)? => {
-            drop(stage);
+            rooted.drop_file_handle(&stage_path, stage);
             let final_file = match open_existing_lock(rooted, final_path, access, false) {
                 Ok(file) => file,
                 Err(error) if error.kind() == GeneratorErrorKind::LeaseActive => {
@@ -547,7 +559,9 @@ fn open_or_bootstrap_lock(
                         rooted.open_file_handle(final_path, PRIVATE_FILE_MODE, false)?;
                     validate_lock_header(rooted, final_path, &final_handle, false)?;
                     let final_identity = rooted.identity_of_handle(&final_handle)?;
-                    drop(final_handle);
+                    #[cfg(test)]
+                    rooted.observe_handle_identity(final_path);
+                    rooted.drop_file_handle(final_path, final_handle);
                     let marker = LostContended {
                         schema_version: 1,
                         final_path: final_path.to_owned(),
@@ -679,6 +693,8 @@ fn lock_file(file: &File, access: CoordinationAccess, context: &str) -> Result<(
 }
 
 fn recover_bootstrap(rooted: &RootedFs) -> Result<()> {
+    #[cfg(test)]
+    let _observation_phase = rooted.begin_observation_phase(DurabilityPhase::BootstrapRecovery);
     for _ in 0..16 {
         let names = rooted.list_dir(BOOTSTRAP_LOCKS)?;
         if names.is_empty() {
@@ -1047,6 +1063,8 @@ fn cleanup_bootstrap_directory(
     _name: &str,
     _moved_member: Option<&str>,
 ) -> Result<()> {
+    #[cfg(test)]
+    let _observation_phase = rooted.begin_observation_phase(DurabilityPhase::BootstrapCleanup);
     let identity = rooted.identity_at(path)?.ok_or_else(|| {
         transaction_error(
             "clean bootstrap directory",
@@ -1455,6 +1473,8 @@ fn validate_owner_record(rooted: &RootedFs, record: &OwnerRecord) -> Result<()> 
 }
 
 fn run_rename_probe(rooted: &RootedFs, domain: Domain, token: &str) -> Result<()> {
+    #[cfg(test)]
+    let _observation_phase = rooted.begin_observation_phase(DurabilityPhase::ProbeInstall);
     let parent = format!(".surgeist-generator/probes/{}", domain.as_str());
     let active = format!("{parent}/active-{token}");
     let active_identity = rooted.create_dir_exclusive(&active, PRIVATE_DIRECTORY_MODE)?;
@@ -1482,6 +1502,8 @@ fn run_rename_probe(rooted: &RootedFs, domain: Domain, token: &str) -> Result<()
 }
 
 fn recover_probe_journals(rooted: &RootedFs, domain: Domain) -> Result<()> {
+    #[cfg(test)]
+    let _observation_phase = rooted.begin_observation_phase(DurabilityPhase::ProbeRecovery);
     let parent = format!(".surgeist-generator/probes/{}", domain.as_str());
     for name in rooted.list_dir(&parent)? {
         let Some(token) = name.strip_prefix("active-") else {
@@ -1556,6 +1578,8 @@ fn install_owner_record(
     token: &str,
     authority_key: &str,
 ) -> Result<()> {
+    #[cfg(test)]
+    let _observation_phase = rooted.begin_observation_phase(DurabilityPhase::OwnerInstall);
     let parent = format!(
         ".surgeist-generator/leases/{}/{}",
         domain.as_str(),
@@ -1613,6 +1637,8 @@ fn install_owner_record(
     )?;
     let mut stage = rooted.create_file_handle_exclusive(&stage_path, b"", PRIVATE_FILE_MODE)?;
     let stage_identity = rooted.identity_of_handle(&stage)?;
+    #[cfg(test)]
+    rooted.observe_handle_identity(&stage_path);
     rooted.publish_file_exclusive(
         &active,
         "stage-registration.json",
@@ -1620,29 +1646,35 @@ fn install_owner_record(
         &canonical_json(&stage_identity, "serialize owner-stage registration")?,
         PRIVATE_FILE_MODE,
     )?;
-    stage.write_all(&owner_bytes).map_err(|source| {
-        transaction_source(
-            "write historical generation owner stage",
-            &stage_path,
-            source,
-        )
-    })?;
-    stage.flush().map_err(|source| {
-        transaction_source(
-            "flush historical generation owner stage",
-            &stage_path,
-            source,
-        )
-    })?;
-    stage.sync_all().map_err(|source| {
-        transaction_source(
-            "sync historical generation owner stage",
-            &stage_path,
-            source,
-        )
-    })?;
+    rooted
+        .write_file_handle_all(&stage_path, &mut stage, &owner_bytes)
+        .map_err(|source| {
+            transaction_source(
+                "write historical generation owner stage",
+                &stage_path,
+                source,
+            )
+        })?;
+    rooted
+        .flush_file_handle(&stage_path, &mut stage)
+        .map_err(|source| {
+            transaction_source(
+                "flush historical generation owner stage",
+                &stage_path,
+                source,
+            )
+        })?;
+    rooted
+        .sync_file_handle(&stage_path, &stage)
+        .map_err(|source| {
+            transaction_source(
+                "sync historical generation owner stage",
+                &stage_path,
+                source,
+            )
+        })?;
     rooted.validate_handle_at(&stage_path, &stage, PRIVATE_FILE_MODE)?;
-    drop(stage);
+    rooted.drop_file_handle(&stage_path, stage);
     rooted.publish_file_exclusive(
         &active,
         "prepared.json",
@@ -1686,6 +1718,8 @@ fn recover_owner_transactions(
     domain: Domain,
     authority_key: &str,
 ) -> Result<()> {
+    #[cfg(test)]
+    let _observation_phase = rooted.begin_observation_phase(DurabilityPhase::OwnerRecovery);
     let parent = format!(
         ".surgeist-generator/leases/{}/{}",
         domain.as_str(),
@@ -2000,6 +2034,8 @@ fn cleanup_simple_journal(
     journal: &str,
     journal_identity: HeldIdentity,
 ) -> Result<()> {
+    #[cfg(test)]
+    let _observation_phase = rooted.begin_observation_phase(DurabilityPhase::OwnerCleanup);
     for name in rooted.list_dir(journal)? {
         let path = format!("{journal}/{name}");
         let identity = rooted.identity_at(&path)?.ok_or_else(|| {

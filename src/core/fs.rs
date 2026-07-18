@@ -11,6 +11,220 @@ pub(crate) const PRIVATE_FILE_MODE: u32 = 0o600;
 pub(crate) const CORPUS_DIRECTORY_MODE: u32 = 0o755;
 pub(crate) const CORPUS_FILE_MODE: u32 = 0o644;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum DurabilityPhase {
+    Rooted,
+    FilePublication,
+    TransactionInstall,
+    TransactionStage,
+    TransactionRecovery,
+    TransactionCleanup,
+    BootstrapInstall,
+    BootstrapRecovery,
+    BootstrapCleanup,
+    OwnerInstall,
+    OwnerRecovery,
+    OwnerCleanup,
+    ProbeInstall,
+    ProbeRecovery,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum DurabilityPrimitive {
+    CreateDirectory,
+    CreateFile,
+    WritePartial,
+    WriteFull,
+    SetPermissions,
+    FlushFile,
+    SyncFile,
+    ValidateIdentity,
+    DropHandle,
+    RenameExclusive,
+    RenameSwap,
+    RemoveFile,
+    RemoveDirectory,
+    SyncDirectory,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DurabilityEvent {
+    phase: DurabilityPhase,
+    primitive: DurabilityPrimitive,
+    path: String,
+    ordinal: usize,
+}
+
+#[cfg(test)]
+impl DurabilityEvent {
+    pub(crate) const fn phase(&self) -> DurabilityPhase {
+        self.phase
+    }
+
+    pub(crate) const fn primitive(&self) -> DurabilityPrimitive {
+        self.primitive
+    }
+
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub(crate) const fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct RootedObserverState {
+    events: Vec<DurabilityEvent>,
+    next_ordinals: std::collections::BTreeMap<DurabilityPhase, usize>,
+    phase_stacks: std::collections::HashMap<std::thread::ThreadId, Vec<DurabilityPhase>>,
+    interrupt_after: Option<usize>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct RootedObserver {
+    state: std::sync::Arc<std::sync::Mutex<RootedObserverState>>,
+}
+
+#[cfg(test)]
+impl RootedObserver {
+    pub(crate) fn recording() -> Self {
+        Self::with_interruption(None)
+    }
+
+    /// Arms the observer for the zero-based global event index.
+    pub(crate) fn interrupt_after(event_index: usize) -> Self {
+        Self::with_interruption(Some(event_index))
+    }
+
+    fn with_interruption(interrupt_after: Option<usize>) -> Self {
+        Self {
+            state: std::sync::Arc::new(std::sync::Mutex::new(RootedObserverState {
+                events: Vec::new(),
+                next_ordinals: std::collections::BTreeMap::new(),
+                phase_stacks: std::collections::HashMap::new(),
+                interrupt_after,
+            })),
+        }
+    }
+
+    pub(crate) fn events(&self) -> Vec<DurabilityEvent> {
+        self.lock_state().events.clone()
+    }
+
+    pub(crate) fn is_interruption(payload: &(dyn std::any::Any + Send)) -> bool {
+        payload.is::<RootedInterruption>()
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, RootedObserverState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn enter_phase(&self, phase: DurabilityPhase, only_if_unset: bool) -> ObservationPhaseGuard {
+        let thread = std::thread::current().id();
+        let pushed = {
+            let mut state = self.lock_state();
+            let stack = state.phase_stacks.entry(thread).or_default();
+            if only_if_unset && !stack.is_empty() {
+                false
+            } else {
+                stack.push(phase);
+                true
+            }
+        };
+        ObservationPhaseGuard {
+            observer: Some(self.clone()),
+            thread,
+            phase,
+            pushed,
+        }
+    }
+
+    fn record(&self, primitive: DurabilityPrimitive, path: &str) -> bool {
+        let thread = std::thread::current().id();
+        let mut state = self.lock_state();
+        let phase = state
+            .phase_stacks
+            .get(&thread)
+            .and_then(|stack| stack.last())
+            .copied()
+            .unwrap_or(DurabilityPhase::Rooted);
+        let ordinal = {
+            let next = state.next_ordinals.entry(phase).or_default();
+            let ordinal = *next;
+            *next += 1;
+            ordinal
+        };
+        let event_index = state.events.len();
+        state.events.push(DurabilityEvent {
+            phase,
+            primitive,
+            path: path.to_owned(),
+            ordinal,
+        });
+        state.interrupt_after == Some(event_index)
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ObservationPhaseGuard {
+    observer: Option<RootedObserver>,
+    thread: std::thread::ThreadId,
+    phase: DurabilityPhase,
+    pushed: bool,
+}
+
+#[cfg(test)]
+impl ObservationPhaseGuard {
+    fn inactive(phase: DurabilityPhase) -> Self {
+        Self {
+            observer: None,
+            thread: std::thread::current().id(),
+            phase,
+            pushed: false,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ObservationPhaseGuard {
+    fn drop(&mut self) {
+        if !self.pushed {
+            return;
+        }
+        let observer = self
+            .observer
+            .as_ref()
+            .expect("an active phase guard has an observer");
+        let mut state = observer.lock_state();
+        let stack = state
+            .phase_stacks
+            .get_mut(&self.thread)
+            .expect("an active phase guard has a thread stack");
+        assert_eq!(
+            stack.pop(),
+            Some(self.phase),
+            "rooted observation phases must unwind in stack order"
+        );
+        if stack.is_empty() {
+            state.phase_stacks.remove(&self.thread);
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct RootedInterruption;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MutationTarget {
     AppleSiliconMacOs,
@@ -137,6 +351,8 @@ pub(crate) struct RootedFs {
     identity: HeldIdentity,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     root: rustix::fd::OwnedFd,
+    #[cfg(test)]
+    observer: Option<RootedObserver>,
 }
 
 impl std::fmt::Debug for RootedFs {
@@ -200,6 +416,8 @@ impl RootedFs {
             canonical_root: canonical,
             identity,
             root: current,
+            #[cfg(test)]
+            observer: None,
         })
     }
 
@@ -211,6 +429,46 @@ impl RootedFs {
 
     pub(crate) fn canonical_root(&self) -> &Path {
         &self.canonical_root
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_corpus_observed(
+        location: &CorpusLocation,
+        observer: RootedObserver,
+    ) -> Result<Self> {
+        let mut rooted = Self::open_corpus(location)?;
+        rooted.observer = Some(observer);
+        Ok(rooted)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_observation_phase(&self, phase: DurabilityPhase) -> ObservationPhaseGuard {
+        self.observer.as_ref().map_or_else(
+            || ObservationPhaseGuard::inactive(phase),
+            |observer| observer.enter_phase(phase, false),
+        )
+    }
+
+    #[cfg(test)]
+    fn begin_default_observation_phase(&self, phase: DurabilityPhase) -> ObservationPhaseGuard {
+        self.observer.as_ref().map_or_else(
+            || ObservationPhaseGuard::inactive(phase),
+            |observer| observer.enter_phase(phase, true),
+        )
+    }
+
+    #[cfg(test)]
+    fn record_durability(&self, primitive: DurabilityPrimitive, relative: &str) {
+        let Some(observer) = &self.observer else {
+            return;
+        };
+        assert!(
+            strict_observation_path(relative),
+            "durability events require a strict rooted path: {relative}"
+        );
+        if observer.record(primitive, relative) {
+            std::panic::panic_any(RootedInterruption);
+        }
     }
 
     pub(crate) fn identity(&self) -> &HeldIdentity {
@@ -246,6 +504,8 @@ impl RootedFs {
     }
 
     pub(crate) fn ensure_dir(&self, relative: &str, mode: u32) -> Result<HeldIdentity> {
+        #[cfg(test)]
+        let _phase = self.begin_default_observation_phase(DurabilityPhase::Rooted);
         self.revalidate_root()?;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -269,7 +529,14 @@ impl RootedFs {
                     }
                     Err(Errno::NOENT) => {
                         match mkdirat(&current, component, checked_mode(PRIVATE_DIRECTORY_MODE)?) {
-                            Ok(()) => true,
+                            Ok(()) => {
+                                #[cfg(test)]
+                                self.record_durability(
+                                    DurabilityPrimitive::CreateDirectory,
+                                    &current_path,
+                                );
+                                true
+                            }
                             Err(Errno::EXIST) => {
                                 require_exact_entry_name(&current, component)?;
                                 false
@@ -299,6 +566,11 @@ impl RootedFs {
                             source,
                         )
                     })?;
+                    #[cfg(test)]
+                    self.record_durability(
+                        DurabilityPrimitive::SyncDirectory,
+                        observation_parent(&current_path),
+                    );
                 }
                 let child = open_directory_at(&current, component, "open rooted directory")?;
                 let mut identity = identity_from_fd(&child, "inspect rooted directory")?;
@@ -312,6 +584,8 @@ impl RootedFs {
                             source,
                         )
                     })?;
+                    #[cfg(test)]
+                    self.record_durability(DurabilityPrimitive::SetPermissions, &current_path);
                     fsync(&child).map_err(|source| {
                         io_error(
                             "sync rooted directory",
@@ -319,6 +593,8 @@ impl RootedFs {
                             source,
                         )
                     })?;
+                    #[cfg(test)]
+                    self.record_durability(DurabilityPrimitive::SyncDirectory, &current_path);
                     identity = identity_from_fd(&child, "reinspect rooted directory")?;
                 }
                 if identity.mode != mode {
@@ -348,6 +624,8 @@ impl RootedFs {
         relative: &str,
         final_mode: u32,
     ) -> Result<HeldIdentity> {
+        #[cfg(test)]
+        let _phase = self.begin_default_observation_phase(DurabilityPhase::Rooted);
         self.revalidate_root()?;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -361,6 +639,8 @@ impl RootedFs {
                     source,
                 )
             })?;
+            #[cfg(test)]
+            self.record_durability(DurabilityPrimitive::CreateDirectory, relative);
             let directory = open_directory_at(&parent, name, "open exclusive rooted directory")?;
             fchmod(&directory, checked_mode(final_mode)?).map_err(|source| {
                 io_error(
@@ -369,6 +649,8 @@ impl RootedFs {
                     source,
                 )
             })?;
+            #[cfg(test)]
+            self.record_durability(DurabilityPrimitive::SetPermissions, relative);
             fsync(&directory).map_err(|source| {
                 io_error(
                     "sync exclusive rooted directory",
@@ -376,6 +658,8 @@ impl RootedFs {
                     source,
                 )
             })?;
+            #[cfg(test)]
+            self.record_durability(DurabilityPrimitive::SyncDirectory, relative);
             let identity = identity_from_fd(&directory, "inspect exclusive rooted directory")?;
             require_same_mount(
                 &self.identity,
@@ -387,6 +671,8 @@ impl RootedFs {
                 Some(final_mode),
                 "validate exclusive rooted directory",
             )?;
+            #[cfg(test)]
+            self.record_durability(DurabilityPrimitive::ValidateIdentity, relative);
             fsync(&parent).map_err(|source| {
                 io_error(
                     "sync exclusive rooted directory parent",
@@ -394,6 +680,11 @@ impl RootedFs {
                     source,
                 )
             })?;
+            #[cfg(test)]
+            self.record_durability(
+                DurabilityPrimitive::SyncDirectory,
+                observation_parent(relative),
+            );
             Ok(identity)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -533,12 +824,13 @@ impl RootedFs {
         bytes: &[u8],
         final_mode: u32,
     ) -> Result<HeldIdentity> {
+        #[cfg(test)]
+        let _phase = self.begin_default_observation_phase(DurabilityPhase::Rooted);
         self.revalidate_root()?;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             use rustix::fs::{OFlags, fchmod, fsync, openat};
             use std::fs::File;
-            use std::io::Write;
 
             let (parent, name) = self.open_parent(relative)?;
             let opened = openat(
@@ -554,14 +846,17 @@ impl RootedFs {
                     source,
                 )
             })?;
+            #[cfg(test)]
+            self.record_durability(DurabilityPrimitive::CreateFile, relative);
             let mut file = File::from(opened);
-            file.write_all(bytes).map_err(|source| {
-                io_error(
-                    "write rooted regular file",
-                    &self.canonical_root.join(relative),
-                    source,
-                )
-            })?;
+            self.write_file_handle_all(relative, &mut file, bytes)
+                .map_err(|source| {
+                    io_error(
+                        "write rooted regular file",
+                        &self.canonical_root.join(relative),
+                        source,
+                    )
+                })?;
             fchmod(&file, checked_mode(final_mode)?).map_err(|source| {
                 io_error(
                     "set rooted regular file mode",
@@ -569,13 +864,16 @@ impl RootedFs {
                     source,
                 )
             })?;
-            file.flush().map_err(|source| {
-                io_error(
-                    "flush rooted regular file",
-                    &self.canonical_root.join(relative),
-                    source,
-                )
-            })?;
+            #[cfg(test)]
+            self.record_durability(DurabilityPrimitive::SetPermissions, relative);
+            self.flush_file_handle(relative, &mut file)
+                .map_err(|source| {
+                    io_error(
+                        "flush rooted regular file",
+                        &self.canonical_root.join(relative),
+                        source,
+                    )
+                })?;
             fsync(&file).map_err(|source| {
                 io_error(
                     "sync rooted regular file",
@@ -583,6 +881,8 @@ impl RootedFs {
                     source,
                 )
             })?;
+            #[cfg(test)]
+            self.record_durability(DurabilityPrimitive::SyncFile, relative);
             let identity = identity_from_fd(&file, "inspect created rooted regular file")?;
             require_regular_policy(
                 &identity,
@@ -590,6 +890,8 @@ impl RootedFs {
                 "validate created rooted regular file",
             )?;
             require_same_mount(&self.identity, &identity, "validate created file mount")?;
+            #[cfg(test)]
+            self.record_durability(DurabilityPrimitive::ValidateIdentity, relative);
             fsync(&parent).map_err(|source| {
                 io_error(
                     "sync rooted regular file parent",
@@ -597,6 +899,11 @@ impl RootedFs {
                     source,
                 )
             })?;
+            #[cfg(test)]
+            self.record_durability(
+                DurabilityPrimitive::SyncDirectory,
+                observation_parent(relative),
+            );
             Ok(identity)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -613,11 +920,12 @@ impl RootedFs {
         bytes: &[u8],
         final_mode: u32,
     ) -> Result<std::fs::File> {
+        #[cfg(test)]
+        let _phase = self.begin_default_observation_phase(DurabilityPhase::Rooted);
         self.revalidate_root()?;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             use rustix::fs::{OFlags, fchmod, fsync, openat};
-            use std::io::Write;
 
             let (parent, name) = self.open_parent(relative)?;
             let opened = openat(
@@ -633,14 +941,17 @@ impl RootedFs {
                     source,
                 )
             })?;
+            #[cfg(test)]
+            self.record_durability(DurabilityPrimitive::CreateFile, relative);
             let mut file = std::fs::File::from(opened);
-            file.write_all(bytes).map_err(|source| {
-                io_error(
-                    "write rooted file handle",
-                    &self.canonical_root.join(relative),
-                    source,
-                )
-            })?;
+            self.write_file_handle_all(relative, &mut file, bytes)
+                .map_err(|source| {
+                    io_error(
+                        "write rooted file handle",
+                        &self.canonical_root.join(relative),
+                        source,
+                    )
+                })?;
             fchmod(&file, checked_mode(final_mode)?).map_err(|source| {
                 io_error(
                     "set rooted file-handle mode",
@@ -648,13 +959,16 @@ impl RootedFs {
                     source,
                 )
             })?;
-            file.flush().map_err(|source| {
-                io_error(
-                    "flush rooted file handle",
-                    &self.canonical_root.join(relative),
-                    source,
-                )
-            })?;
+            #[cfg(test)]
+            self.record_durability(DurabilityPrimitive::SetPermissions, relative);
+            self.flush_file_handle(relative, &mut file)
+                .map_err(|source| {
+                    io_error(
+                        "flush rooted file handle",
+                        &self.canonical_root.join(relative),
+                        source,
+                    )
+                })?;
             fsync(&file).map_err(|source| {
                 io_error(
                     "sync rooted file handle",
@@ -662,6 +976,8 @@ impl RootedFs {
                     source,
                 )
             })?;
+            #[cfg(test)]
+            self.record_durability(DurabilityPrimitive::SyncFile, relative);
             let identity = identity_from_fd(&file, "inspect created rooted file handle")?;
             require_regular_policy(&identity, final_mode, "validate created rooted file handle")?;
             require_same_mount(
@@ -669,6 +985,8 @@ impl RootedFs {
                 &identity,
                 "validate rooted file-handle mount",
             )?;
+            #[cfg(test)]
+            self.record_durability(DurabilityPrimitive::ValidateIdentity, relative);
             fsync(&parent).map_err(|source| {
                 io_error(
                     "sync rooted file-handle parent",
@@ -676,6 +994,11 @@ impl RootedFs {
                     source,
                 )
             })?;
+            #[cfg(test)]
+            self.record_durability(
+                DurabilityPrimitive::SyncDirectory,
+                observation_parent(relative),
+            );
             Ok(file)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -734,6 +1057,74 @@ impl RootedFs {
         }
     }
 
+    pub(crate) fn write_file_handle_all(
+        &self,
+        relative: &str,
+        file: &mut std::fs::File,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+
+        #[cfg(not(test))]
+        let _ = relative;
+        #[cfg(test)]
+        if self.observer.is_some() {
+            for (index, byte) in bytes.iter().enumerate() {
+                file.write_all(std::slice::from_ref(byte))?;
+                let primitive = if index + 1 == bytes.len() {
+                    DurabilityPrimitive::WriteFull
+                } else {
+                    DurabilityPrimitive::WritePartial
+                };
+                self.record_durability(primitive, relative);
+            }
+            return Ok(());
+        }
+
+        file.write_all(bytes)
+    }
+
+    pub(crate) fn flush_file_handle(
+        &self,
+        relative: &str,
+        file: &mut std::fs::File,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+
+        #[cfg(not(test))]
+        let _ = relative;
+        file.flush()?;
+        #[cfg(test)]
+        self.record_durability(DurabilityPrimitive::FlushFile, relative);
+        Ok(())
+    }
+
+    pub(crate) fn sync_file_handle(
+        &self,
+        relative: &str,
+        file: &std::fs::File,
+    ) -> std::io::Result<()> {
+        #[cfg(not(test))]
+        let _ = relative;
+        file.sync_all()?;
+        #[cfg(test)]
+        self.record_durability(DurabilityPrimitive::SyncFile, relative);
+        Ok(())
+    }
+
+    pub(crate) fn drop_file_handle(&self, relative: &str, file: std::fs::File) {
+        #[cfg(not(test))]
+        let _ = relative;
+        drop(file);
+        #[cfg(test)]
+        self.record_durability(DurabilityPrimitive::DropHandle, relative);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_handle_identity(&self, relative: &str) {
+        self.record_durability(DurabilityPrimitive::ValidateIdentity, relative);
+    }
+
     pub(crate) fn identity_of_handle(&self, file: &std::fs::File) -> Result<HeldIdentity> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -773,6 +1164,8 @@ impl RootedFs {
                 format!("path and handle differ: {relative}"),
             ));
         }
+        #[cfg(test)]
+        self.record_durability(DurabilityPrimitive::ValidateIdentity, relative);
         Ok(handle)
     }
 
@@ -784,6 +1177,8 @@ impl RootedFs {
         bytes: &[u8],
         mode: u32,
     ) -> Result<HeldIdentity> {
+        #[cfg(test)]
+        let _phase = self.begin_default_observation_phase(DurabilityPhase::FilePublication);
         checked_name(final_name)?;
         checked_name(temporary_name)?;
         let temporary = joined(parent, temporary_name);
@@ -887,6 +1282,8 @@ impl RootedFs {
         expected_from: Option<&HeldIdentity>,
         expected_to: Option<&HeldIdentity>,
     ) -> Result<()> {
+        #[cfg(test)]
+        let _phase = self.begin_default_observation_phase(DurabilityPhase::Rooted);
         self.revalidate_root()?;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -951,6 +1348,14 @@ impl RootedFs {
                     io_error(operation, &self.canonical_root.join(to), source)
                 },
             )?;
+            #[cfg(test)]
+            self.record_durability(
+                match mode {
+                    RenameMode::Exclusive => DurabilityPrimitive::RenameExclusive,
+                    RenameMode::Swap => DurabilityPrimitive::RenameSwap,
+                },
+                to,
+            );
             let from_after = identity_at_held_parent(
                 &from_parent,
                 from_name,
@@ -993,13 +1398,18 @@ impl RootedFs {
                     source,
                 )
             })?;
+            #[cfg(test)]
+            self.record_durability(DurabilityPrimitive::SyncDirectory, observation_parent(from));
             fsync(&to_parent).map_err(|source| {
                 io_error(
                     "sync rooted rename destination parent",
                     &self.canonical_root.join(to),
                     source,
                 )
-            })
+            })?;
+            #[cfg(test)]
+            self.record_durability(DurabilityPrimitive::SyncDirectory, observation_parent(to));
+            Ok(())
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1017,6 +1427,8 @@ impl RootedFs {
     }
 
     fn remove_exact(&self, relative: &str, expected: &HeldIdentity, directory: bool) -> Result<()> {
+        #[cfg(test)]
+        let _phase = self.begin_default_observation_phase(DurabilityPhase::Rooted);
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             use rustix::fs::{AtFlags, fsync, unlinkat};
@@ -1058,13 +1470,28 @@ impl RootedFs {
                     source,
                 )
             })?;
+            #[cfg(test)]
+            self.record_durability(
+                if directory {
+                    DurabilityPrimitive::RemoveDirectory
+                } else {
+                    DurabilityPrimitive::RemoveFile
+                },
+                relative,
+            );
             fsync(&parent).map_err(|source| {
                 io_error(
                     "sync rooted unlink parent",
                     &self.canonical_root.join(relative),
                     source,
                 )
-            })
+            })?;
+            #[cfg(test)]
+            self.record_durability(
+                DurabilityPrimitive::SyncDirectory,
+                observation_parent(relative),
+            );
+            Ok(())
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1074,6 +1501,8 @@ impl RootedFs {
     }
 
     pub(crate) fn sync_dir(&self, relative: &str) -> Result<()> {
+        #[cfg(test)]
+        let _phase = self.begin_default_observation_phase(DurabilityPhase::Rooted);
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             let directory = self.open_dir(relative)?;
@@ -1083,7 +1512,10 @@ impl RootedFs {
                     &self.canonical_root.join(relative),
                     source,
                 )
-            })
+            })?;
+            #[cfg(test)]
+            self.record_durability(DurabilityPrimitive::SyncDirectory, relative);
+            Ok(())
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -1093,6 +1525,8 @@ impl RootedFs {
     }
 
     pub(crate) fn probe_rename_flags(&self, journal_dir: &str, token: &str) -> Result<()> {
+        #[cfg(test)]
+        let _phase = self.begin_default_observation_phase(DurabilityPhase::ProbeInstall);
         let left = joined(journal_dir, &format!("probe-left-{token}"));
         let right = joined(journal_dir, &format!("probe-right-{token}"));
         let moved = joined(journal_dir, &format!("probe-moved-{token}"));
@@ -1226,6 +1660,23 @@ fn joined(parent: &str, name: &str) -> String {
     } else {
         format!("{parent}/{name}")
     }
+}
+
+#[cfg(test)]
+fn observation_parent(relative: &str) -> &str {
+    relative
+        .rsplit_once('/')
+        .map_or("", |(parent, _name)| parent)
+}
+
+#[cfg(test)]
+fn strict_observation_path(relative: &str) -> bool {
+    relative.is_empty()
+        || (!relative.starts_with('/')
+            && !relative.ends_with('/')
+            && relative
+                .split('/')
+                .all(|component| !matches!(component, "" | "." | "..")))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1578,6 +2029,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -1586,7 +2038,11 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{CORPUS_DIRECTORY_MODE, CORPUS_FILE_MODE, MutationTarget, NodeKind, RootedFs};
+    use super::{
+        CORPUS_DIRECTORY_MODE, CORPUS_FILE_MODE, DurabilityPhase, DurabilityPrimitive,
+        MutationTarget, NodeKind, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, RootedFs,
+        RootedObserver,
+    };
     use crate::CorpusLocation;
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -1623,6 +2079,417 @@ mod tests {
         let location = CorpusLocation::new(directory.path(), &corpus).unwrap();
         let rooted = RootedFs::open_corpus(&location).unwrap();
         (directory, corpus, rooted)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn observed_fixture(
+        label: &str,
+        observer: RootedObserver,
+    ) -> (TestDirectory, PathBuf, RootedFs) {
+        let directory = TestDirectory::new(label);
+        let corpus = directory.path().join("corpus");
+        fs::create_dir(&corpus).unwrap();
+        let location = CorpusLocation::new(directory.path(), &corpus).unwrap();
+        let rooted = RootedFs::open_corpus_observed(&location, observer).unwrap();
+        (directory, corpus, rooted)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn record_recovery_distinct_trace(rooted: &RootedFs) {
+        rooted
+            .publish_file_exclusive(
+                "",
+                "published.json",
+                "published.tmp",
+                b"abc",
+                PRIVATE_FILE_MODE,
+            )
+            .unwrap();
+
+        {
+            let _phase = rooted.begin_observation_phase(DurabilityPhase::TransactionStage);
+            rooted
+                .ensure_dir("stage/deep", CORPUS_DIRECTORY_MODE)
+                .unwrap();
+            rooted
+                .create_file_exclusive("stage/deep/value.txt", b"xy", CORPUS_FILE_MODE)
+                .unwrap();
+            rooted.sync_dir("stage/deep").unwrap();
+            rooted.sync_dir("stage").unwrap();
+        }
+
+        {
+            let _phase = rooted.begin_observation_phase(DurabilityPhase::OwnerInstall);
+            let mut stage = rooted
+                .create_file_handle_exclusive("owner.stage", b"", PRIVATE_FILE_MODE)
+                .unwrap();
+            rooted.identity_of_handle(&stage).unwrap();
+            rooted.observe_handle_identity("owner.stage");
+            rooted
+                .write_file_handle_all("owner.stage", &mut stage, b"owner")
+                .unwrap();
+            rooted.flush_file_handle("owner.stage", &mut stage).unwrap();
+            rooted.sync_file_handle("owner.stage", &stage).unwrap();
+            rooted
+                .validate_handle_at("owner.stage", &stage, PRIVATE_FILE_MODE)
+                .unwrap();
+            rooted.drop_file_handle("owner.stage", stage);
+        }
+
+        let exclusive = rooted
+            .create_dir_exclusive("exclusive-source", PRIVATE_DIRECTORY_MODE)
+            .unwrap();
+        {
+            let _phase = rooted.begin_observation_phase(DurabilityPhase::TransactionInstall);
+            rooted
+                .rename_exclusive_bound("exclusive-source", "exclusive-final", &exclusive)
+                .unwrap();
+        }
+
+        let swap_source = rooted
+            .create_dir_exclusive("swap-source", PRIVATE_DIRECTORY_MODE)
+            .unwrap();
+        let swap_destination = rooted
+            .create_dir_exclusive("swap-destination", PRIVATE_DIRECTORY_MODE)
+            .unwrap();
+        {
+            let _phase = rooted.begin_observation_phase(DurabilityPhase::TransactionInstall);
+            rooted
+                .rename_swap_bound(
+                    "swap-source",
+                    "swap-destination",
+                    &swap_source,
+                    &swap_destination,
+                )
+                .unwrap();
+        }
+
+        let claim = rooted
+            .create_dir_exclusive("claim-source", PRIVATE_DIRECTORY_MODE)
+            .unwrap();
+        {
+            let _phase = rooted.begin_observation_phase(DurabilityPhase::BootstrapRecovery);
+            rooted
+                .rename_exclusive_bound("claim-source", "recovering-claim", &claim)
+                .unwrap();
+        }
+
+        let active = rooted
+            .create_dir_exclusive("active-journal", PRIVATE_DIRECTORY_MODE)
+            .unwrap();
+        {
+            let _phase = rooted.begin_observation_phase(DurabilityPhase::TransactionCleanup);
+            rooted
+                .rename_exclusive_bound("active-journal", "completed-journal", &active)
+                .unwrap();
+        }
+
+        let receipt_journal = rooted
+            .create_dir_exclusive("receipt-journal", PRIVATE_DIRECTORY_MODE)
+            .unwrap();
+        let receipt_directory = rooted
+            .create_dir_exclusive("receipt-journal/receipt-dir", PRIVATE_DIRECTORY_MODE)
+            .unwrap();
+        let receipt_file = rooted
+            .create_file_exclusive("receipt-journal/receipt-file", b"member", PRIVATE_FILE_MODE)
+            .unwrap();
+        let receipt = rooted
+            .create_file_exclusive(
+                "receipt-journal/cleanup-receipt.json",
+                b"receipt",
+                PRIVATE_FILE_MODE,
+            )
+            .unwrap();
+        {
+            let _phase = rooted.begin_observation_phase(DurabilityPhase::TransactionCleanup);
+            rooted
+                .remove_file_exact("receipt-journal/receipt-file", &receipt_file)
+                .unwrap();
+            rooted
+                .remove_dir_exact("receipt-journal/receipt-dir", &receipt_directory)
+                .unwrap();
+            rooted
+                .remove_file_exact("receipt-journal/cleanup-receipt.json", &receipt)
+                .unwrap();
+            rooted
+                .remove_dir_exact("receipt-journal", &receipt_journal)
+                .unwrap();
+        }
+
+        let probe_journal = rooted
+            .create_dir_exclusive("probe-journal", PRIVATE_DIRECTORY_MODE)
+            .unwrap();
+        let probe_member = rooted
+            .create_dir_exclusive("probe-journal/probe-member", PRIVATE_DIRECTORY_MODE)
+            .unwrap();
+        {
+            let _phase = rooted.begin_observation_phase(DurabilityPhase::ProbeRecovery);
+            rooted
+                .remove_dir_exact("probe-journal/probe-member", &probe_member)
+                .unwrap();
+            rooted
+                .remove_dir_exact("probe-journal", &probe_journal)
+                .unwrap();
+        }
+
+        let owner_journal = rooted
+            .create_dir_exclusive("owner-journal", PRIVATE_DIRECTORY_MODE)
+            .unwrap();
+        let owner_member = rooted
+            .create_file_exclusive("owner-journal/intent.json", b"intent", PRIVATE_FILE_MODE)
+            .unwrap();
+        {
+            let _phase = rooted.begin_observation_phase(DurabilityPhase::OwnerCleanup);
+            rooted
+                .remove_file_exact("owner-journal/intent.json", &owner_member)
+                .unwrap();
+            rooted
+                .remove_dir_exact("owner-journal", &owner_journal)
+                .unwrap();
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn rooted_observer_records_recovery_distinct_primitives() {
+        let first_observer = RootedObserver::recording();
+        let (_first_directory, _first_corpus, first_rooted) =
+            observed_fixture("observer-records-first", first_observer.clone());
+        record_recovery_distinct_trace(&first_rooted);
+        let first = first_observer.events();
+
+        let second_observer = RootedObserver::recording();
+        let (_second_directory, _second_corpus, second_rooted) =
+            observed_fixture("observer-records-second", second_observer.clone());
+        record_recovery_distinct_trace(&second_rooted);
+        let second = second_observer.events();
+
+        assert_eq!(first_observer.events(), first);
+        assert_eq!(second, first, "the same rooted fixture must have one trace");
+
+        let mut primitive_counts = BTreeMap::new();
+        for event in &first {
+            *primitive_counts.entry(event.primitive()).or_insert(0usize) += 1;
+        }
+        assert_eq!(first.len(), 161);
+        assert_eq!(
+            primitive_counts,
+            BTreeMap::from([
+                (DurabilityPrimitive::CreateDirectory, 12),
+                (DurabilityPrimitive::CreateFile, 6),
+                (DurabilityPrimitive::WritePartial, 23),
+                (DurabilityPrimitive::WriteFull, 6),
+                (DurabilityPrimitive::SetPermissions, 18),
+                (DurabilityPrimitive::FlushFile, 7),
+                (DurabilityPrimitive::SyncFile, 7),
+                (DurabilityPrimitive::ValidateIdentity, 18),
+                (DurabilityPrimitive::DropHandle, 1),
+                (DurabilityPrimitive::RenameExclusive, 4),
+                (DurabilityPrimitive::RenameSwap, 1),
+                (DurabilityPrimitive::RemoveFile, 3),
+                (DurabilityPrimitive::RemoveDirectory, 5),
+                (DurabilityPrimitive::SyncDirectory, 50),
+            ])
+        );
+
+        let primitives: BTreeSet<_> = first.iter().map(|event| event.primitive()).collect();
+        assert_eq!(
+            primitives,
+            BTreeSet::from([
+                DurabilityPrimitive::CreateDirectory,
+                DurabilityPrimitive::CreateFile,
+                DurabilityPrimitive::WritePartial,
+                DurabilityPrimitive::WriteFull,
+                DurabilityPrimitive::SetPermissions,
+                DurabilityPrimitive::FlushFile,
+                DurabilityPrimitive::SyncFile,
+                DurabilityPrimitive::ValidateIdentity,
+                DurabilityPrimitive::DropHandle,
+                DurabilityPrimitive::RenameExclusive,
+                DurabilityPrimitive::RenameSwap,
+                DurabilityPrimitive::RemoveFile,
+                DurabilityPrimitive::RemoveDirectory,
+                DurabilityPrimitive::SyncDirectory,
+            ])
+        );
+
+        let mut next_ordinal = BTreeMap::new();
+        for event in &first {
+            let expected = next_ordinal.entry(event.phase()).or_insert(0);
+            assert_eq!(event.ordinal(), *expected);
+            *expected += 1;
+            assert!(
+                event.path().is_empty()
+                    || (!event.path().starts_with('/')
+                        && !event.path().ends_with('/')
+                        && event
+                            .path()
+                            .split('/')
+                            .all(|component| !matches!(component, "" | "." | ".."))),
+                "observer path is not strict and rooted: {}",
+                event.path()
+            );
+        }
+
+        let contains = |phase, primitive, path| {
+            first.iter().any(|event| {
+                event.phase() == phase && event.primitive() == primitive && event.path() == path
+            })
+        };
+        assert!(contains(
+            DurabilityPhase::FilePublication,
+            DurabilityPrimitive::CreateFile,
+            "published.tmp"
+        ));
+        assert!(contains(
+            DurabilityPhase::FilePublication,
+            DurabilityPrimitive::WritePartial,
+            "published.tmp"
+        ));
+        assert!(contains(
+            DurabilityPhase::FilePublication,
+            DurabilityPrimitive::WriteFull,
+            "published.tmp"
+        ));
+        assert!(contains(
+            DurabilityPhase::FilePublication,
+            DurabilityPrimitive::SyncFile,
+            "published.tmp"
+        ));
+        assert!(contains(
+            DurabilityPhase::FilePublication,
+            DurabilityPrimitive::RenameExclusive,
+            "published.json"
+        ));
+        assert!(contains(
+            DurabilityPhase::FilePublication,
+            DurabilityPrimitive::SyncDirectory,
+            ""
+        ));
+        assert!(contains(
+            DurabilityPhase::TransactionStage,
+            DurabilityPrimitive::CreateDirectory,
+            "stage/deep"
+        ));
+        assert!(contains(
+            DurabilityPhase::TransactionStage,
+            DurabilityPrimitive::CreateFile,
+            "stage/deep/value.txt"
+        ));
+        assert!(contains(
+            DurabilityPhase::TransactionStage,
+            DurabilityPrimitive::SyncDirectory,
+            "stage/deep"
+        ));
+        for primitive in [
+            DurabilityPrimitive::WritePartial,
+            DurabilityPrimitive::WriteFull,
+            DurabilityPrimitive::FlushFile,
+            DurabilityPrimitive::SyncFile,
+            DurabilityPrimitive::ValidateIdentity,
+            DurabilityPrimitive::DropHandle,
+        ] {
+            assert!(contains(
+                DurabilityPhase::OwnerInstall,
+                primitive,
+                "owner.stage"
+            ));
+        }
+        assert!(contains(
+            DurabilityPhase::TransactionInstall,
+            DurabilityPrimitive::RenameExclusive,
+            "exclusive-final"
+        ));
+        assert!(contains(
+            DurabilityPhase::TransactionInstall,
+            DurabilityPrimitive::RenameSwap,
+            "swap-destination"
+        ));
+        assert!(contains(
+            DurabilityPhase::BootstrapRecovery,
+            DurabilityPrimitive::RenameExclusive,
+            "recovering-claim"
+        ));
+        assert!(contains(
+            DurabilityPhase::TransactionCleanup,
+            DurabilityPrimitive::RenameExclusive,
+            "completed-journal"
+        ));
+        assert!(contains(
+            DurabilityPhase::TransactionCleanup,
+            DurabilityPrimitive::RemoveFile,
+            "receipt-journal/cleanup-receipt.json"
+        ));
+        assert!(contains(
+            DurabilityPhase::ProbeRecovery,
+            DurabilityPrimitive::RemoveDirectory,
+            "probe-journal/probe-member"
+        ));
+        assert!(contains(
+            DurabilityPhase::OwnerCleanup,
+            DurabilityPrimitive::RemoveDirectory,
+            "owner-journal"
+        ));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn rooted_observer_interrupts_without_generator_error() {
+        let observer = RootedObserver::interrupt_after(1);
+        let (directory, corpus, rooted) = observed_fixture("observer-interrupts", observer.clone());
+
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rooted.publish_file_exclusive(
+                "",
+                "interrupted.json",
+                "interrupted.tmp",
+                b"abc",
+                PRIVATE_FILE_MODE,
+            )
+        }))
+        .expect_err("the observer must unwind instead of returning GeneratorError");
+        assert!(RootedObserver::is_interruption(interrupted.as_ref()));
+        assert!(
+            interrupted
+                .downcast_ref::<crate::GeneratorError>()
+                .is_none()
+        );
+        let events = observer.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].phase(), DurabilityPhase::FilePublication);
+        assert_eq!(events[0].primitive(), DurabilityPrimitive::CreateFile);
+        assert_eq!(events[0].path(), "interrupted.tmp");
+        assert_eq!(events[0].ordinal(), 0);
+        assert_eq!(events[1].phase(), DurabilityPhase::FilePublication);
+        assert_eq!(events[1].primitive(), DurabilityPrimitive::WritePartial);
+        assert_eq!(events[1].path(), "interrupted.tmp");
+        assert_eq!(events[1].ordinal(), 1);
+
+        drop(rooted);
+        let location = CorpusLocation::new(directory.path(), &corpus).unwrap();
+        let fresh = RootedFs::open_corpus(&location).unwrap();
+        assert!(!fresh.exists("interrupted.json").unwrap());
+        assert_eq!(
+            fresh
+                .read_file("interrupted.tmp", PRIVATE_FILE_MODE)
+                .unwrap(),
+            b"a"
+        );
+
+        fresh
+            .publish_file_exclusive(
+                "",
+                "production.json",
+                "production.tmp",
+                b"ok",
+                PRIVATE_FILE_MODE,
+            )
+            .unwrap();
+        assert_eq!(
+            observer.events().len(),
+            2,
+            "ordinary RootedFs construction must not share an observer"
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
