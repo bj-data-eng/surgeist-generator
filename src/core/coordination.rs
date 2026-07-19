@@ -262,6 +262,9 @@ pub(crate) fn acquire_exclusive(
 ) -> Result<CoordinationGuard> {
     MutationTarget::current().require_supported("acquire generation mutation lease")?;
     let rooted = RootedFs::open_corpus(location)?;
+    if rooted.exists(COORDINATION_ROOT)? {
+        validate_coordination_tree(&rooted, domain, false)?;
+    }
     rooted.ensure_dir(COORDINATION_ROOT, PRIVATE_DIRECTORY_MODE)?;
     rooted.ensure_dir(".surgeist-generator/bootstrap", PRIVATE_DIRECTORY_MODE)?;
     rooted.ensure_dir(BOOTSTRAP_LOCKS, PRIVATE_DIRECTORY_MODE)?;
@@ -1381,6 +1384,13 @@ fn validate_coordination_tree_inner(rooted: &RootedFs, domain: Domain) -> Result
         let owner = format!("{lease}/{OWNER_RECORD}");
         if rooted.exists(&owner)? {
             validate_private_file(rooted, &owner)?;
+            let bytes = rooted.read_file(&owner, PRIVATE_FILE_MODE)?;
+            validate_owner_record_bytes(
+                rooted,
+                &bytes,
+                "validate generation coordination tree",
+                "visible owner record",
+            )?;
         }
         let owner_transactions = format!("{lease}/{OWNER_TRANSACTIONS}");
         if rooted.exists(&owner_transactions)? {
@@ -1542,18 +1552,16 @@ fn inspect_read_only_residue(rooted: &RootedFs, domain: Domain) -> Result<()> {
     }
     let owner = owner_path(domain);
     if rooted.exists(&owner).map_err(verification_from)? {
-        let record: OwnerRecord = serde_json::from_slice(
-            &rooted
-                .read_file(&owner, PRIVATE_FILE_MODE)
-                .map_err(verification_from)?,
+        let bytes = rooted
+            .read_file(&owner, PRIVATE_FILE_MODE)
+            .map_err(verification_from)?;
+        validate_owner_record_bytes(
+            rooted,
+            &bytes,
+            "inspect historical generation owner",
+            "visible owner record",
         )
-        .map_err(|error| {
-            verification_error(
-                "inspect historical generation owner",
-                format!("owner record is invalid: {error}"),
-            )
-        })?;
-        validate_owner_record(rooted, &record).map_err(verification_from)?;
+        .map_err(verification_from)?;
     }
     Ok(())
 }
@@ -1582,6 +1590,18 @@ fn validate_owner_record(rooted: &RootedFs, record: &OwnerRecord) -> Result<()> 
         ));
     }
     Ok(())
+}
+
+fn validate_owner_record_bytes(
+    rooted: &RootedFs,
+    bytes: &[u8],
+    operation: &str,
+    label: &str,
+) -> Result<()> {
+    let record: OwnerRecord = serde_json::from_slice(bytes)
+        .map_err(|error| transaction_error(operation, format!("{label} is invalid: {error}")))?;
+    validate_owner_record(rooted, &record)?;
+    validate_canonical_owner_json(bytes, &record, operation, label)
 }
 
 fn run_rename_probe(rooted: &RootedFs, domain: Domain, token: &str) -> Result<()> {
@@ -1805,18 +1825,11 @@ fn install_owner_record_bytes(
         OWNER_TRANSACTIONS
     );
     let active = format!("{parent}/active-{token}");
-    let active_identity = rooted.create_dir_exclusive(&active, PRIVATE_DIRECTORY_MODE)?;
     let owner_path = owner_path(domain);
-    let (old_digest, old_identity) = if rooted.exists(&owner_path)? {
-        (
-            Some(Sha256Digest::from_bytes(
-                rooted.read_file(&owner_path, PRIVATE_FILE_MODE)?,
-            )),
-            rooted.identity_at(&owner_path)?,
-        )
-    } else {
-        (None, None)
-    };
+    let historical_visibility = read_owner_visibility(rooted, &owner_path)?;
+    let old_digest = historical_visibility.digest;
+    let old_identity = historical_visibility.identity;
+    let active_identity = rooted.create_dir_exclusive(&active, PRIVATE_DIRECTORY_MODE)?;
     let stage_path = format!("{active}/owner.stage");
     let intent = OwnerIntent {
         schema_version: 1,
@@ -1891,10 +1904,11 @@ fn install_owner_record_bytes(
     ensure_owner_outcome(
         rooted,
         &active,
+        &active_identity,
         token,
         &intent,
         OwnerOutcomeKind::Committed,
-        OwnerVisibility {
+        &OwnerVisibility {
             digest: Some(intent.new_digest.clone()),
             identity: Some(stage_identity.clone()),
         },
@@ -1930,12 +1944,48 @@ fn recover_owner_transactions(
     authority_key: &str,
 ) -> Result<()> {
     #[cfg(test)]
+    let result = recover_owner_transactions_inner(rooted, domain, authority_key, None);
+    #[cfg(not(test))]
+    let result = recover_owner_transactions_inner(rooted, domain, authority_key);
+    result
+}
+
+#[cfg(test)]
+struct OwnerRecoveryControl<'a> {
+    before_mutation: &'a mut dyn FnMut(&str) -> Result<()>,
+}
+
+#[cfg(test)]
+impl<'a> OwnerRecoveryControl<'a> {
+    fn new(before_mutation: &'a mut dyn FnMut(&str) -> Result<()>) -> Self {
+        Self { before_mutation }
+    }
+}
+
+#[cfg(test)]
+fn recover_owner_transactions_controlled(
+    rooted: &RootedFs,
+    domain: Domain,
+    authority_key: &str,
+    control: &mut OwnerRecoveryControl<'_>,
+) -> Result<()> {
+    recover_owner_transactions_inner(rooted, domain, authority_key, Some(control))
+}
+
+fn recover_owner_transactions_inner(
+    rooted: &RootedFs,
+    domain: Domain,
+    authority_key: &str,
+    #[cfg(test)] mut control: Option<&mut OwnerRecoveryControl<'_>>,
+) -> Result<()> {
+    #[cfg(test)]
     let _observation_phase = rooted.begin_observation_phase(DurabilityPhase::OwnerRecovery);
     let parent = format!(
         ".surgeist-generator/leases/{}/{}",
         domain.as_str(),
         OWNER_TRANSACTIONS
     );
+    read_owner_visibility(rooted, &owner_path(domain))?;
     for name in rooted.list_dir(&parent)? {
         let Some(token) = name.strip_prefix("active-") else {
             return Err(transaction_error(
@@ -1948,16 +1998,14 @@ fn recover_owner_transactions(
         let active_identity = rooted.identity_at(&active)?.ok_or_else(|| {
             transaction_error("recover owner transaction", "owner journal disappeared")
         })?;
-        if active_identity.kind() != NodeKind::Directory
-            || active_identity.mode() != PRIVATE_DIRECTORY_MODE
-        {
-            return Err(transaction_error(
-                "recover owner transaction",
-                "owner journal has the wrong type or mode",
-            ));
-        }
+        validate_owner_cleanup_journal_identity(rooted, &active, &active_identity)?;
         let names = rooted.list_dir(&active)?;
         if names.is_empty() {
+            #[cfg(test)]
+            if let Some(control) = control.as_deref_mut() {
+                (control.before_mutation)("empty-journal-unlink")?;
+            }
+            validate_owner_cleanup_journal_identity(rooted, &active, &active_identity)?;
             rooted.remove_dir_exact(&active, &active_identity)?;
             continue;
         }
@@ -2123,14 +2171,11 @@ fn recover_owner_transactions(
         let owner_identity = visibility.identity.clone();
         let owner_digest = visibility.digest.clone();
         let stage_identity = rooted.identity_at(&intent.stage_path)?;
-        let stage_digest = stage_identity
+        let stage_bytes = stage_identity
             .as_ref()
-            .map(|_| {
-                rooted
-                    .read_file(&intent.stage_path, PRIVATE_FILE_MODE)
-                    .map(Sha256Digest::from_bytes)
-            })
+            .map(|_| rooted.read_file(&intent.stage_path, PRIVATE_FILE_MODE))
             .transpose()?;
+        let stage_digest = stage_bytes.as_ref().map(Sha256Digest::from_bytes);
         let existing_outcome = existing_owner_outcome(rooted, &active)?;
         if let Some(outcome) = existing_outcome {
             validate_existing_owner_outcome(
@@ -2192,6 +2237,17 @@ fn recover_owner_transactions(
                             "old owner stage identity changed",
                         ));
                     }
+                    validate_owner_record_bytes(
+                        rooted,
+                        stage_bytes.as_deref().ok_or_else(|| {
+                            transaction_error(
+                                "recover owner transaction",
+                                "post-commit owner stage bytes disappeared",
+                            )
+                        })?,
+                        "recover owner transaction",
+                        "post-commit historical owner stage",
+                    )?;
                     Some(old_identity)
                 }
                 (Some(_), Some(_), None, None)
@@ -2219,17 +2275,26 @@ fn recover_owner_transactions(
                             "pre-commit owner stage identity changed",
                         ));
                     }
-                    if prepared.is_some() && stage_digest != &intent.new_digest {
+                    if stage_digest != &intent.new_digest {
                         return Err(transaction_error(
                             "recover owner transaction",
-                            "prepared owner stage bytes differ",
+                            "registered owner stage bytes differ from its intent",
                         ));
                     }
+                    validate_owner_record_bytes(
+                        rooted,
+                        stage_bytes.as_deref().ok_or_else(|| {
+                            transaction_error(
+                                "recover owner transaction",
+                                "registered owner stage bytes disappeared",
+                            )
+                        })?,
+                        "recover owner transaction",
+                        "registered owner stage",
+                    )?;
                 } else {
                     if prepared.is_some()
-                        || !rooted
-                            .read_file(&intent.stage_path, PRIVATE_FILE_MODE)?
-                            .is_empty()
+                        || !stage_bytes.as_deref().is_some_and(|bytes| bytes.is_empty())
                     {
                         return Err(transaction_error(
                             "recover owner transaction",
@@ -2272,8 +2337,29 @@ fn recover_owner_transactions(
         )?;
         validate_owner_visibility(rooted, &intent.owner_path, &visibility)?;
         remove_owner_temporaries(rooted, &active, &active_identity, &names, &temporaries)?;
-        ensure_owner_outcome(rooted, &active, token, &intent, outcome, visibility)?;
+        #[cfg(test)]
+        if let Some(control) = control.as_deref_mut() {
+            (control.before_mutation)("outcome-publication")?;
+        }
+        ensure_owner_outcome(
+            rooted,
+            &active,
+            &active_identity,
+            token,
+            &intent,
+            outcome,
+            &visibility,
+        )?;
         if let Some(actual) = removable_stage {
+            validate_owner_cleanup_journal_identity(rooted, &active, &active_identity)?;
+            validate_owner_visibility(rooted, &intent.owner_path, &visibility)?;
+            let actual_bytes = read_owner_cleanup_file(rooted, &intent.stage_path, &actual)?;
+            if stage_bytes.as_ref() != Some(&actual_bytes) {
+                return Err(transaction_error(
+                    "recover owner transaction",
+                    "owner stage bytes changed before removal",
+                ));
+            }
             rooted.remove_file_exact(&intent.stage_path, &actual)?;
         }
         cleanup_owner_journal(
@@ -2625,6 +2711,7 @@ fn remove_owner_temporaries(
         revalidate_owner_temporary(rooted, active, temporary)?;
     }
     for temporary in temporaries {
+        validate_owner_cleanup_journal_identity(rooted, active, active_identity)?;
         revalidate_owner_temporary(rooted, active, temporary)?;
         rooted.remove_file_exact(&format!("{active}/{}", temporary.name), &temporary.identity)?;
     }
@@ -2637,9 +2724,14 @@ fn read_owner_visibility(rooted: &RootedFs, owner_path: &str) -> Result<OwnerVis
     let digest = identity
         .as_ref()
         .map(|_| {
-            rooted
-                .read_file(owner_path, PRIVATE_FILE_MODE)
-                .map(Sha256Digest::from_bytes)
+            let bytes = rooted.read_file(owner_path, PRIVATE_FILE_MODE)?;
+            validate_owner_record_bytes(
+                rooted,
+                &bytes,
+                "recover owner transaction",
+                "visible owner record",
+            )?;
+            Ok(Sha256Digest::from_bytes(bytes))
         })
         .transpose()?;
     Ok(OwnerVisibility { digest, identity })
@@ -2793,9 +2885,14 @@ fn validate_owner_visibility(
     let actual_digest = actual_identity
         .as_ref()
         .map(|_| {
-            rooted
-                .read_file(owner_path, PRIVATE_FILE_MODE)
-                .map(Sha256Digest::from_bytes)
+            let bytes = rooted.read_file(owner_path, PRIVATE_FILE_MODE)?;
+            validate_owner_record_bytes(
+                rooted,
+                &bytes,
+                "recover owner transaction",
+                "visible owner record",
+            )?;
+            Ok(Sha256Digest::from_bytes(bytes))
         })
         .transpose()?;
     let identity_matches = match (visibility.identity.as_ref(), actual_identity.as_ref()) {
@@ -2911,12 +3008,14 @@ fn validate_existing_owner_outcome(
 fn ensure_owner_outcome(
     rooted: &RootedFs,
     active: &str,
+    active_identity: &HeldIdentity,
     token: &str,
     intent: &OwnerIntent,
     outcome: OwnerOutcomeKind,
-    visibility: OwnerVisibility,
+    visibility: &OwnerVisibility,
 ) -> Result<()> {
-    validate_owner_visibility(rooted, &intent.owner_path, &visibility)?;
+    validate_owner_cleanup_journal_identity(rooted, active, active_identity)?;
+    validate_owner_visibility(rooted, &intent.owner_path, visibility)?;
     if let Some(existing) = existing_owner_outcome(rooted, active)? {
         if existing != outcome {
             return Err(transaction_error(
@@ -2925,13 +3024,7 @@ fn ensure_owner_outcome(
             ));
         }
         return validate_existing_owner_outcome(
-            rooted,
-            active,
-            token,
-            intent,
-            outcome,
-            &visibility,
-            None,
+            rooted, active, token, intent, outcome, visibility, None,
         );
     }
     let name = match outcome {
@@ -2953,14 +3046,17 @@ fn ensure_owner_outcome(
     }
     let temporary_name = format!("{name}-{token}.tmp");
     let temporary = format!("{active}/{temporary_name}");
-    let marker = expected_owner_outcome(intent, outcome, &visibility);
+    let marker = expected_owner_outcome(intent, outcome, visibility);
     let marker_bytes = canonical_json(&marker, "serialize recovered owner outcome")?;
     if rooted.identity_at(&temporary)?.is_some() {
         let evidence = read_owner_temporary(rooted, active, &temporary_name)?;
         validate_owner_temporary_prefix(&evidence, &marker_bytes)?;
+        validate_owner_cleanup_journal_identity(rooted, active, active_identity)?;
         revalidate_owner_temporary(rooted, active, &evidence)?;
         rooted.remove_file_exact(&temporary, &evidence.identity)?;
     }
+    validate_owner_cleanup_journal_identity(rooted, active, active_identity)?;
+    validate_owner_visibility(rooted, &intent.owner_path, visibility)?;
     rooted.publish_file_exclusive(
         active,
         name,
@@ -3006,21 +3102,13 @@ fn validate_standalone_owner_outcome(
         ));
     }
     validate_recorded_owner_identity(rooted, marker.visible_identity.as_ref())?;
-    let actual_identity = rooted.identity_at(&marker.owner_path)?;
-    let actual_digest = actual_identity
-        .as_ref()
-        .map(|_| {
-            rooted
-                .read_file(&marker.owner_path, PRIVATE_FILE_MODE)
-                .map(Sha256Digest::from_bytes)
-        })
-        .transpose()?;
-    let identity_matches = match (marker.visible_identity.as_ref(), actual_identity.as_ref()) {
+    let actual = read_owner_visibility(rooted, &marker.owner_path)?;
+    let identity_matches = match (marker.visible_identity.as_ref(), actual.identity.as_ref()) {
         (Some(expected), Some(actual)) => expected.matches_recovery(actual),
         (None, None) => true,
         _ => false,
     };
-    if marker.visible_digest != actual_digest || !identity_matches {
+    if marker.visible_digest != actual.digest || !identity_matches {
         return Err(transaction_error(
             "recover owner transaction",
             "standalone owner outcome differs from visible owner",
@@ -3520,6 +3608,12 @@ fn validate_owner_cleanup_marker(
                 ));
             }
             let bytes = read_owner_cleanup_file(rooted, &marker.owner_path, expected_identity)?;
+            validate_owner_record_bytes(
+                rooted,
+                &bytes,
+                "clean private journal",
+                "visible owner record",
+            )?;
             if &Sha256Digest::from_bytes(bytes) != expected_digest {
                 return Err(transaction_error(
                     "clean private journal",
@@ -3817,10 +3911,12 @@ mod tests {
         ACQUISITION_LOCK, BOOTSTRAP_LOCKS, BootstrapInstallControl, BootstrapRecoveryControl,
         COORDINATION_ROOT, CoordinationAccess, CoordinationGuard, LeaseMetadata,
         OWNER_TRANSACTIONS, OwnerCleanupControl, OwnerOutcomeKind, OwnerOutcomeMarker, OwnerRecord,
-        OwnerRecordStamp, acquire_exclusive, canonical_json, cleanup_owner_journal,
-        cleanup_owner_journal_controlled, corpus_authority_key, install_owner_record_controlled,
-        mutex_path, open_existing_lock, open_or_bootstrap_lock, open_or_bootstrap_lock_controlled,
-        owner_path, process_is_live, recover_bootstrap_controlled, recover_owner_transactions,
+        OwnerRecordStamp, OwnerRecoveryControl, acquire_exclusive, acquire_shared_check,
+        canonical_json, cleanup_owner_journal, cleanup_owner_journal_controlled,
+        corpus_authority_key, install_owner_record_controlled, mutex_path, open_existing_lock,
+        open_or_bootstrap_lock, open_or_bootstrap_lock_controlled, owner_path, process_is_live,
+        recover_bootstrap_controlled, recover_owner_transactions,
+        recover_owner_transactions_controlled,
     };
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -5209,6 +5305,102 @@ mod tests {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn seed_owner_intent_without_prepared(fixture: &OwnerFixture, trace: &[DurabilityEvent]) {
+        interrupt_owner_install(fixture, trace, owner_marker_index(trace, "intent.json"));
+        let active = fixture.active_path();
+        let names = fixture
+            .rooted()
+            .list_dir(&active)
+            .expect("inspect intent-present owner journal");
+        for required in ["intent.json", "owner.stage", "stage-registration.json"] {
+            assert!(
+                names.iter().any(|name| name == required),
+                "intent-present owner journal omitted {required}"
+            );
+        }
+        assert!(
+            !names.iter().any(|name| name == "prepared.json"),
+            "owner intent seed unexpectedly includes a prepared marker"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn replace_owner_journal_identity(fixture: &OwnerFixture) {
+        let active = fixture.corpus.join(fixture.active_path());
+        let displaced = fixture.corpus.join(format!(
+            "{}/displaced-owner-journal",
+            fixture.transaction_parent()
+        ));
+        fs::rename(&active, &displaced).expect("displace validated owner journal");
+        fs::create_dir(&active).expect("create replacement owner journal");
+        fs::set_permissions(&active, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+            .expect("set replacement owner-journal mode");
+        let mut members = fs::read_dir(&displaced)
+            .expect("list displaced owner journal")
+            .map(|entry| entry.expect("read displaced owner member"))
+            .collect::<Vec<_>>();
+        members.sort_by_key(|entry| entry.file_name());
+        for member in members {
+            let destination = active.join(member.file_name());
+            fs::copy(member.path(), &destination).expect("copy replacement owner member");
+            fs::set_permissions(&destination, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+                .expect("set replacement owner-member mode");
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn assert_standalone_owner_canonical_corruption_preserved(near_miss: OwnerJsonNearMiss) {
+        let fixture = OwnerFixture::new(InitialOwner::Absent);
+        seed_historical_acquisition(&fixture);
+        let owner = fixture.corpus.join(owner_path(Domain::Layout));
+        let canonical = fs::read(&owner).expect("read standalone canonical owner");
+        corrupt_file(&owner, &owner_json_near_miss(&canonical, near_miss));
+        assert!(
+            fixture
+                .rooted()
+                .list_dir(&fixture.transaction_parent())
+                .expect("inspect standalone owner journals")
+                .is_empty(),
+            "standalone owner fixture retained a journal"
+        );
+        let before = fixture.snapshot();
+
+        let read_only: Result<CoordinationGuard> =
+            acquire_shared_check(&fixture.location, Domain::Layout);
+        let error = read_only.expect_err("read-only check must reject noncanonical owner bytes");
+        assert_eq!(error.kind(), GeneratorErrorKind::Verification);
+        assert_eq!(
+            fixture.snapshot(),
+            before,
+            "read-only check changed owner evidence"
+        );
+
+        let error = fixture
+            .recover(None)
+            .expect_err("owner recovery must reject noncanonical standalone owner bytes");
+        assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+        assert_eq!(
+            fixture.snapshot(),
+            before,
+            "owner recovery changed owner evidence"
+        );
+
+        let exclusive: Result<CoordinationGuard> = acquire_exclusive(
+            &fixture.location,
+            Domain::Layout,
+            new_owner_metadata(),
+            |_| Ok(()),
+        );
+        let error = exclusive.expect_err("acquisition must reject noncanonical owner bytes");
+        assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+        assert_eq!(
+            fixture.snapshot(),
+            before,
+            "acquisition changed owner evidence"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn assert_corrupt_owner_install_temporary_preserved(
         initial: InitialOwner,
         temporary_name: &str,
@@ -5515,6 +5707,126 @@ mod tests {
                 &format!("{name} {near_miss:?} canonical-byte near miss"),
             );
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn owner_intent_without_prepared_rejects_altered_or_replaced_registered_stage() {
+        for initial in [InitialOwner::Absent, InitialOwner::Old] {
+            let trace = record_owner_install_trace(initial);
+            for corruption in ["altered-bytes", "replaced-identity"] {
+                let fixture = OwnerFixture::new(initial);
+                seed_owner_intent_without_prepared(&fixture, &trace);
+                let stage = fixture
+                    .corpus
+                    .join(format!("{}/owner.stage", fixture.active_path()));
+                match corruption {
+                    "altered-bytes" => {
+                        corrupt_file(&stage, &fixture.record_bytes(&old_owner_metadata()));
+                    }
+                    "replaced-identity" => {
+                        let canonical = fs::read(&stage).expect("read registered owner stage");
+                        fs::remove_file(&stage).expect("remove registered owner stage");
+                        corrupt_file(&stage, &canonical);
+                    }
+                    _ => unreachable!("fixed owner-stage corruption cases"),
+                }
+                assert_owner_corruption_preserved(
+                    &fixture,
+                    &format!("{initial:?} owner stage {corruption} without prepared marker"),
+                );
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn owner_recovery_revalidates_active_journal_identity_before_outcome_mutation() {
+        let trace = record_owner_install_trace(InitialOwner::Absent);
+        let fixture = OwnerFixture::new(InitialOwner::Absent);
+        seed_owner_intent_without_prepared(&fixture, &trace);
+        let rooted = fixture.rooted();
+        let authority_key = corpus_authority_key(&rooted, Domain::Layout);
+        let mut raced_snapshot = None;
+        let result = {
+            let mut before_mutation = |mutation: &str| {
+                assert_eq!(mutation, "outcome-publication");
+                assert!(
+                    raced_snapshot.is_none(),
+                    "owner recovery outcome hook ran more than once"
+                );
+                replace_owner_journal_identity(&fixture);
+                raced_snapshot = Some(fixture.snapshot());
+                Ok(())
+            };
+            let mut control = OwnerRecoveryControl::new(&mut before_mutation);
+            recover_owner_transactions_controlled(
+                &rooted,
+                Domain::Layout,
+                &authority_key,
+                &mut control,
+            )
+        };
+        let error = result.expect_err("replaced active owner journal must stop recovery");
+        assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+        assert_eq!(
+            fixture.snapshot(),
+            raced_snapshot.expect("owner-journal race captured its replacement state"),
+            "owner recovery mutated evidence after active-journal replacement"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn owner_recovery_revalidates_empty_active_journal_before_unlink() {
+        let fixture = OwnerFixture::new(InitialOwner::Absent);
+        let rooted = fixture.rooted();
+        let active = fixture.active_path();
+        rooted
+            .create_dir_exclusive(&active, PRIVATE_DIRECTORY_MODE)
+            .expect("seed empty active owner journal");
+        let authority_key = corpus_authority_key(&rooted, Domain::Layout);
+        let mut raced_snapshot = None;
+        let result = {
+            let mut before_mutation = |mutation: &str| {
+                assert_eq!(mutation, "empty-journal-unlink");
+                assert!(
+                    raced_snapshot.is_none(),
+                    "empty owner-journal hook ran more than once"
+                );
+                replace_owner_journal_identity(&fixture);
+                raced_snapshot = Some(fixture.snapshot());
+                Ok(())
+            };
+            let mut control = OwnerRecoveryControl::new(&mut before_mutation);
+            recover_owner_transactions_controlled(
+                &rooted,
+                Domain::Layout,
+                &authority_key,
+                &mut control,
+            )
+        };
+        let error = result.expect_err("replaced empty owner journal must stop recovery");
+        assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+        assert_eq!(
+            fixture.snapshot(),
+            raced_snapshot.expect("empty owner-journal race captured replacement state"),
+            "owner recovery unlinked evidence after empty-journal replacement"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn standalone_owner_missing_canonical_newline_is_preserved() {
+        assert_standalone_owner_canonical_corruption_preserved(
+            OwnerJsonNearMiss::MissingFinalNewline,
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn standalone_owner_reordered_fields_are_preserved() {
+        assert_standalone_owner_canonical_corruption_preserved(OwnerJsonNearMiss::ReorderedFields);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
