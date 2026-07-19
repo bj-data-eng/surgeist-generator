@@ -10,6 +10,9 @@ use surgeist_generator::{
     collect_regular_files, parse_manifest, validate_disposition_records, verify_git_source,
 };
 
+#[cfg(feature = "css-corpus")]
+use surgeist_generator::css::{CssCommand, CssRequest};
+
 const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
 const ZERO_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const ONE_DIGEST: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -376,4 +379,64 @@ fn portable_count_bounds_and_structural_report_counts_are_enforced() {
         vec![artifact],
     )
     .expect("shared reports do not invent artifacts for unsupported/failed cases");
+}
+
+#[cfg(feature = "css-corpus")]
+#[test]
+fn css_public_request_constructs_only_import_payloads_and_exposes_accessors() {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TestRoot(PathBuf);
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).expect("remove public API roots");
+        }
+    }
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let root = TestRoot(std::env::temp_dir().join(format!(
+        "surgeist-generator-css-public-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )));
+    let owner = root.0.join("owner");
+    let corpus = owner.join("corpus");
+    fs::create_dir_all(&corpus).expect("create public API roots");
+    let location = CorpusLocation::new(&owner, &corpus).expect("location");
+    let source = PathBuf::from("a-source-that-need-not-exist");
+
+    assert_copy_debug_eq::<CssCommand>();
+    assert_clone_debug_eq::<CssRequest>();
+    let request = CssRequest::new(
+        location.clone(),
+        CssCommand::ImportCsstree,
+        Some(source.clone()),
+        None,
+    )
+    .expect("I/O-free import request");
+    assert_eq!(request.location(), &location);
+    assert_eq!(request.command(), CssCommand::ImportCsstree);
+    assert_eq!(request.source_root(), Some(source.as_path()));
+    assert_eq!(request.filter(), None);
+
+    for (source_root, filter) in [
+        (None, None),
+        (Some(PathBuf::new()), None),
+        (
+            Some(source.clone()),
+            Some(RelativePath::new("declaration").expect("filter")),
+        ),
+    ] {
+        let error = CssRequest::new(
+            location.clone(),
+            CssCommand::ImportCsstree,
+            source_root,
+            filter,
+        )
+        .expect_err("invalid import payload");
+        assert_eq!(error.kind(), GeneratorErrorKind::Cli);
+    }
 }

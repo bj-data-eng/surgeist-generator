@@ -5,6 +5,9 @@
 mod core;
 mod error;
 
+#[cfg(feature = "css-corpus")]
+pub mod css;
+
 pub use core::{
     ArtifactProvenance, CaseDisposition, CaseDispositionRecord, CorpusLocation, GenerationCounts,
     GenerationReport, ManifestVersion, PinnedSource, RelativePath, ReportArtifact, RunScope,

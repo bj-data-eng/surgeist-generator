@@ -12,6 +12,11 @@ description = "Generator tooling and generation contracts for Surgeist."
 name = "surgeist_generator"
 path = "src/lib.rs"
 
+[[bin]]
+name = "surgeist-css-generate"
+path = "src/bin/surgeist-css-generate.rs"
+required-features = ["css-corpus"]
+
 [features]
 default = []
 layout-browser = []

@@ -210,8 +210,18 @@ impl TransactionRequest {
     }
 
     fn stage_name(&self) -> String {
-        format!("._surgeist-{}-stage-{}", self.domain, self.token)
+        external_stage_name(&self.domain, &self.token)
+            .expect("validated transaction identity has a canonical external stage name")
+            .as_str()
+            .to_owned()
     }
+}
+
+pub(crate) fn external_stage_name(domain: &str, token: &str) -> Result<RelativePath> {
+    validate_token(token)?;
+    validate_component(domain)?;
+    RelativePath::new(format!("._surgeist-{domain}-stage-{token}"))
+        .map_err(|error| transaction_error("construct external stage name", error.to_string()))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -19,6 +19,27 @@ pub use manifest::{ManifestVersion, parse_manifest};
 pub use report::{ArtifactProvenance, GenerationCounts, GenerationReport, ReportArtifact};
 pub use source::{PinnedSource, SourceRevision, VerifiedSource, verify_git_source};
 
+#[cfg(feature = "css-corpus")]
+pub(crate) use artifact::{
+    ArtifactPlan, ArtifactReservation, PublicationInventory, PublicationPolicy,
+};
+#[cfg(feature = "css-corpus")]
+pub(crate) use coordination::Domain;
+#[cfg(feature = "css-corpus")]
+pub(crate) use fs::{CORPUS_FILE_MODE, NodeKind, RootedFs};
+#[cfg(feature = "css-corpus")]
+pub(crate) use inventory::{Inventory, InventoryPolicy};
+#[cfg(feature = "css-corpus")]
+pub(crate) use lease::GenerationLease;
+#[cfg(feature = "css-corpus")]
+pub(crate) use protection::ProtectedSourceDisjointness;
+#[cfg(all(feature = "css-corpus", test))]
+pub(crate) use source::SnapshotEntry;
+#[cfg(feature = "css-corpus")]
+pub(crate) use source::{
+    ObjectFormat, ProtectedSource, VerifiedSourceSnapshot, verify_protected_git_source,
+};
+
 pub(crate) fn validate_identifier(value: &str) -> bool {
     private_front_doors_are_linked();
     let bytes = value.as_bytes();

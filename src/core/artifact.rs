@@ -9,6 +9,8 @@ use super::coordination::{Domain, new_token};
 use super::fs::{CORPUS_FILE_MODE, NodeKind};
 use super::inventory::{Inventory, InventoryPolicy};
 use super::lease::{GenerationLease, LeaseBinding};
+#[cfg(feature = "css-corpus")]
+use super::transaction::external_stage_name;
 use super::transaction::{StagedTree, TransactionEngine, TransactionRequest};
 
 /// The three publication behaviors admitted by the shared transaction layer.
@@ -77,6 +79,34 @@ pub(crate) struct ArtifactPlan {
     policy: PublicationPolicy,
     inventory: PublicationInventory,
     artifacts: BTreeMap<RelativePath, PlannedArtifact>,
+    #[cfg(feature = "css-corpus")]
+    transaction_token: Option<String>,
+}
+
+/// In-memory proof of the exact external stage namespace chosen before lease.
+#[cfg(feature = "css-corpus")]
+#[derive(Debug)]
+pub(crate) struct ArtifactReservation {
+    domain: Domain,
+    token: String,
+    external_stage: RelativePath,
+}
+
+#[cfg(feature = "css-corpus")]
+impl ArtifactReservation {
+    pub(crate) fn new(domain: Domain) -> Result<Self> {
+        let token = new_token()?;
+        let external_stage = external_stage_name(domain.as_str(), &token)?;
+        Ok(Self {
+            domain,
+            token,
+            external_stage,
+        })
+    }
+
+    pub(crate) const fn external_stage(&self) -> &RelativePath {
+        &self.external_stage
+    }
 }
 
 impl ArtifactPlan {
@@ -141,11 +171,47 @@ impl ArtifactPlan {
             policy,
             inventory,
             artifacts: planned,
+            #[cfg(feature = "css-corpus")]
+            transaction_token: None,
         })
+    }
+
+    #[cfg(feature = "css-corpus")]
+    pub(crate) fn with_reservation(mut self, reservation: ArtifactReservation) -> Result<Self> {
+        if reservation.domain != self.domain {
+            return Err(plan_error(
+                "artifact reservation domain differs from the publication plan",
+            ));
+        }
+        if reservation.external_stage == self.final_root {
+            return Err(plan_error(
+                "artifact reservation collides with the publication root",
+            ));
+        }
+        self.transaction_token = Some(reservation.token);
+        Ok(self)
     }
 
     /// Installs the complete new unit through one EXCL or SWAP root transition.
     pub(crate) fn install(&self) -> Result<()> {
+        self.install_impl(|_| Ok(()), None)
+    }
+
+    /// Revalidates domain-owned read authorities at the last pre-intent boundary.
+    #[cfg(feature = "css-corpus")]
+    pub(crate) fn install_with_revalidation(
+        self,
+        pre_intent_revalidation: impl FnOnce(&super::fs::RootedFs) -> Result<()>,
+    ) -> Result<()> {
+        let transaction_token = self.transaction_token.clone();
+        self.install_impl(pre_intent_revalidation, transaction_token)
+    }
+
+    fn install_impl(
+        &self,
+        pre_intent_revalidation: impl FnOnce(&super::fs::RootedFs) -> Result<()>,
+        transaction_token: Option<String>,
+    ) -> Result<()> {
         // This validation intentionally precedes every descriptor recheck, probe, and write.
         let state = self.binding.validate(&self.location, self.domain)?;
         let rooted = state.rooted();
@@ -157,6 +223,7 @@ impl ArtifactPlan {
         )
         .map_err(pre_intent_error)?;
         self.validate_current(current.as_ref())?;
+        pre_intent_revalidation(rooted)?;
 
         let mut desired = BTreeMap::new();
         if let Some(current) = current.as_ref() {
@@ -199,7 +266,7 @@ impl ArtifactPlan {
         if state.token().is_none() {
             return Err(plan_error("exclusive lease token disappeared"));
         }
-        let transaction_token = new_token()?;
+        let transaction_token = transaction_token.map_or_else(new_token, Ok)?;
         let request = TransactionRequest::new(
             state.authority_key(),
             self.domain.as_str(),
