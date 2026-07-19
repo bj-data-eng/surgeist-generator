@@ -44,7 +44,7 @@ pub(super) fn inspect(rooted: &RootedFs, manifest: &CssManifest) -> Result<Valid
     let sidecar_path = RelativePath::new(SIDECAR_FILE)?;
     let sidecar_entry = inventory
         .find(&sidecar_path)
-        .ok_or_else(|| invalid_inventory("nonempty CSS import root has no canonical sidecar"))?;
+        .ok_or_else(|| verification("nonempty CSS import root has no canonical sidecar"))?;
     if sidecar_entry.identity().kind() != NodeKind::Regular {
         return Err(invalid_inventory(
             "CSS import sidecar is not a regular file",

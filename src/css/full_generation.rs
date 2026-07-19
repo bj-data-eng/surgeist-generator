@@ -56,6 +56,15 @@ fn run_impl(
     )?;
     let preflight_rooted = RootedFs::open_corpus(location)?;
     let historical = super::historical::inspect(&preflight_rooted, &manifest)?;
+    let preflight_imported = super::fixture::inspect(&preflight_rooted, &manifest)?;
+    let report_relative = super::report::relative_path(&manifest)?;
+    let desired = preflight_imported
+        .fixtures()
+        .iter()
+        .map(|fixture| fixture.path.clone())
+        .chain(std::iter::once(report_relative.clone()))
+        .collect::<BTreeSet<_>>();
+    historical.validate_union(&desired)?;
     drop(preflight_rooted);
     pre_lease_hook();
     let lease = GenerationLease::acquire_with_revalidation(
@@ -64,7 +73,23 @@ fn run_impl(
         GENERATOR,
         &RunScope::Full,
         COMMAND,
-        |rooted| protection.revalidate(rooted),
+        |rooted| {
+            protection.revalidate(rooted)?;
+            super::importer::revalidate_manifest(rooted, &manifest_bytes)?;
+            if super::fixture::inspect(rooted, &manifest)? != preflight_imported {
+                return Err(super::invalid_inventory(
+                    "current CSS import changed before lease owner installation",
+                ));
+            }
+            let current_historical = super::historical::inspect(rooted, &manifest)?;
+            current_historical.validate_union(&desired)?;
+            if current_historical != historical {
+                return Err(super::invalid_inventory(
+                    "CSS historical inventory changed before lease owner installation",
+                ));
+            }
+            Ok(())
+        },
     )?;
 
     let binding = lease.bind(location, Domain::Css)?;
@@ -73,13 +98,11 @@ fn run_impl(
     protection.revalidate(rooted)?;
     super::importer::revalidate_manifest(rooted, &manifest_bytes)?;
     let imported = super::fixture::inspect(rooted, &manifest)?;
-    let report_relative = super::report::relative_path(&manifest)?;
-    let desired = imported
-        .fixtures()
-        .iter()
-        .map(|fixture| fixture.path.clone())
-        .chain(std::iter::once(report_relative.clone()))
-        .collect::<BTreeSet<_>>();
+    if imported != preflight_imported {
+        return Err(super::invalid_inventory(
+            "current CSS import changed before held validation",
+        ));
+    }
     let current_historical = super::historical::inspect(rooted, &manifest)?;
     current_historical.validate_union(&desired)?;
     if current_historical != historical {

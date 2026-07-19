@@ -1822,6 +1822,323 @@ mod imports {
         assert_eq!(snapshot_tree(&fixture.corpus.join("expectations")), before);
     }
 
+    struct PublishedGenerationProof {
+        tree: BTreeMap<PathBuf, Vec<u8>>,
+        root_identity: (u64, u64),
+        output_bytes: Vec<u8>,
+        output_identity: (u64, u64),
+        report_bytes: Vec<u8>,
+        report_identity: (u64, u64),
+    }
+
+    impl PublishedGenerationProof {
+        fn capture(fixture: &Fixture) -> Self {
+            let root = fixture.corpus.join("expectations");
+            let output = root.join("declaration/Case.json");
+            let report = root.join("generation-reports/all.json");
+            Self {
+                tree: snapshot_tree(&root),
+                root_identity: path_identity(&root),
+                output_bytes: fs::read(&output).expect("read published expectation"),
+                output_identity: path_identity(&output),
+                report_bytes: fs::read(&report).expect("read published report"),
+                report_identity: path_identity(&report),
+            }
+        }
+
+        fn assert_unchanged(&self, fixture: &Fixture) {
+            let root = fixture.corpus.join("expectations");
+            let output = root.join("declaration/Case.json");
+            let report = root.join("generation-reports/all.json");
+            assert_eq!(snapshot_tree(&root), self.tree);
+            assert_eq!(path_identity(&root), self.root_identity);
+            assert_eq!(
+                fs::read(&output).expect("read retained expectation"),
+                self.output_bytes
+            );
+            assert_eq!(path_identity(&output), self.output_identity);
+            assert_eq!(
+                fs::read(&report).expect("read retained report"),
+                self.report_bytes
+            );
+            assert_eq!(path_identity(&report), self.report_identity);
+        }
+    }
+
+    fn canonical_sidecar_replacement(bytes: &[u8], old: &str, new: &str, field: &str) -> Vec<u8> {
+        assert_eq!(
+            old.len(),
+            new.len(),
+            "replacement must preserve field width"
+        );
+        let text = String::from_utf8(bytes.to_vec()).expect("canonical sidecar is UTF-8");
+        assert_eq!(
+            text.matches(old).count(),
+            1,
+            "sidecar must contain one {field} value"
+        );
+        text.replacen(old, new, 1).into_bytes()
+    }
+
+    fn remove_completed_coordination(fixture: &Fixture) {
+        let coordination = fixture.corpus.join(".surgeist-generator");
+        fs::remove_dir_all(&coordination).expect("remove completed test coordination");
+        assert!(!coordination.exists());
+    }
+
+    fn assert_initial_import_rejected_before_lease(
+        mutate: impl FnOnce(&Fixture),
+        expected_kind: GeneratorErrorKind,
+        expected_error: &str,
+    ) {
+        let fixture = imported_generation_fixture(
+            "declaration/Case.json",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+            1,
+            &[],
+        );
+        fixture.generate().expect("seed current expectations");
+        mutate(&fixture);
+        remove_completed_coordination(&fixture);
+        let published = PublishedGenerationProof::capture(&fixture);
+        let hook_reached = Cell::new(false);
+
+        let error = full_generation::run_with_pre_lease_hook(&fixture.generate_request(), || {
+            hook_reached.set(true)
+        })
+        .expect_err("invalid initial import must reject full generation");
+
+        published.assert_unchanged(&fixture);
+        assert_no_import_intent_journal_or_stage(&fixture);
+        let coordination = fixture.corpus.join(".surgeist-generator");
+        let owner = coordination.join("leases/css/owner.json");
+        assert_eq!(
+            (
+                error.kind(),
+                hook_reached.get(),
+                coordination.exists(),
+                owner.exists(),
+            ),
+            (expected_kind, false, false, false),
+            "initial import validation must precede the hook and every coordination mutation"
+        );
+        assert_eq!(error.to_string(), expected_error);
+    }
+
+    #[test]
+    fn css_full_generate_rejects_initially_absent_import_sidecar_before_lease() {
+        assert_initial_import_rejected_before_lease(
+            |fixture| {
+                fs::remove_file(fixture.imported(".surgeist-source.json"))
+                    .expect("remove canonical import sidecar");
+            },
+            GeneratorErrorKind::Verification,
+            "validate current CSS import: nonempty CSS import root has no canonical sidecar",
+        );
+    }
+
+    #[test]
+    fn css_full_generate_rejects_initially_absent_import_fixture_before_lease() {
+        assert_initial_import_rejected_before_lease(
+            |fixture| {
+                fs::remove_file(fixture.imported("declaration/Case.json"))
+                    .expect("remove listed import fixture");
+            },
+            GeneratorErrorKind::Verification,
+            "validate current CSS import: CSS imported fixture is absent: declaration/Case.json",
+        );
+    }
+
+    #[test]
+    fn css_full_generate_rejects_initially_stale_import_sidecar_before_lease() {
+        assert_initial_import_rejected_before_lease(
+            |fixture| {
+                let sidecar_path = fixture.imported(".surgeist-source.json");
+                let sidecar = fs::read(&sidecar_path).expect("read canonical import sidecar");
+                let stale_revision = if fixture.revision.starts_with('0') {
+                    "1".repeat(fixture.revision.len())
+                } else {
+                    "0".repeat(fixture.revision.len())
+                };
+                let stale = canonical_sidecar_replacement(
+                    &sidecar,
+                    &fixture.revision,
+                    &stale_revision,
+                    "source revision",
+                );
+                fs::write(sidecar_path, stale).expect("write stale canonical sidecar");
+            },
+            GeneratorErrorKind::Verification,
+            "validate current CSS import: CSS import sidecar does not match the current manifest",
+        );
+    }
+
+    #[test]
+    fn css_full_generate_rejects_initially_stale_import_fixture_before_lease() {
+        assert_initial_import_rejected_before_lease(
+            |fixture| {
+                fs::write(
+                    fixture.imported("declaration/Case.json"),
+                    b"{\"case\":{\"source\":\"stale\",\"ast\":{}}}\n",
+                )
+                .expect("write stale import fixture");
+            },
+            GeneratorErrorKind::Verification,
+            "validate current CSS import: CSS imported fixture digest is stale: declaration/Case.json",
+        );
+    }
+
+    #[test]
+    fn css_full_generate_rejects_initially_unknown_import_entry_before_lease() {
+        assert_initial_import_rejected_before_lease(
+            |fixture| {
+                fs::write(fixture.imported("unknown.json"), b"{}\n")
+                    .expect("write unknown import entry");
+            },
+            GeneratorErrorKind::InvalidInventory,
+            "validate current CSS import: unknown entry in CSS import root: unknown.json",
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PreLeaseImportMutation {
+        FixtureByteDrift,
+        FixtureSameBytesIdentityReplacement,
+        SidecarByteDrift,
+        SidecarSameBytesIdentityReplacement,
+    }
+
+    fn assert_pre_lease_import_revalidation(mutation: PreLeaseImportMutation) {
+        const SOURCE: &[u8] = b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n";
+
+        let fixture = imported_generation_fixture("declaration/Case.json", SOURCE, 1, &[]);
+        fixture.generate().expect("seed current expectations");
+        remove_completed_coordination(&fixture);
+        let published = PublishedGenerationProof::capture(&fixture);
+        let target = match mutation {
+            PreLeaseImportMutation::FixtureByteDrift
+            | PreLeaseImportMutation::FixtureSameBytesIdentityReplacement => {
+                fixture.imported("declaration/Case.json")
+            }
+            PreLeaseImportMutation::SidecarByteDrift
+            | PreLeaseImportMutation::SidecarSameBytesIdentityReplacement => {
+                fixture.imported(".surgeist-source.json")
+            }
+        };
+        let displaced = fixture.root.join("displaced-pre-lease-import");
+        let original_bytes = fs::read(&target).expect("read retained import target");
+        let original_identity = path_identity(&target);
+        let replace_identity = matches!(
+            mutation,
+            PreLeaseImportMutation::FixtureSameBytesIdentityReplacement
+                | PreLeaseImportMutation::SidecarSameBytesIdentityReplacement
+        );
+        let replacement_bytes = match mutation {
+            PreLeaseImportMutation::FixtureByteDrift => {
+                b"{\"case\":{\"source\":\"pre-lease drift\",\"ast\":{}}}\n".to_vec()
+            }
+            PreLeaseImportMutation::SidecarByteDrift => canonical_sidecar_replacement(
+                &original_bytes,
+                Sha256Digest::from_bytes(SOURCE).as_str(),
+                Sha256Digest::from_bytes(b"pre-lease sidecar byte drift").as_str(),
+                "fixture digest",
+            ),
+            PreLeaseImportMutation::FixtureSameBytesIdentityReplacement
+            | PreLeaseImportMutation::SidecarSameBytesIdentityReplacement => original_bytes.clone(),
+        };
+        let hook_reached = Cell::new(false);
+        let replacement_identity = Cell::new(None);
+
+        let result = full_generation::run_with_pre_lease_hook(&fixture.generate_request(), || {
+            assert!(
+                !hook_reached.replace(true),
+                "pre-lease hook ran more than once"
+            );
+            assert!(
+                !fixture.corpus.join(".surgeist-generator").exists(),
+                "lease acquisition began before the pre-lease hook"
+            );
+            assert_eq!(
+                fs::read(&target).expect("read hook import target"),
+                original_bytes
+            );
+            assert_eq!(path_identity(&target), original_identity);
+            published.assert_unchanged(&fixture);
+            if replace_identity {
+                fs::rename(&target, &displaced).expect("displace preflight import target");
+            }
+            fs::write(&target, &replacement_bytes).expect("write raced import target");
+            replacement_identity.set(Some(path_identity(&target)));
+        });
+        let error = result.expect_err("pre-lease import replacement must reject generation");
+
+        published.assert_unchanged(&fixture);
+        assert_no_import_intent_journal_or_stage(&fixture);
+        let owner = fixture
+            .corpus
+            .join(".surgeist-generator/leases/css/owner.json");
+        let expected_kind = if replace_identity {
+            GeneratorErrorKind::InvalidInventory
+        } else {
+            GeneratorErrorKind::Verification
+        };
+        assert_eq!(
+            (error.kind(), hook_reached.get(), owner.exists()),
+            (expected_kind, true, false),
+            "pre-lease import proof must close under the mutex before owner installation"
+        );
+        if replace_identity {
+            assert_eq!(
+                error.to_string(),
+                "revalidate CSS generation inputs: current CSS import changed before lease owner installation"
+            );
+            assert_ne!(path_identity(&target), original_identity);
+            assert_eq!(path_identity(&displaced), original_identity);
+            assert_eq!(
+                fs::read(&displaced).expect("read displaced import"),
+                original_bytes
+            );
+        } else {
+            assert_eq!(
+                error.to_string(),
+                "validate current CSS import: CSS imported fixture digest is stale: declaration/Case.json"
+            );
+            assert_eq!(path_identity(&target), original_identity);
+            assert!(!displaced.exists());
+        }
+        assert_eq!(Some(path_identity(&target)), replacement_identity.get());
+        assert_eq!(
+            fs::read(&target).expect("read raced import target"),
+            replacement_bytes
+        );
+    }
+
+    #[test]
+    fn css_full_generate_pre_lease_revalidation_rejects_fixture_byte_drift_before_owner_install() {
+        assert_pre_lease_import_revalidation(PreLeaseImportMutation::FixtureByteDrift);
+    }
+
+    #[test]
+    fn css_full_generate_pre_lease_revalidation_rejects_fixture_same_byte_identity_replacement_before_owner_install()
+     {
+        assert_pre_lease_import_revalidation(
+            PreLeaseImportMutation::FixtureSameBytesIdentityReplacement,
+        );
+    }
+
+    #[test]
+    fn css_full_generate_pre_lease_revalidation_rejects_sidecar_byte_drift_before_owner_install() {
+        assert_pre_lease_import_revalidation(PreLeaseImportMutation::SidecarByteDrift);
+    }
+
+    #[test]
+    fn css_full_generate_pre_lease_revalidation_rejects_sidecar_same_byte_identity_replacement_before_owner_install()
+     {
+        assert_pre_lease_import_revalidation(
+            PreLeaseImportMutation::SidecarSameBytesIdentityReplacement,
+        );
+    }
+
     #[test]
     fn css_full_generate_rejects_current_import_digest_drift_without_publication() {
         let fixture = imported_generation_fixture(
