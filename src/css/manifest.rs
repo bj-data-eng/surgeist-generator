@@ -3,6 +3,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::core::{validate_disposition_reason, validate_json_case_id_syntax};
 use crate::{
     CaseDisposition, CaseDispositionRecord, GeneratorError, GeneratorErrorKind, ManifestVersion,
     RelativePath, Result, SourceRevision, parse_manifest,
@@ -23,7 +24,29 @@ pub(super) struct CssManifest {
     pub(super) expected_cases: usize,
     pub(super) expectation_root: RelativePath,
     pub(super) report_file: RelativePath,
-    pub(super) cases: Vec<CaseDispositionRecord>,
+    pub(super) cases: Vec<CssCaseOverride>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CssCaseOverride {
+    id: String,
+    status: CaseDisposition,
+    reason: Option<String>,
+}
+
+impl CssCaseOverride {
+    pub(super) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(super) fn bind(&self, source_path: &RelativePath) -> Result<CaseDispositionRecord> {
+        CaseDispositionRecord::new(
+            &self.id,
+            source_path.clone(),
+            self.status,
+            self.reason.clone(),
+        )
+    }
 }
 
 #[derive(Deserialize)]
@@ -111,25 +134,26 @@ pub(super) fn parse(bytes: &[u8], path: &Path) -> Result<CssManifest> {
     let mut case_ids = BTreeSet::new();
     let mut cases = Vec::with_capacity(raw.cases.len());
     for case in raw.cases {
-        let (source, pointer) = case
-            .id
-            .split_once('#')
-            .ok_or_else(|| invalid_manifest("case ID must contain a JSON pointer"))?;
-        if pointer.is_empty() || !pointer.starts_with('/') {
+        if !validate_json_case_id_syntax(&case.id) {
             return Err(invalid_manifest(
-                "case ID must contain a nonempty JSON pointer",
+                "case ID must contain a strict JSON source and canonical JSON pointer",
             ));
         }
-        let source_path = RelativePath::with_extension(source, "json")
-            .map_err(|error| invalid_manifest(error.to_string()))?;
-        let record = CaseDispositionRecord::new(&case.id, source_path, case.status, case.reason)
-            .map_err(|error| invalid_manifest(error.to_string()))?;
-        if !case_ids.insert(case.id) {
+        if !validate_disposition_reason(case.status, case.reason.as_deref()) {
+            return Err(invalid_manifest(
+                "case disposition and reason combination is invalid",
+            ));
+        }
+        if !case_ids.insert(case.id.clone()) {
             return Err(invalid_manifest("case IDs must be unique"));
         }
-        cases.push(record);
+        cases.push(CssCaseOverride {
+            id: case.id,
+            status: case.status,
+            reason: case.reason,
+        });
     }
-    cases.sort_by(|left, right| left.case_id().cmp(right.case_id()));
+    cases.sort_by(|left, right| left.id.cmp(&right.id));
 
     Ok(CssManifest {
         repository: raw.source.repository,

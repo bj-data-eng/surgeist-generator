@@ -115,7 +115,7 @@ pub(super) fn derive(
     let mut overrides = manifest
         .cases
         .iter()
-        .map(|record| (record.case_id().to_owned(), record))
+        .map(|record| (record.id().to_owned(), record))
         .collect::<BTreeMap<_, _>>();
     let mut all_ids = BTreeSet::new();
     let mut artifacts = Vec::with_capacity(imported.fixtures().len());
@@ -188,6 +188,9 @@ pub(super) fn derive(
                 )));
             }
             if let Some(record) = overrides.remove(&case.id) {
+                let record = record
+                    .bind(&fixture.path)
+                    .map_err(|error| invalid_inventory(error.to_string()))?;
                 case.status = record.disposition();
                 case.reason = record.reason().map(str::to_owned);
             }

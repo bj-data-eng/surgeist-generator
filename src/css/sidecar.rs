@@ -212,7 +212,7 @@ pub(super) fn validate_fixture_path(path: &RelativePath) -> Result<()> {
     Ok(())
 }
 
-fn paths_overlap(left: &str, right: &str) -> bool {
+pub(super) fn paths_overlap(left: &str, right: &str) -> bool {
     is_same_or_descendant(left, right) || is_same_or_descendant(right, left)
 }
 

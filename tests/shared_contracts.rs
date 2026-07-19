@@ -62,6 +62,39 @@ fn disposition_validation_accepts_repeated_sources_and_sorts_only_by_case_id() {
 }
 
 #[test]
+fn disposition_case_ids_preserve_hashes_in_strict_sources_and_pointer_tokens() {
+    let source = RelativePath::new("nested#source/Fixture#.json").unwrap();
+    let id = "nested#source/Fixture#.json#/before#~1middle~1#after";
+    let record = CaseDispositionRecord::new(
+        id,
+        source.clone(),
+        CaseDisposition::ExpectedFail,
+        Some("known hash-label mismatch"),
+    )
+    .unwrap();
+    assert_eq!(record.case_id(), id);
+    assert_eq!(record.source_path(), &source);
+
+    for malformed in [
+        "nested#source/Fixture#.json#",
+        "nested#source/Fixture#.json#pointer",
+        "nested#source/Fixture#.json##/pointer",
+        "nested#source/Fixture#.json#/bad~2escape",
+    ] {
+        assert!(
+            CaseDispositionRecord::new(
+                malformed,
+                source.clone(),
+                CaseDisposition::Active,
+                None::<String>,
+            )
+            .is_err(),
+            "accepted malformed delimiter spelling {malformed:?}"
+        );
+    }
+}
+
+#[test]
 fn corpus_locations_reject_the_exact_reserved_coordination_component() {
     let owner = TestDirectory::new("reserved-owner");
     let reserved = owner.path().join(".surgeist-generator");

@@ -129,8 +129,7 @@ fn validate_report(
         ));
     }
     let mut case_count = 0_usize;
-    let mut source_paths = BTreeSet::new();
-    let mut classified = BTreeSet::from([report_relative]);
+    let mut paths = Vec::with_capacity(report.artifacts().len());
     for artifact in report.artifacts() {
         case_count = case_count
             .checked_add(artifact.case_count())
@@ -155,22 +154,27 @@ fn validate_report(
             .ok_or_else(|| {
                 invalid_inventory("CSS historical output path is outside expectation_root")
             })?;
+        sidecar::validate_fixture_path(&source_relative)?;
+        sidecar::validate_fixture_path(&output_relative)?;
+        paths.push((source_relative, output_relative));
+    }
+    validate_nonoverlapping_paths(
+        paths.iter().map(|(source, _)| source),
+        "historical source paths",
+    )?;
+    validate_nonoverlapping_paths(
+        paths.iter().map(|(_, output)| output),
+        "historical output paths",
+    )?;
+
+    let mut classified = BTreeSet::from([report_relative]);
+    for (source_relative, output_relative) in paths {
         if source_relative != output_relative || output_relative.as_str() == REPORT_RELATIVE {
             return Err(invalid_inventory(
                 "CSS historical source/output mapping or report reservation is invalid",
             ));
         }
-        sidecar::validate_fixture_path(&source_relative)?;
-        if !source_paths.insert(source_relative) {
-            return Err(invalid_inventory(
-                "CSS historical report repeats a source path",
-            ));
-        }
-        if !classified.insert(output_relative) {
-            return Err(invalid_inventory(
-                "CSS historical report repeats an output path",
-            ));
-        }
+        classified.insert(output_relative);
     }
     if report.counts().total()? != case_count {
         return Err(invalid_inventory(
@@ -178,6 +182,27 @@ fn validate_report(
         ));
     }
     Ok(classified)
+}
+
+fn validate_nonoverlapping_paths<'a>(
+    paths: impl IntoIterator<Item = &'a RelativePath>,
+    label: &str,
+) -> Result<()> {
+    let mut prior = Vec::<&RelativePath>::new();
+    for path in paths {
+        if let Some(collision) = prior
+            .iter()
+            .find(|candidate| sidecar::paths_overlap(candidate.as_str(), path.as_str()))
+        {
+            return Err(invalid_inventory(format!(
+                "CSS {label} collide: {} and {}",
+                collision.as_str(),
+                path.as_str()
+            )));
+        }
+        prior.push(path);
+    }
+    Ok(())
 }
 
 fn strip_root(path: &RelativePath, root: &RelativePath) -> Option<RelativePath> {
@@ -202,4 +227,42 @@ fn invalid_inventory_with_source(operation: &str, source: GeneratorError) -> Gen
         source.to_string(),
         source,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_nonoverlapping_paths;
+    use crate::RelativePath;
+
+    fn paths(values: &[&str]) -> Vec<RelativePath> {
+        values
+            .iter()
+            .map(|value| RelativePath::new(value).expect("strict path"))
+            .collect()
+    }
+
+    #[test]
+    fn css_historical_inventory_path_collision_matrix_uses_strict_target_components() {
+        for colliding in [
+            ["a.json", "a.json"],
+            ["a.json", "a.json/b.json"],
+            ["a.json/b.json", "a.json"],
+        ] {
+            let paths = paths(&colliding);
+            validate_nonoverlapping_paths(paths.iter(), "test paths")
+                .expect_err("exact or ancestor collision");
+        }
+
+        let distinct = paths(&["a.json", "a.json-copy/b.json"]);
+        validate_nonoverlapping_paths(distinct.iter(), "test paths")
+            .expect("partial component is not a collision");
+
+        let target_aliases = paths(&["Case.json", "case.json"]);
+        #[cfg(target_os = "macos")]
+        validate_nonoverlapping_paths(target_aliases.iter(), "test paths")
+            .expect_err("macOS target aliases collide");
+        #[cfg(not(target_os = "macos"))]
+        validate_nonoverlapping_paths(target_aliases.iter(), "test paths")
+            .expect("case-distinct paths do not alias on this target");
+    }
 }

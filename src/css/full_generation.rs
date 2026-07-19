@@ -13,6 +13,15 @@ const COMMAND: &str = "generate";
 const MANIFEST_FILE: &str = "corpus.toml";
 
 pub(super) fn run(request: &CssRequest) -> Result<()> {
+    run_impl(request, || {})
+}
+
+#[cfg(test)]
+pub(super) fn run_with_pre_lease_hook(request: &CssRequest, hook: impl FnOnce()) -> Result<()> {
+    run_impl(request, hook)
+}
+
+fn run_impl(request: &CssRequest, pre_lease_hook: impl FnOnce()) -> Result<()> {
     let location = request.location();
     let manifest_path = location.corpus_root().join(MANIFEST_FILE);
     let manifest_bytes = super::importer::read_manifest_file(&manifest_path)?;
@@ -33,6 +42,10 @@ pub(super) fn run(request: &CssRequest) -> Result<()> {
             ("CSS import root", import_root_path.as_path()),
         ],
     )?;
+    let preflight_rooted = RootedFs::open_corpus(location)?;
+    let historical = super::historical::inspect(&preflight_rooted, &manifest)?;
+    drop(preflight_rooted);
+    pre_lease_hook();
     let lease = GenerationLease::acquire_with_revalidation(
         location,
         Domain::Css,
@@ -55,8 +68,13 @@ pub(super) fn run(request: &CssRequest) -> Result<()> {
         .map(|fixture| fixture.path.clone())
         .chain(std::iter::once(report_relative.clone()))
         .collect::<BTreeSet<_>>();
-    let historical = super::historical::inspect(rooted, &manifest)?;
-    historical.validate_union(&desired)?;
+    let current_historical = super::historical::inspect(rooted, &manifest)?;
+    current_historical.validate_union(&desired)?;
+    if current_historical != historical {
+        return Err(super::invalid_inventory(
+            "CSS historical inventory changed before held validation",
+        ));
+    }
     let expectations = super::expectation::derive(&imported, &manifest)?;
     let report_bytes = super::report::build(
         &manifest,

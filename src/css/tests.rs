@@ -46,6 +46,10 @@ fn css_manifest_valid_schema_1_matrix_is_accepted() {
         "status = \"active\"",
         "status = \"expected-fail\"\nreason = \"known upstream mismatch\"",
     ));
+    valid.push(manifest_text(SHA1_REVISION, 1).replace(
+        "declaration/Declaration.json#/case",
+        "nested#context/Fixture#.json#/before#~1middle~1#after",
+    ));
 
     for text in valid {
         manifest::parse(text.as_bytes(), Path::new("corpus.toml"))
@@ -88,6 +92,22 @@ fn css_manifest_invalid_schema_1_matrix_is_rejected() {
         valid.replace(
             "id = \"declaration/Declaration.json#/case\"",
             "id = \"declaration/Declaration.json#/case\"\nid = \"duplicate\"",
+        ),
+        valid.replace(
+            "declaration/Declaration.json#/case",
+            "declaration/Declaration.json#",
+        ),
+        valid.replace(
+            "declaration/Declaration.json#/case",
+            "declaration/Declaration.json#not-a-pointer",
+        ),
+        valid.replace(
+            "declaration/Declaration.json#/case",
+            "declaration/Declaration.json##/extra-delimiter",
+        ),
+        valid.replace(
+            "declaration/Declaration.json#/case",
+            "declaration/Declaration.json#/bad~2escape",
         ),
         format!(
             "{valid}\n[[cases]]\nid = \"declaration/Declaration.json#/case\"\nstatus = \"active\"\n"
@@ -221,7 +241,7 @@ mod imports {
     };
 
     use super::{CSSTREE_REPOSITORY, manifest_text};
-    use crate::css::importer;
+    use crate::css::{full_generation, importer};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -526,6 +546,52 @@ mod imports {
                 bytes: snapshot_tree(&self.corpus.join("expectations")),
                 report_bytes,
             }
+        }
+
+        fn replace_historical_report(&self, paths: &[(&str, &str)]) {
+            let sidecar_digest = Sha256Digest::from_bytes(self.sidecar());
+            let artifacts = paths
+                .iter()
+                .enumerate()
+                .map(|(index, (source, output))| {
+                    let mut domain = BTreeMap::new();
+                    domain.insert("csstree-import".to_owned(), sidecar_digest.clone());
+                    let provenance = ArtifactProvenance::new(
+                        RelativePath::new(format!("source/{source}"))
+                            .expect("historical source path"),
+                        Sha256Digest::from_bytes(format!("source-{index}").as_bytes()),
+                        "surgeist-css-generate",
+                        ManifestVersion::new(1).expect("historical schema"),
+                        domain,
+                    )
+                    .expect("historical provenance");
+                    ReportArtifact::new(
+                        provenance,
+                        RelativePath::new(format!("expectations/{output}"))
+                            .expect("historical output path"),
+                        Sha256Digest::from_bytes(format!("output-{index}").as_bytes()),
+                        1,
+                    )
+                    .expect("historical artifact")
+                })
+                .collect::<Vec<_>>();
+            let report = GenerationReport::new(
+                Sha256Digest::from_file(self.corpus.join("corpus.toml"))
+                    .expect("historical manifest digest"),
+                CSSTREE_REPOSITORY,
+                SourceRevision::new(&self.revision).expect("historical revision"),
+                GenerationCounts::new(paths.len(), 0, 0, 0, 0).expect("historical counts"),
+                artifacts,
+            )
+            .expect("structurally canonical historical report");
+            let mut bytes =
+                serde_json::to_vec_pretty(&report).expect("serialize historical report");
+            bytes.push(b'\n');
+            fs::write(
+                self.corpus.join("expectations/generation-reports/all.json"),
+                bytes,
+            )
+            .expect("replace historical report");
         }
     }
 
@@ -1266,6 +1332,46 @@ mod imports {
     }
 
     #[test]
+    fn css_expectation_hash_label_and_strict_hash_source_path_golden() {
+        let source =
+            b"{\"before#/middle/#after\":{\"source\":\"a {}\",\"ast\":{},\"generate\":\"a{}\"}}\n";
+        let fixture = imported_generation_fixture("hash#context/Fixture#.json", source, 1, &[]);
+        fixture.generate().expect("generate hash-label expectation");
+
+        let source_digest = Sha256Digest::from_bytes(source);
+        let sidecar_digest = Sha256Digest::from_bytes(fixture.sidecar());
+        let expected = format!(
+            "{{\n  \"schema_version\": 1,\n  \"generator\": \"surgeist-css-generate\",\n  \"source\": \"source/hash#context/Fixture#.json\",\n  \"source_sha256\": \"{source_digest}\",\n  \"source_revision\": \"{}\",\n  \"import_provenance_sha256\": \"{sidecar_digest}\",\n  \"cases\": [\n    {{\n      \"id\": \"hash#context/Fixture#.json#/before#~1middle~1#after\",\n      \"context\": \"hash#context\",\n      \"label\": \"before#/middle/#after\",\n      \"input\": \"a {{}}\",\n      \"upstream_outcome\": \"parsed\",\n      \"canonical_css\": \"a{{}}\",\n      \"status\": \"active\"\n    }}\n  ]\n}}\n",
+            fixture.revision
+        );
+        assert_eq!(
+            fixture.expectation("hash#context/Fixture#.json"),
+            expected.as_bytes()
+        );
+    }
+
+    #[test]
+    fn css_expectation_hash_case_id_matches_override_disposition() {
+        let id = "hash#context/Fixture#.json#/before#~1middle~1#after";
+        let fixture = imported_generation_fixture(
+            "hash#context/Fixture#.json",
+            b"{\"before#/middle/#after\":{\"source\":\"a {}\",\"ast\":{}}}\n",
+            1,
+            &[(id, "unsupported", Some("hash-label override"))],
+        );
+        fixture
+            .generate()
+            .expect("generate overridden hash-label case");
+
+        let expectation: serde_json::Value =
+            serde_json::from_slice(&fixture.expectation("hash#context/Fixture#.json"))
+                .expect("hash-label expectation JSON");
+        assert_eq!(expectation["cases"][0]["id"], id);
+        assert_eq!(expectation["cases"][0]["status"], "unsupported");
+        assert_eq!(expectation["cases"][0]["reason"], "hash-label override");
+    }
+
+    #[test]
     fn css_expectation_duplicate_decoded_members_at_every_depth_are_rejected() {
         let fixtures: &[&[u8]] = &[
             b"{\"\\u0063ase\":{\"source\":\"a\",\"ast\":{}},\"case\":{\"source\":\"b\",\"ast\":{}}}\n",
@@ -1559,6 +1665,76 @@ mod imports {
         assert_eq!(
             snapshot_tree(&malformed.corpus.join("expectations")),
             before
+        );
+    }
+
+    fn assert_historical_path_collision_is_pre_lease(
+        source_paths: (&str, &str),
+        output_paths: (&str, &str),
+        expected_detail: &str,
+    ) {
+        let fixture = imported_generation_fixture(
+            "seed/Case.json",
+            b"{\"case\":{\"source\":\"seed\",\"ast\":{}}}\n",
+            1,
+            &[],
+        );
+        fixture.generate().expect("seed existing publication");
+        fixture.replace_historical_report(&[
+            (source_paths.0, output_paths.0),
+            (source_paths.1, output_paths.1),
+        ]);
+        let expectation_root = fixture.corpus.join("expectations");
+        let report_path = expectation_root.join("generation-reports/all.json");
+        let before_bytes = snapshot_tree(&expectation_root);
+        let before_root_identity = path_identity(&expectation_root);
+        let before_report_identity = path_identity(&report_path);
+        let pre_lease_reached = Cell::new(false);
+
+        let error = full_generation::run_with_pre_lease_hook(&fixture.generate_request(), || {
+            pre_lease_reached.set(true)
+        })
+        .expect_err("colliding historical paths must be rejected");
+
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert!(
+            error.to_string().contains(expected_detail),
+            "unexpected collision diagnostic: {error}"
+        );
+        assert!(
+            !pre_lease_reached.get(),
+            "historical path collision reached lease acquisition"
+        );
+        assert_eq!(snapshot_tree(&expectation_root), before_bytes);
+        assert_eq!(path_identity(&expectation_root), before_root_identity);
+        assert_eq!(path_identity(&report_path), before_report_identity);
+        assert_no_import_intent_journal_or_stage(&fixture);
+    }
+
+    #[test]
+    fn css_historical_inventory_rejects_source_ancestor_collision_before_lease_or_intent() {
+        assert_historical_path_collision_is_pre_lease(
+            ("a.json", "a.json/b.json"),
+            ("one.json", "two.json"),
+            "historical source paths collide",
+        );
+    }
+
+    #[test]
+    fn css_historical_inventory_rejects_output_ancestor_collision_before_lease_or_intent() {
+        assert_historical_path_collision_is_pre_lease(
+            ("one.json", "two.json"),
+            ("a.json", "a.json/b.json"),
+            "historical output paths collide",
+        );
+    }
+
+    #[test]
+    fn css_historical_inventory_rejects_aligned_ancestor_collision_without_publication() {
+        assert_historical_path_collision_is_pre_lease(
+            ("a.json", "a.json/b.json"),
+            ("a.json", "a.json/b.json"),
+            "historical source paths collide",
         );
     }
 

@@ -24,6 +24,8 @@ pub(crate) use artifact::{
     ArtifactPlan, ArtifactReservation, PublicationInventory, PublicationPolicy,
 };
 #[cfg(feature = "css-corpus")]
+pub(crate) use case::{validate_disposition_reason, validate_json_case_id_syntax};
+#[cfg(feature = "css-corpus")]
 pub(crate) use coordination::Domain;
 #[cfg(feature = "css-corpus")]
 pub(crate) use fs::{CORPUS_FILE_MODE, NodeKind, RootedFs};
