@@ -1715,6 +1715,26 @@ struct OwnerVisibility {
     identity: Option<HeldIdentity>,
 }
 
+#[derive(Clone, Debug)]
+struct OwnerTemporaryEvidence {
+    name: String,
+    identity: HeldIdentity,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OwnerTemporaryContext<'a> {
+    token: &'a str,
+    intent: &'a OwnerIntent,
+    registration: Option<&'a HeldIdentity>,
+    prepared: Option<&'a Sha256Digest>,
+    stage_identity: Option<&'a HeldIdentity>,
+    stage_digest: Option<&'a Sha256Digest>,
+    existing_outcome: Option<OwnerOutcomeKind>,
+    expected_outcome: OwnerOutcomeKind,
+    visibility: &'a OwnerVisibility,
+}
+
 fn install_owner_record(
     rooted: &RootedFs,
     location: &CorpusLocation,
@@ -1942,7 +1962,6 @@ fn recover_owner_transactions(
             continue;
         }
         if !rooted.exists(&format!("{active}/intent.json"))? {
-            let expected = format!("intent-{token}.tmp");
             if names.len() == 1 && matches!(names[0].as_str(), "committed" | "aborted") {
                 validate_standalone_owner_outcome(
                     rooted,
@@ -1962,29 +1981,15 @@ fn recover_owner_transactions(
                 )?;
                 continue;
             }
-            if names.iter().any(|member| member != &expected) {
-                return Err(transaction_error(
-                    "recover owner transaction",
-                    "owner journal has unknown pre-intent state",
-                ));
-            }
-            for member in names {
-                let path = format!("{active}/{member}");
-                let identity = rooted.identity_at(&path)?.ok_or_else(|| {
-                    transaction_error("recover owner transaction", "intent temp disappeared")
-                })?;
-                if identity.kind() != NodeKind::Regular
-                    || identity.mode() != PRIVATE_FILE_MODE
-                    || identity.link_count() != Some(1)
-                {
-                    return Err(transaction_error(
-                        "recover owner transaction",
-                        "owner intent temp has the wrong type or mode",
-                    ));
-                }
-                rooted.remove_file_exact(&path, &identity)?;
-            }
-            rooted.remove_dir_exact(&active, &active_identity)?;
+            recover_pre_intent_owner_journal(
+                rooted,
+                domain,
+                authority_key,
+                token,
+                &active,
+                &active_identity,
+                &names,
+            )?;
             continue;
         }
         let intent: OwnerIntent = serde_json::from_slice(
@@ -2099,15 +2104,9 @@ fn recover_owner_transactions(
                 "owner prepared marker differs from its registration",
             ));
         }
-        let owner_identity = rooted.identity_at(&intent.owner_path)?;
-        let owner_digest = owner_identity
-            .as_ref()
-            .map(|_| {
-                rooted
-                    .read_file(&intent.owner_path, PRIVATE_FILE_MODE)
-                    .map(Sha256Digest::from_bytes)
-            })
-            .transpose()?;
+        let visibility = read_owner_visibility(rooted, &intent.owner_path)?;
+        let owner_identity = visibility.identity.clone();
+        let owner_digest = visibility.digest.clone();
         let stage_identity = rooted.identity_at(&intent.stage_path)?;
         let stage_digest = stage_identity
             .as_ref()
@@ -2118,10 +2117,6 @@ fn recover_owner_transactions(
             })
             .transpose()?;
         let existing_outcome = existing_owner_outcome(rooted, &active)?;
-        let visibility = OwnerVisibility {
-            digest: owner_digest.clone(),
-            identity: owner_identity.clone(),
-        };
         if let Some(outcome) = existing_outcome {
             validate_existing_owner_outcome(
                 rooted,
@@ -2152,7 +2147,7 @@ fn recover_owner_transactions(
                     _ => false,
                 },
             };
-        if owner_matches_new {
+        let (outcome, removable_stage) = if owner_matches_new {
             if existing_outcome.is_none() {
                 if registration.is_none() {
                     return Err(transaction_error(
@@ -2197,17 +2192,7 @@ fn recover_owner_transactions(
                     ));
                 }
             };
-            ensure_owner_outcome(
-                rooted,
-                &active,
-                token,
-                &intent,
-                OwnerOutcomeKind::Committed,
-                visibility.clone(),
-            )?;
-            if let Some(old_stage) = old_stage {
-                rooted.remove_file_exact(&intent.stage_path, old_stage)?;
-            }
+            (OwnerOutcomeKind::Committed, old_stage.cloned())
         } else if owner_matches_old {
             let removable_stage = if let (Some(stage_digest), Some(actual)) =
                 (stage_digest.as_ref(), stage_identity.as_ref())
@@ -2247,22 +2232,34 @@ fn recover_owner_transactions(
             } else {
                 None
             };
-            ensure_owner_outcome(
-                rooted,
-                &active,
-                token,
-                &intent,
-                OwnerOutcomeKind::Aborted,
-                visibility,
-            )?;
-            if let Some(actual) = removable_stage {
-                rooted.remove_file_exact(&intent.stage_path, actual)?;
-            }
+            (OwnerOutcomeKind::Aborted, removable_stage.cloned())
         } else {
             return Err(transaction_error(
                 "recover owner transaction",
                 "owner/stage contents match neither durable outcome",
             ));
+        };
+        let temporaries = validate_owner_transaction_temporaries(
+            rooted,
+            &active,
+            &names,
+            OwnerTemporaryContext {
+                token,
+                intent: &intent,
+                registration: registration.as_ref(),
+                prepared: prepared.as_ref(),
+                stage_identity: stage_identity.as_ref(),
+                stage_digest: stage_digest.as_ref(),
+                existing_outcome,
+                expected_outcome: outcome,
+                visibility: &visibility,
+            },
+        )?;
+        validate_owner_visibility(rooted, &intent.owner_path, &visibility)?;
+        remove_owner_temporaries(rooted, &active, &active_identity, &names, &temporaries)?;
+        ensure_owner_outcome(rooted, &active, token, &intent, outcome, visibility)?;
+        if let Some(actual) = removable_stage {
+            rooted.remove_file_exact(&intent.stage_path, &actual)?;
         }
         cleanup_owner_journal(
             rooted,
@@ -2272,6 +2269,341 @@ fn recover_owner_transactions(
             &active,
             active_identity,
         )?;
+    }
+    Ok(())
+}
+
+fn recover_pre_intent_owner_journal(
+    rooted: &RootedFs,
+    domain: Domain,
+    authority_key: &str,
+    token: &str,
+    active: &str,
+    active_identity: &HeldIdentity,
+    names: &[String],
+) -> Result<()> {
+    let temporary_name = format!("intent-{token}.tmp");
+    if names != [temporary_name.as_str()] {
+        return Err(transaction_error(
+            "recover owner transaction",
+            "owner journal has unknown pre-intent state",
+        ));
+    }
+    validate_owner_cleanup_journal_identity(rooted, active, active_identity)?;
+    let owner_path = owner_path(domain);
+    let visibility = read_owner_visibility(rooted, &owner_path)?;
+    let evidence = read_owner_temporary(rooted, active, &temporary_name)?;
+    validate_owner_intent_temporary_prefix(
+        &evidence,
+        authority_key,
+        token,
+        &owner_path,
+        &format!("{active}/owner.stage"),
+        &visibility,
+    )?;
+
+    validate_owner_visibility(rooted, &owner_path, &visibility)?;
+    validate_owner_cleanup_journal_identity(rooted, active, active_identity)?;
+    if rooted.list_dir(active)? != names {
+        return Err(transaction_error(
+            "recover owner transaction",
+            "owner pre-intent inventory changed during validation",
+        ));
+    }
+    revalidate_owner_temporary(rooted, active, &evidence)?;
+    rooted.remove_file_exact(&format!("{active}/{}", evidence.name), &evidence.identity)?;
+    validate_owner_cleanup_journal_identity(rooted, active, active_identity)?;
+    if !rooted.list_dir(active)?.is_empty() {
+        return Err(transaction_error(
+            "recover owner transaction",
+            "owner pre-intent journal changed before removal",
+        ));
+    }
+    rooted.remove_dir_exact(active, active_identity)
+}
+
+fn validate_owner_transaction_temporaries(
+    rooted: &RootedFs,
+    active: &str,
+    names: &[String],
+    context: OwnerTemporaryContext<'_>,
+) -> Result<Vec<OwnerTemporaryEvidence>> {
+    let OwnerTemporaryContext {
+        token,
+        intent,
+        registration,
+        prepared,
+        stage_identity,
+        stage_digest,
+        existing_outcome,
+        expected_outcome,
+        visibility,
+    } = context;
+    let intent_temporary = format!("intent-{token}.tmp");
+    let registration_temporary = format!("stage-registration-{token}.tmp");
+    let prepared_temporary = format!("prepared-{token}.tmp");
+    let committed_temporary = format!("committed-{token}.tmp");
+    let aborted_temporary = format!("aborted-{token}.tmp");
+    let temporary_names: Vec<_> = names
+        .iter()
+        .filter(|name| {
+            matches!(
+                name.as_str(),
+                candidate
+                    if candidate == intent_temporary
+                        || candidate == registration_temporary
+                        || candidate == prepared_temporary
+                        || candidate == committed_temporary
+                        || candidate == aborted_temporary
+            )
+        })
+        .collect();
+    if temporary_names.len() > 1 {
+        return Err(transaction_error(
+            "recover owner transaction",
+            "owner journal contains conflicting publication temporaries",
+        ));
+    }
+    let Some(name) = temporary_names.first() else {
+        return Ok(Vec::new());
+    };
+    if name.as_str() == intent_temporary {
+        return Err(transaction_error(
+            "recover owner transaction",
+            "published owner intent retains its temporary",
+        ));
+    }
+
+    let evidence = read_owner_temporary(rooted, active, name)?;
+    if name.as_str() == registration_temporary {
+        if registration.is_some() || prepared.is_some() {
+            return Err(transaction_error(
+                "recover owner transaction",
+                "owner stage-registration temporary conflicts with later state",
+            ));
+        }
+        let stage_identity = stage_identity.ok_or_else(|| {
+            transaction_error(
+                "recover owner transaction",
+                "owner stage-registration temporary has no stage",
+            )
+        })?;
+        if stage_digest != Some(&Sha256Digest::from_bytes(b"")) {
+            return Err(transaction_error(
+                "recover owner transaction",
+                "owner stage-registration temporary has a nonempty stage",
+            ));
+        }
+        validate_owner_temporary_prefix(
+            &evidence,
+            &canonical_json(
+                stage_identity,
+                "serialize recovered owner-stage registration",
+            )?,
+        )?;
+    } else if name.as_str() == prepared_temporary {
+        let registration = registration.ok_or_else(|| {
+            transaction_error(
+                "recover owner transaction",
+                "owner prepared temporary has no stage registration",
+            )
+        })?;
+        let stage_identity = stage_identity.ok_or_else(|| {
+            transaction_error(
+                "recover owner transaction",
+                "owner prepared temporary has no stage",
+            )
+        })?;
+        if prepared.is_some()
+            || !registration.matches_recovery(stage_identity)
+            || stage_digest != Some(&intent.new_digest)
+        {
+            return Err(transaction_error(
+                "recover owner transaction",
+                "owner prepared temporary differs from its staged generation",
+            ));
+        }
+        validate_owner_temporary_prefix(
+            &evidence,
+            &canonical_json(
+                &intent.new_digest,
+                "serialize recovered owner prepared marker",
+            )?,
+        )?;
+    } else {
+        if existing_outcome.is_some() {
+            return Err(transaction_error(
+                "recover owner transaction",
+                "published owner outcome retains its temporary marker",
+            ));
+        }
+        let temporary_outcome = if name.as_str() == committed_temporary {
+            OwnerOutcomeKind::Committed
+        } else if name.as_str() == aborted_temporary {
+            OwnerOutcomeKind::Aborted
+        } else {
+            return Err(transaction_error(
+                "recover owner transaction",
+                "owner journal contains an unclassified temporary",
+            ));
+        };
+        if temporary_outcome != expected_outcome {
+            return Err(transaction_error(
+                "recover owner transaction",
+                "owner outcome temporary conflicts with visible state",
+            ));
+        }
+        let marker = expected_owner_outcome(intent, expected_outcome, visibility);
+        validate_owner_temporary_prefix(
+            &evidence,
+            &canonical_json(&marker, "serialize recovered owner outcome")?,
+        )?;
+    }
+    Ok(vec![evidence])
+}
+
+fn remove_owner_temporaries(
+    rooted: &RootedFs,
+    active: &str,
+    active_identity: &HeldIdentity,
+    names: &[String],
+    temporaries: &[OwnerTemporaryEvidence],
+) -> Result<()> {
+    if temporaries.is_empty() {
+        return Ok(());
+    }
+    validate_owner_cleanup_journal_identity(rooted, active, active_identity)?;
+    if rooted.list_dir(active)? != names {
+        return Err(transaction_error(
+            "recover owner transaction",
+            "owner journal inventory changed during temporary validation",
+        ));
+    }
+    for temporary in temporaries {
+        revalidate_owner_temporary(rooted, active, temporary)?;
+    }
+    for temporary in temporaries {
+        revalidate_owner_temporary(rooted, active, temporary)?;
+        rooted.remove_file_exact(&format!("{active}/{}", temporary.name), &temporary.identity)?;
+    }
+    Ok(())
+}
+
+fn read_owner_visibility(rooted: &RootedFs, owner_path: &str) -> Result<OwnerVisibility> {
+    let identity = rooted.identity_at(owner_path)?;
+    validate_recorded_owner_identity(rooted, identity.as_ref())?;
+    let digest = identity
+        .as_ref()
+        .map(|_| {
+            rooted
+                .read_file(owner_path, PRIVATE_FILE_MODE)
+                .map(Sha256Digest::from_bytes)
+        })
+        .transpose()?;
+    Ok(OwnerVisibility { digest, identity })
+}
+
+fn read_owner_temporary(
+    rooted: &RootedFs,
+    active: &str,
+    name: &str,
+) -> Result<OwnerTemporaryEvidence> {
+    let path = format!("{active}/{name}");
+    let identity = rooted.identity_at(&path)?.ok_or_else(|| {
+        transaction_error(
+            "recover owner transaction",
+            format!("owner temporary disappeared: {name}"),
+        )
+    })?;
+    validate_owner_cleanup_member_identity(rooted, name, &identity)?;
+    let bytes = read_owner_cleanup_file(rooted, &path, &identity)?;
+    Ok(OwnerTemporaryEvidence {
+        name: name.to_owned(),
+        identity,
+        bytes,
+    })
+}
+
+fn validate_owner_temporary_prefix(
+    evidence: &OwnerTemporaryEvidence,
+    expected: &[u8],
+) -> Result<()> {
+    if !expected.starts_with(&evidence.bytes) {
+        return Err(transaction_error(
+            "recover owner transaction",
+            format!(
+                "owner temporary is not a canonical publication prefix: {}",
+                evidence.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_owner_intent_temporary_prefix(
+    evidence: &OwnerTemporaryEvidence,
+    authority_key: &str,
+    token: &str,
+    owner_path: &str,
+    stage_path: &str,
+    visibility: &OwnerVisibility,
+) -> Result<()> {
+    let placeholder_digest = Sha256Digest::from_bytes(b"owner intent temporary placeholder");
+    let intent = OwnerIntent {
+        schema_version: 1,
+        authority_key: authority_key.to_owned(),
+        token: token.to_owned(),
+        owner_path: owner_path.to_owned(),
+        stage_path: stage_path.to_owned(),
+        old_digest: visibility.digest.clone(),
+        old_identity: visibility.identity.clone(),
+        new_digest: placeholder_digest.clone(),
+    };
+    let template = canonical_json(&intent, "serialize recovered owner intent")?;
+    let digest = placeholder_digest.as_str().as_bytes();
+    let digest_start = template
+        .windows(digest.len())
+        .rposition(|window| window == digest)
+        .ok_or_else(|| {
+            transaction_error(
+                "recover owner transaction",
+                "canonical owner intent omitted its new digest",
+            )
+        })?;
+    let digest_end = digest_start + digest.len();
+    let actual = &evidence.bytes;
+    let valid = actual.len() <= template.len()
+        && actual[..actual.len().min(digest_start)] == template[..actual.len().min(digest_start)]
+        && (actual.len() <= digest_start
+            || actual[digest_start..actual.len().min(digest_end)]
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)))
+        && (actual.len() <= digest_end
+            || actual[digest_end..] == template[digest_end..actual.len()]);
+    if !valid {
+        return Err(transaction_error(
+            "recover owner transaction",
+            "owner intent temporary is not a canonical token-bound publication prefix",
+        ));
+    }
+    Ok(())
+}
+
+fn revalidate_owner_temporary(
+    rooted: &RootedFs,
+    active: &str,
+    evidence: &OwnerTemporaryEvidence,
+) -> Result<()> {
+    let path = format!("{active}/{}", evidence.name);
+    let bytes = read_owner_cleanup_file(rooted, &path, &evidence.identity)?;
+    if bytes != evidence.bytes {
+        return Err(transaction_error(
+            "recover owner transaction",
+            format!(
+                "owner temporary changed after validation: {}",
+                evidence.name
+            ),
+        ));
     }
     Ok(())
 }
@@ -2496,24 +2828,19 @@ fn ensure_owner_outcome(
     }
     let temporary_name = format!("{name}-{token}.tmp");
     let temporary = format!("{active}/{temporary_name}");
-    if let Some(identity) = rooted.identity_at(&temporary)? {
-        if identity.kind() != NodeKind::Regular
-            || identity.mode() != PRIVATE_FILE_MODE
-            || identity.link_count() != Some(1)
-        {
-            return Err(transaction_error(
-                "recover owner transaction",
-                "owner outcome temporary has the wrong policy",
-            ));
-        }
-        rooted.remove_file_exact(&temporary, &identity)?;
-    }
     let marker = expected_owner_outcome(intent, outcome, &visibility);
+    let marker_bytes = canonical_json(&marker, "serialize recovered owner outcome")?;
+    if rooted.identity_at(&temporary)?.is_some() {
+        let evidence = read_owner_temporary(rooted, active, &temporary_name)?;
+        validate_owner_temporary_prefix(&evidence, &marker_bytes)?;
+        revalidate_owner_temporary(rooted, active, &evidence)?;
+        rooted.remove_file_exact(&temporary, &evidence.identity)?;
+    }
     rooted.publish_file_exclusive(
         active,
         name,
         &temporary_name,
-        &canonical_json(&marker, "serialize recovered owner outcome")?,
+        &marker_bytes,
         PRIVATE_FILE_MODE,
     )?;
     Ok(())
@@ -2655,18 +2982,12 @@ fn validate_owner_cleanup(
     let has_intent = names.iter().any(|name| name == "intent.json");
     let has_registration = names.iter().any(|name| name == "stage-registration.json");
     let has_prepared = names.iter().any(|name| name == "prepared.json");
-    let registration_temporary = format!("stage-registration-{token}.tmp");
-    let prepared_temporary = format!("prepared-{token}.tmp");
-    let has_registration_temporary = names.iter().any(|name| name == &registration_temporary);
-    let has_prepared_temporary = names.iter().any(|name| name == &prepared_temporary);
 
     for name in &names {
         if !matches!(
             name.as_str(),
             "intent.json" | "stage-registration.json" | "prepared.json" | "aborted" | "committed"
-        ) && name != &registration_temporary
-            && name != &prepared_temporary
-        {
+        ) {
             return Err(transaction_error(
                 "clean private journal",
                 format!("owner journal contains an unexpected cleanup member: {name}"),
@@ -2683,26 +3004,6 @@ fn validate_owner_cleanup(
         return Err(transaction_error(
             "clean private journal",
             "owner prepared marker has no stage registration",
-        ));
-    }
-    if outcome == OwnerOutcomeKind::Committed
-        && (has_registration_temporary || has_prepared_temporary)
-    {
-        return Err(transaction_error(
-            "clean private journal",
-            "committed owner cleanup retains a publication temporary",
-        ));
-    }
-    if has_registration_temporary && (has_registration || has_prepared || has_prepared_temporary) {
-        return Err(transaction_error(
-            "clean private journal",
-            "owner stage-registration temporary conflicts with later state",
-        ));
-    }
-    if has_prepared_temporary && (!has_registration || has_prepared) {
-        return Err(transaction_error(
-            "clean private journal",
-            "owner prepared temporary conflicts with its registration",
         ));
     }
 
@@ -2772,11 +3073,7 @@ fn validate_owner_cleanup(
         }
     }
 
-    let mut removal_names: Vec<_> = names
-        .iter()
-        .filter(|name| name.ends_with(".tmp"))
-        .cloned()
-        .collect();
+    let mut removal_names = Vec::new();
     for name in ["prepared.json", "stage-registration.json", "intent.json"] {
         if names.iter().any(|member| member == name) {
             removal_names.push(name.to_owned());
@@ -4552,6 +4849,68 @@ mod tests {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn assert_corrupt_owner_install_temporary_preserved(
+        initial: InitialOwner,
+        temporary_name: &str,
+    ) {
+        let trace = record_owner_install_trace(initial);
+        let fixture = OwnerFixture::new(initial);
+        let temporary = format!("{}/{}", fixture.active_path(), temporary_name);
+        let event_index = *event_indices(
+            &trace,
+            DurabilityPhase::OwnerInstall,
+            DurabilityPrimitive::WritePartial,
+            &temporary,
+        )
+        .first()
+        .expect("owner install records a temporary write prefix");
+        interrupt_owner_install(&fixture, &trace, event_index);
+        corrupt_file(
+            &fixture.corpus.join(&temporary),
+            b"corrupt owner publication temporary\n",
+        );
+        assert_owner_corruption_preserved(&fixture, temporary_name);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn assert_corrupt_owner_outcome_temporary_preserved(committed: bool) {
+        let install_trace = record_owner_install_trace(InitialOwner::Old);
+        let seed = OwnerRecoverySeed {
+            initial: InitialOwner::Old,
+            committed,
+        };
+        let recovery_trace = record_owner_recovery_trace(seed, &install_trace);
+        let fixture = OwnerFixture::new(seed.initial);
+        seed_owner_recovery(&fixture, &install_trace, committed);
+        let outcome = if committed { "committed" } else { "aborted" };
+        let temporary = format!(
+            "{}/{outcome}-{OWNER_INSTALL_TOKEN}.tmp",
+            fixture.active_path()
+        );
+        let event_index = *event_indices(
+            &recovery_trace,
+            DurabilityPhase::OwnerRecovery,
+            DurabilityPrimitive::WritePartial,
+            &temporary,
+        )
+        .first()
+        .expect("owner recovery records an outcome write prefix");
+        let observer = RootedObserver::interrupt_after(event_index);
+        expect_interruption(|| fixture.recover(Some(observer.clone())));
+        assert_event_prefix(
+            &observer,
+            &recovery_trace,
+            event_index,
+            "owner outcome recovery",
+        );
+        corrupt_file(
+            &fixture.corpus.join(&temporary),
+            b"corrupt owner outcome temporary\n",
+        );
+        assert_owner_corruption_preserved(&fixture, outcome);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn seed_historical_acquisition(fixture: &OwnerFixture) -> Vec<u8> {
         let guard = acquire_exclusive(
             &fixture.location,
@@ -4763,6 +5122,45 @@ mod tests {
                 "direct owner cleanup did not preserve the complete {initial:?} journal"
             );
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn owner_temporary_corruption_preserves_intent_evidence() {
+        assert_corrupt_owner_install_temporary_preserved(
+            InitialOwner::Absent,
+            &format!("intent-{OWNER_INSTALL_TOKEN}.tmp"),
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn owner_temporary_corruption_preserves_registration_evidence() {
+        assert_corrupt_owner_install_temporary_preserved(
+            InitialOwner::Absent,
+            &format!("stage-registration-{OWNER_INSTALL_TOKEN}.tmp"),
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn owner_temporary_corruption_preserves_prepared_evidence() {
+        assert_corrupt_owner_install_temporary_preserved(
+            InitialOwner::Old,
+            &format!("prepared-{OWNER_INSTALL_TOKEN}.tmp"),
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn owner_temporary_corruption_preserves_aborted_outcome_evidence() {
+        assert_corrupt_owner_outcome_temporary_preserved(false);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn owner_temporary_corruption_preserves_committed_outcome_evidence() {
+        assert_corrupt_owner_outcome_temporary_preserved(true);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
