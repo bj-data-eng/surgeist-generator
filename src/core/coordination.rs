@@ -1892,11 +1892,11 @@ fn recover_probe_journals_inner(
             }
             plan.revalidate(rooted, &active)?;
             let member_path = format!("{active}/{}", member.name);
-            match member.kind {
-                ProbeMemberKind::File => {
+            match member.evidence {
+                ProbeRecoveryMemberEvidence::File(_) => {
                     rooted.remove_file_exact(&member_path, &member.identity)?;
                 }
-                ProbeMemberKind::Directory => {
+                ProbeRecoveryMemberEvidence::Directory(_) => {
                     rooted.remove_dir_exact(&member_path, &member.identity)?;
                 }
             }
@@ -1944,18 +1944,17 @@ struct ProbeIntent {
     journal_identity: HeldIdentity,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProbeMemberKind {
-    File,
-    Directory,
+#[derive(Clone, Debug)]
+enum ProbeRecoveryMemberEvidence {
+    File(Vec<u8>),
+    Directory(Vec<String>),
 }
 
 #[derive(Clone, Debug)]
 struct ProbeRecoveryMember {
     name: String,
     identity: HeldIdentity,
-    kind: ProbeMemberKind,
-    bytes: Option<Vec<u8>>,
+    evidence: ProbeRecoveryMemberEvidence,
 }
 
 #[derive(Clone, Debug)]
@@ -2075,16 +2074,19 @@ impl ProbeRecoveryPlan {
                 members.push(ProbeRecoveryMember {
                     name,
                     identity,
-                    kind: ProbeMemberKind::File,
-                    bytes: Some(bytes),
+                    evidence: ProbeRecoveryMemberEvidence::File(bytes),
                 });
             } else {
-                validate_probe_directory_identity(rooted, &identity)?;
+                let directory_inventory = capture_empty_probe_directory_inventory(
+                    rooted,
+                    &path,
+                    &identity,
+                    "recover rename capability probe",
+                )?;
                 members.push(ProbeRecoveryMember {
                     name,
                     identity,
-                    kind: ProbeMemberKind::Directory,
-                    bytes: None,
+                    evidence: ProbeRecoveryMemberEvidence::Directory(directory_inventory),
                 });
             }
         }
@@ -2140,17 +2142,10 @@ impl ProbeRecoveryPlan {
                     ),
                 ));
             }
-            match member.kind {
-                ProbeMemberKind::File => {
+            match &member.evidence {
+                ProbeRecoveryMemberEvidence::File(bytes) => {
                     validate_probe_file_identity(rooted, &actual)?;
-                    if rooted.read_file(&path, PRIVATE_FILE_MODE)?
-                        != *member.bytes.as_ref().ok_or_else(|| {
-                            transaction_error(
-                                "recover rename capability probe",
-                                "probe file plan has no captured bytes",
-                            )
-                        })?
-                    {
+                    if rooted.read_file(&path, PRIVATE_FILE_MODE)? != *bytes {
                         return Err(transaction_error(
                             "recover rename capability probe",
                             format!(
@@ -2160,8 +2155,14 @@ impl ProbeRecoveryPlan {
                         ));
                     }
                 }
-                ProbeMemberKind::Directory => {
-                    validate_probe_directory_identity(rooted, &actual)?;
+                ProbeRecoveryMemberEvidence::Directory(inventory) => {
+                    validate_probe_directory_inventory(
+                        rooted,
+                        &path,
+                        &actual,
+                        inventory,
+                        "recover rename capability probe",
+                    )?;
                 }
             }
         }
@@ -2208,6 +2209,40 @@ fn validate_probe_directory_identity(rooted: &RootedFs, identity: &HeldIdentity)
     Ok(())
 }
 
+fn capture_empty_probe_directory_inventory(
+    rooted: &RootedFs,
+    path: &str,
+    identity: &HeldIdentity,
+    operation: &str,
+) -> Result<Vec<String>> {
+    validate_probe_directory_identity(rooted, identity)?;
+    let inventory = rooted.list_dir(path)?;
+    if !inventory.is_empty() {
+        return Err(transaction_error(
+            operation,
+            format!("probe directory contains unknown nested evidence: {path}"),
+        ));
+    }
+    Ok(inventory)
+}
+
+fn validate_probe_directory_inventory(
+    rooted: &RootedFs,
+    path: &str,
+    identity: &HeldIdentity,
+    expected_inventory: &[String],
+    operation: &str,
+) -> Result<()> {
+    validate_probe_directory_identity(rooted, identity)?;
+    if rooted.list_dir(path)? != expected_inventory {
+        return Err(transaction_error(
+            operation,
+            format!("probe directory inventory changed after classification: {path}"),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_probe_file_identity(rooted: &RootedFs, identity: &HeldIdentity) -> Result<()> {
     if identity.kind() != NodeKind::Regular
         || identity.mode() != PRIVATE_FILE_MODE
@@ -2224,11 +2259,34 @@ fn validate_probe_file_identity(rooted: &RootedFs, identity: &HeldIdentity) -> R
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ProbeInstallMember<'a> {
     name: &'a str,
     path: &'a str,
     identity: &'a HeldIdentity,
+    directory_inventory: Vec<String>,
+}
+
+impl<'a> ProbeInstallMember<'a> {
+    fn capture(
+        rooted: &RootedFs,
+        name: &'a str,
+        path: &'a str,
+        identity: &'a HeldIdentity,
+    ) -> Result<Self> {
+        let directory_inventory = capture_empty_probe_directory_inventory(
+            rooted,
+            path,
+            identity,
+            "classify rename capability probe cleanup",
+        )?;
+        Ok(Self {
+            name,
+            path,
+            identity,
+            directory_inventory,
+        })
+    }
 }
 
 fn probe_rename_flags_journaled(
@@ -2248,16 +2306,8 @@ fn probe_rename_flags_journaled(
     let left_identity = rooted.create_dir_exclusive(&left, PRIVATE_DIRECTORY_MODE)?;
     let right_identity = rooted.create_dir_exclusive(&right, PRIVATE_DIRECTORY_MODE)?;
     let before_exclusive = [
-        ProbeInstallMember {
-            name: &left_name,
-            path: &left,
-            identity: &left_identity,
-        },
-        ProbeInstallMember {
-            name: &right_name,
-            path: &right,
-            identity: &right_identity,
-        },
+        ProbeInstallMember::capture(rooted, &left_name, &left, &left_identity)?,
+        ProbeInstallMember::capture(rooted, &right_name, &right, &right_identity)?,
     ];
 
     #[cfg(test)]
@@ -2289,16 +2339,8 @@ fn probe_rename_flags_journaled(
     }
 
     let before_swap = [
-        ProbeInstallMember {
-            name: &moved_name,
-            path: &moved,
-            identity: &left_identity,
-        },
-        ProbeInstallMember {
-            name: &right_name,
-            path: &right,
-            identity: &right_identity,
-        },
+        ProbeInstallMember::capture(rooted, &moved_name, &moved, &left_identity)?,
+        ProbeInstallMember::capture(rooted, &right_name, &right, &right_identity)?,
     ];
     #[cfg(test)]
     if control
@@ -2329,16 +2371,8 @@ fn probe_rename_flags_journaled(
     }
 
     let after_swap = [
-        ProbeInstallMember {
-            name: &right_name,
-            path: &right,
-            identity: &left_identity,
-        },
-        ProbeInstallMember {
-            name: &moved_name,
-            path: &moved,
-            identity: &right_identity,
-        },
+        ProbeInstallMember::capture(rooted, &right_name, &right, &left_identity)?,
+        ProbeInstallMember::capture(rooted, &moved_name, &moved, &right_identity)?,
     ];
     cleanup_probe_members(
         rooted,
@@ -2392,12 +2426,13 @@ fn cleanup_probe_members(
     members: &[ProbeInstallMember<'_>],
     #[cfg(test)] mut control: Option<&mut ProbeInstallControl>,
 ) -> Result<()> {
+    validate_probe_install_members(rooted, intent, intent_bytes, members)?;
     for (index, member) in members.iter().enumerate() {
-        validate_probe_install_members(rooted, intent, intent_bytes, &members[index..])?;
         #[cfg(test)]
         if let Some(control) = control.as_deref_mut() {
             control.before_cleanup(member.path)?;
         }
+        validate_probe_install_members(rooted, intent, intent_bytes, &members[index..])?;
         rooted.remove_dir_exact(member.path, member.identity)?;
     }
     validate_probe_install_members(rooted, intent, intent_bytes, &[])?;
@@ -2463,13 +2498,19 @@ fn validate_probe_install_members(
                 format!("probe member disappeared: {}", member.name),
             )
         })?;
-        validate_probe_directory_identity(rooted, &actual)?;
         if !member.identity.matches_recovery(&actual) {
             return Err(transaction_error(
                 "validate rename capability probe cleanup",
                 format!("probe member identity changed: {}", member.name),
             ));
         }
+        validate_probe_directory_inventory(
+            rooted,
+            member.path,
+            &actual,
+            &member.directory_inventory,
+            "validate rename capability probe cleanup",
+        )?;
     }
     Ok(())
 }
@@ -5297,7 +5338,7 @@ mod tests {
     use super::{BootstrapProtocol, BootstrapStep, Domain, LOCK_HEADER};
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use std::fs::{self, File};
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -5323,11 +5364,13 @@ mod tests {
         COORDINATION_ROOT, CoordinationAccess, CoordinationGuard, LeaseMetadata,
         OWNER_TRANSACTIONS, OwnerCleanupControl, OwnerOutcomeKind, OwnerOutcomeMarker, OwnerRecord,
         OwnerRecordStamp, OwnerRecoveryControl, ProbeCapabilityFault, ProbeInstallControl,
-        ProbeRecoveryControl, acquire_exclusive, acquire_shared_check, canonical_json,
-        cleanup_owner_journal, cleanup_owner_journal_controlled, corpus_authority_key,
-        install_owner_record_bytes, install_owner_record_controlled, mutex_path,
-        open_existing_lock, open_or_bootstrap_lock, open_or_bootstrap_lock_controlled, owner_path,
-        process_is_live, recover_bootstrap_controlled, recover_owner_transactions,
+        ProbeInstallMember, ProbeIntent, ProbeRecoveryControl, ProbeRecoveryPlan,
+        acquire_exclusive, acquire_shared_check, canonical_json, cleanup_owner_journal,
+        cleanup_owner_journal_controlled, corpus_authority_key, finish_probe_capability_failure,
+        injected_probe_capability_error, install_owner_record_bytes,
+        install_owner_record_controlled, mutex_path, open_existing_lock, open_or_bootstrap_lock,
+        open_or_bootstrap_lock_controlled, owner_path, process_is_live,
+        recover_bootstrap_controlled, recover_owner_transactions,
         recover_owner_transactions_controlled, recover_probe_journals,
         recover_probe_journals_controlled, run_rename_probe, run_rename_probe_controlled,
     };
@@ -8484,6 +8527,14 @@ mod tests {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ProbeEvidenceSnapshot {
+        root_identity: HeldIdentity,
+        entries: BTreeMap<PathBuf, SnapshotEntry>,
+        identities: BTreeMap<PathBuf, HeldIdentity>,
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl ProbeFixture {
         fn new() -> Self {
             let owner = OwnerFixture::new(InitialOwner::Old);
@@ -8582,6 +8633,27 @@ mod tests {
             run_rename_probe(&self.rooted(), Domain::Layout, LATER_PROBE_TOKEN)
                 .expect("subsequent production rename probe");
             self.assert_clean();
+        }
+
+        fn evidence_snapshot(&self) -> ProbeEvidenceSnapshot {
+            let rooted = self.rooted();
+            let entries = snapshot(&self.owner.corpus);
+            let identities = entries
+                .keys()
+                .map(|path| {
+                    let relative = path.to_str().expect("probe snapshot path is UTF-8");
+                    let identity = rooted
+                        .identity_at(relative)
+                        .expect("inspect probe snapshot identity")
+                        .expect("probe snapshot entry remains present");
+                    (path.clone(), identity)
+                })
+                .collect();
+            ProbeEvidenceSnapshot {
+                root_identity: rooted.identity().clone(),
+                entries,
+                identities,
+            }
         }
     }
 
@@ -8720,6 +8792,314 @@ mod tests {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    enum ProbeRecoverySeedStage {
+        JournalBeforeIntent,
+        IntentTemporaryPrefix,
+        IntentBeforeProbeMembers,
+        PreExclusiveLeftOnly,
+        PreExclusiveLeftRight,
+        PostExclusiveMovedIsLeftRightIsRight,
+        PostSwapMovedIsRightRightIsLeft,
+        PostSwapMovedIsRight,
+        IntentAfterProbeMembers,
+        JournalAfterIntent,
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl ProbeRecoverySeedStage {
+        fn label(self) -> &'static str {
+            match self {
+                Self::JournalBeforeIntent => "journal-before-intent",
+                Self::IntentTemporaryPrefix => "intent-publication-temporary-prefix",
+                Self::IntentBeforeProbeMembers => "intent-before-probe-members",
+                Self::PreExclusiveLeftOnly => "pre-exclusive-left-only",
+                Self::PreExclusiveLeftRight => "pre-exclusive-left=left-right=right",
+                Self::PostExclusiveMovedIsLeftRightIsRight => {
+                    "post-exclusive-moved=left-right=right"
+                }
+                Self::PostSwapMovedIsRightRightIsLeft => "post-swap-moved=right-right=left",
+                Self::PostSwapMovedIsRight => "partial-cleanup-moved=right",
+                Self::IntentAfterProbeMembers => "partial-cleanup-intent-only",
+                Self::JournalAfterIntent => "partial-cleanup-empty-journal",
+            }
+        }
+
+        fn expected_names(self) -> Vec<String> {
+            let intent = "intent.json".to_owned();
+            let temporary = format!("intent-{PROBE_TOKEN}.tmp");
+            let left = format!("probe-left-{PROBE_TOKEN}");
+            let right = format!("probe-right-{PROBE_TOKEN}");
+            let moved = format!("probe-moved-{PROBE_TOKEN}");
+            let mut names = match self {
+                Self::JournalBeforeIntent | Self::JournalAfterIntent => Vec::new(),
+                Self::IntentTemporaryPrefix => vec![temporary],
+                Self::IntentBeforeProbeMembers | Self::IntentAfterProbeMembers => vec![intent],
+                Self::PreExclusiveLeftOnly => vec![intent, left],
+                Self::PreExclusiveLeftRight => vec![intent, left, right],
+                Self::PostExclusiveMovedIsLeftRightIsRight
+                | Self::PostSwapMovedIsRightRightIsLeft => vec![intent, moved, right],
+                Self::PostSwapMovedIsRight => vec![intent, moved],
+            };
+            names.sort();
+            names
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[derive(Clone, Debug)]
+    struct ProbeRecoverySeed {
+        install_event_index: usize,
+        stage: ProbeRecoverySeedStage,
+        label: String,
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    struct ProbeRecoverySeedBoundaries {
+        active_create: usize,
+        intent_temporary_create: usize,
+        intent_publish: usize,
+        left_create: usize,
+        right_create: usize,
+        exclusive_rename: usize,
+        swap_rename: usize,
+        right_remove: usize,
+        moved_remove: usize,
+        intent_remove: usize,
+        active_remove: usize,
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl ProbeRecoverySeedBoundaries {
+        fn capture(trace: &[DurabilityEvent]) -> Self {
+            let active = probe_active_path(PROBE_TOKEN);
+            let intent_temporary = format!("{active}/intent-{PROBE_TOKEN}.tmp");
+            let intent = format!("{active}/intent.json");
+            Self {
+                active_create: one_event_index(
+                    trace,
+                    DurabilityPhase::ProbeInstall,
+                    DurabilityPrimitive::CreateDirectory,
+                    &active,
+                ),
+                intent_temporary_create: one_event_index(
+                    trace,
+                    DurabilityPhase::ProbeInstall,
+                    DurabilityPrimitive::CreateFile,
+                    &intent_temporary,
+                ),
+                intent_publish: one_event_index(
+                    trace,
+                    DurabilityPhase::ProbeInstall,
+                    DurabilityPrimitive::RenameExclusive,
+                    &intent,
+                ),
+                left_create: one_event_index(
+                    trace,
+                    DurabilityPhase::ProbeInstall,
+                    DurabilityPrimitive::CreateDirectory,
+                    &probe_member_path("probe-left"),
+                ),
+                right_create: one_event_index(
+                    trace,
+                    DurabilityPhase::ProbeInstall,
+                    DurabilityPrimitive::CreateDirectory,
+                    &probe_member_path("probe-right"),
+                ),
+                exclusive_rename: one_event_index(
+                    trace,
+                    DurabilityPhase::ProbeInstall,
+                    DurabilityPrimitive::RenameExclusive,
+                    &probe_member_path("probe-moved"),
+                ),
+                swap_rename: one_event_index(
+                    trace,
+                    DurabilityPhase::ProbeInstall,
+                    DurabilityPrimitive::RenameSwap,
+                    &probe_member_path("probe-right"),
+                ),
+                right_remove: one_event_index(
+                    trace,
+                    DurabilityPhase::ProbeInstall,
+                    DurabilityPrimitive::RemoveDirectory,
+                    &probe_member_path("probe-right"),
+                ),
+                moved_remove: one_event_index(
+                    trace,
+                    DurabilityPhase::ProbeInstall,
+                    DurabilityPrimitive::RemoveDirectory,
+                    &probe_member_path("probe-moved"),
+                ),
+                intent_remove: one_event_index(
+                    trace,
+                    DurabilityPhase::ProbeInstall,
+                    DurabilityPrimitive::RemoveFile,
+                    &intent,
+                ),
+                active_remove: one_event_index(
+                    trace,
+                    DurabilityPhase::ProbeInstall,
+                    DurabilityPrimitive::RemoveDirectory,
+                    &active,
+                ),
+            }
+        }
+
+        fn stage(&self, event_index: usize) -> ProbeRecoverySeedStage {
+            assert!(
+                (self.active_create..self.active_remove).contains(&event_index),
+                "probe recovery seed index is outside the active-journal lifetime"
+            );
+            if event_index < self.intent_temporary_create {
+                ProbeRecoverySeedStage::JournalBeforeIntent
+            } else if event_index < self.intent_publish {
+                ProbeRecoverySeedStage::IntentTemporaryPrefix
+            } else if event_index < self.left_create {
+                ProbeRecoverySeedStage::IntentBeforeProbeMembers
+            } else if event_index < self.right_create {
+                ProbeRecoverySeedStage::PreExclusiveLeftOnly
+            } else if event_index < self.exclusive_rename {
+                ProbeRecoverySeedStage::PreExclusiveLeftRight
+            } else if event_index < self.swap_rename {
+                ProbeRecoverySeedStage::PostExclusiveMovedIsLeftRightIsRight
+            } else if event_index < self.right_remove {
+                ProbeRecoverySeedStage::PostSwapMovedIsRightRightIsLeft
+            } else if event_index < self.moved_remove {
+                ProbeRecoverySeedStage::PostSwapMovedIsRight
+            } else if event_index < self.intent_remove {
+                ProbeRecoverySeedStage::IntentAfterProbeMembers
+            } else {
+                ProbeRecoverySeedStage::JournalAfterIntent
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn derive_probe_recovery_seeds(trace: &[DurabilityEvent]) -> Vec<ProbeRecoverySeed> {
+        let boundaries = ProbeRecoverySeedBoundaries::capture(trace);
+        let temporary = format!(
+            "{}/intent-{PROBE_TOKEN}.tmp",
+            probe_active_path(PROBE_TOKEN)
+        );
+        let seeds = (boundaries.active_create..boundaries.active_remove)
+            .map(|install_event_index| {
+                let stage = boundaries.stage(install_event_index);
+                let event = &trace[install_event_index];
+                let intent_prefix_bytes = trace[..=install_event_index]
+                    .iter()
+                    .filter(|event| {
+                        event.path() == temporary
+                            && matches!(
+                                event.primitive(),
+                                DurabilityPrimitive::WritePartial
+                                    | DurabilityPrimitive::WriteFull
+                            )
+                    })
+                    .count();
+                let label = format!(
+                    "{};install-event={install_event_index:04};primitive={:?};path={};ordinal={};intent-prefix-bytes={intent_prefix_bytes}",
+                    stage.label(),
+                    event.primitive(),
+                    event.path(),
+                    event.ordinal(),
+                );
+                ProbeRecoverySeed {
+                    install_event_index,
+                    stage,
+                    label,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let expected_stages = BTreeSet::from([
+            ProbeRecoverySeedStage::JournalBeforeIntent,
+            ProbeRecoverySeedStage::IntentTemporaryPrefix,
+            ProbeRecoverySeedStage::IntentBeforeProbeMembers,
+            ProbeRecoverySeedStage::PreExclusiveLeftOnly,
+            ProbeRecoverySeedStage::PreExclusiveLeftRight,
+            ProbeRecoverySeedStage::PostExclusiveMovedIsLeftRightIsRight,
+            ProbeRecoverySeedStage::PostSwapMovedIsRightRightIsLeft,
+            ProbeRecoverySeedStage::PostSwapMovedIsRight,
+            ProbeRecoverySeedStage::IntentAfterProbeMembers,
+            ProbeRecoverySeedStage::JournalAfterIntent,
+        ]);
+        assert_eq!(
+            seeds.iter().map(|seed| seed.stage).collect::<BTreeSet<_>>(),
+            expected_stages,
+            "rename-probe recovery seeds omit a production install shape"
+        );
+        assert_eq!(
+            seeds
+                .iter()
+                .map(|seed| seed.label.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            seeds.len(),
+            "rename-probe recovery seed labels are not unique"
+        );
+        seeds
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn seed_probe_recovery_shape(
+        fixture: &ProbeFixture,
+        install_trace: &[DurabilityEvent],
+        seed: &ProbeRecoverySeed,
+    ) {
+        interrupt_probe_install(fixture, install_trace, seed.install_event_index, None);
+        let names = fixture
+            .rooted()
+            .list_dir(&fixture.active_path())
+            .unwrap_or_else(|error| panic!("inspect seeded probe shape {}: {error}", seed.label));
+        assert_eq!(
+            names,
+            seed.stage.expected_names(),
+            "seeded probe residue differs from its deterministic label: {}",
+            seed.label
+        );
+        assert_valid_probe_recovery_residue(fixture, &seed.label);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn assert_valid_probe_recovery_residue(fixture: &ProbeFixture, label: &str) {
+        let before = fixture.evidence_snapshot();
+        let rooted = fixture.rooted();
+        let parent = ".surgeist-generator/probes/layout";
+        let names = rooted
+            .list_dir(parent)
+            .unwrap_or_else(|error| panic!("inspect probe recovery residue {label}: {error}"));
+        match names.as_slice() {
+            [] => {}
+            [name] if name == &format!("active-{PROBE_TOKEN}") => {
+                let active = fixture.active_path();
+                let identity = rooted
+                    .identity_at(&active)
+                    .unwrap_or_else(|error| {
+                        panic!("inspect active probe recovery residue {label}: {error}")
+                    })
+                    .unwrap_or_else(|| panic!("active probe recovery residue vanished: {label}"));
+                ProbeRecoveryPlan::capture(
+                    &rooted,
+                    Domain::Layout,
+                    PROBE_TOKEN,
+                    &active,
+                    &identity,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("probe recovery residue is not exactly valid ({label}): {error}")
+                });
+            }
+            _ => panic!("unexpected probe recovery residue for {label}: {names:?}"),
+        }
+        assert_eq!(
+            fixture.evidence_snapshot(),
+            before,
+            "read-only probe residue classification mutated state: {label}"
+        );
+        fixture.assert_protected();
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn seed_probe_recovery(fixture: &ProbeFixture, install_trace: &[DurabilityEvent]) {
         let swap = one_event_index(
             install_trace,
@@ -8731,13 +9111,21 @@ mod tests {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn record_probe_recovery_trace(install_trace: &[DurabilityEvent]) -> Vec<DurabilityEvent> {
+    fn record_probe_recovery_trace(
+        install_trace: &[DurabilityEvent],
+        seed: &ProbeRecoverySeed,
+    ) -> Vec<DurabilityEvent> {
         let fixture = ProbeFixture::new();
-        seed_probe_recovery(&fixture, install_trace);
+        seed_probe_recovery_shape(&fixture, install_trace, seed);
         let observer = RootedObserver::recording();
         fixture
             .recover(Some(observer.clone()))
-            .expect("record production rename-probe recovery");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "record unhooked production rename-probe recovery for {}: {error}",
+                    seed.label
+                )
+            });
         fixture.assert_clean();
         let trace = observer.events();
         assert!(
@@ -8750,7 +9138,18 @@ mod tests {
                             | DurabilityPrimitive::SyncDirectory
                     )
             }),
-            "probe recovery trace contains no individual removal or sync"
+            "probe recovery trace contains no individual removal or sync: {}",
+            seed.label
+        );
+        let recovered = fixture.evidence_snapshot();
+        fixture
+            .recover(None)
+            .unwrap_or_else(|error| panic!("repeat clean recovery for {}: {error}", seed.label));
+        assert_eq!(
+            fixture.evidence_snapshot(),
+            recovered,
+            "unhooked probe recovery is not idempotent: {}",
+            seed.label
         );
         trace
     }
@@ -8783,6 +9182,171 @@ mod tests {
             &probe_member_path("probe-moved"),
         );
         interrupt_probe_install(fixture, trace, rename, None);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn seed_probe_before_exclusive(fixture: &ProbeFixture, trace: &[DurabilityEvent]) {
+        let rename = one_event_index(
+            trace,
+            DurabilityPhase::ProbeInstall,
+            DurabilityPrimitive::RenameExclusive,
+            &probe_member_path("probe-moved"),
+        );
+        let preceding = rename
+            .checked_sub(1)
+            .expect("probe exclusive rename has a preceding durable prefix");
+        interrupt_probe_install(fixture, trace, preceding, None);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn seed_nested_probe_child(fixture: &ProbeFixture, parent: &str) {
+        let child = fixture.owner.corpus.join(parent).join("unknown-nested");
+        fs::create_dir(&child).expect("seed nested unknown probe child");
+        fs::set_permissions(&child, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+            .expect("set nested unknown probe child mode");
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn probe_install_members(
+        fixture: &ProbeFixture,
+        names: &[&str],
+    ) -> (ProbeIntent, Vec<u8>, Vec<(String, String, HeldIdentity)>) {
+        let rooted = fixture.rooted();
+        let intent_path = format!("{}/intent.json", fixture.active_path());
+        let intent_bytes = rooted
+            .read_file(&intent_path, PRIVATE_FILE_MODE)
+            .expect("read seeded probe intent");
+        let intent = serde_json::from_slice(&intent_bytes).expect("parse seeded probe intent");
+        let members = names
+            .iter()
+            .map(|name| {
+                let name = format!("{name}-{PROBE_TOKEN}");
+                let path = format!("{}/{name}", fixture.active_path());
+                let identity = rooted
+                    .identity_at(&path)
+                    .expect("inspect seeded capability member")
+                    .expect("seeded capability member remains");
+                (name, path, identity)
+            })
+            .collect();
+        (intent, intent_bytes, members)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn rename_probe_recovery_nested_later_directory_preserves_complete_evidence() {
+        let trace = record_probe_install_trace();
+        for (label, after_exclusive) in [
+            ("pre-exclusive left/right", false),
+            ("post-exclusive moved/right", true),
+        ] {
+            let fixture = ProbeFixture::new();
+            if after_exclusive {
+                seed_probe_after_exclusive(&fixture, &trace);
+            } else {
+                seed_probe_before_exclusive(&fixture, &trace);
+            }
+            seed_nested_probe_child(&fixture, &probe_member_path("probe-right"));
+            let before = fixture.evidence_snapshot();
+
+            let error = fixture
+                .recover(None)
+                .expect_err("nested probe evidence must stop recovery before cleanup");
+
+            assert_eq!(
+                error.kind(),
+                GeneratorErrorKind::ArtifactTransaction,
+                "{label}"
+            );
+            assert_eq!(
+                fixture.evidence_snapshot(),
+                before,
+                "probe recovery removed earlier valid evidence: {label}"
+            );
+            fixture.assert_protected();
+        }
+
+        let raced = ProbeFixture::new();
+        seed_probe_after_exclusive(&raced, &trace);
+        let mut raced_snapshot = None;
+        let result = {
+            let mut before_mutation = |member: &str| {
+                assert_eq!(member, format!("probe-moved-{PROBE_TOKEN}"));
+                assert!(
+                    raced_snapshot.is_none(),
+                    "nested probe race ran more than once"
+                );
+                seed_nested_probe_child(&raced, &probe_member_path("probe-right"));
+                raced_snapshot = Some(raced.evidence_snapshot());
+                Ok(())
+            };
+            let mut control = ProbeRecoveryControl::new(&mut before_mutation);
+            raced.recover_controlled(&mut control)
+        };
+        let error = result.expect_err("nested probe race must stop before cleanup mutation");
+        assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+        assert_eq!(
+            raced.evidence_snapshot(),
+            raced_snapshot.expect("nested probe race captured its state"),
+            "probe recovery removed evidence after a nested inventory race"
+        );
+        raced.assert_protected();
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn rename_probe_capability_cleanup_nested_later_directory_preserves_complete_evidence() {
+        let trace = record_probe_install_trace();
+        for (fault, rename_kind, names) in [
+            (
+                ProbeCapabilityFault::FailExclusiveRename,
+                "exclusive",
+                ["probe-left", "probe-right"],
+            ),
+            (
+                ProbeCapabilityFault::FailSwapRename,
+                "swap",
+                ["probe-moved", "probe-right"],
+            ),
+        ] {
+            let fixture = ProbeFixture::new();
+            if fault == ProbeCapabilityFault::FailExclusiveRename {
+                seed_probe_before_exclusive(&fixture, &trace);
+            } else {
+                seed_probe_after_exclusive(&fixture, &trace);
+            }
+            let (intent, intent_bytes, member_data) = probe_install_members(&fixture, &names);
+            let rooted = fixture.rooted();
+            let members = member_data
+                .iter()
+                .map(|(name, path, identity)| {
+                    ProbeInstallMember::capture(&rooted, name, path, identity)
+                        .expect("capture seeded capability member inventory")
+                })
+                .collect::<Vec<_>>();
+            seed_nested_probe_child(&fixture, &probe_member_path("probe-right"));
+            let before = fixture.evidence_snapshot();
+
+            let error = finish_probe_capability_failure(
+                &rooted,
+                &intent,
+                &intent_bytes,
+                rename_kind,
+                injected_probe_capability_error(rename_kind),
+                &members,
+                None,
+            )
+            .expect_err("nested probe evidence must stop capability cleanup before mutation");
+
+            assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+            assert!(error.to_string().contains("capability"));
+            assert_eq!(
+                fixture.evidence_snapshot(),
+                before,
+                "capability cleanup removed earlier valid evidence: {rename_kind}"
+            );
+            fixture.assert_protected();
+        }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -9042,19 +9606,22 @@ mod tests {
     #[ignore = "exhaustive opt-in diagnostic"]
     fn rename_probe_recovery_every_prefix_is_idempotent() {
         let install_trace = record_probe_install_trace();
-        let recovery_trace = record_probe_recovery_trace(&install_trace);
-        for event_index in 0..recovery_trace.len() {
-            let fixture = ProbeFixture::new();
-            seed_probe_recovery(&fixture, &install_trace);
-            let observer = RootedObserver::interrupt_after(event_index);
-            expect_interruption(|| fixture.recover(Some(observer.clone())));
-            assert_event_prefix(
-                &observer,
-                &recovery_trace,
-                event_index,
-                "rename probe recovery",
-            );
-            fixture.assert_fresh_recovery_and_reprobe();
+        for seed in derive_probe_recovery_seeds(&install_trace) {
+            let recovery_trace = record_probe_recovery_trace(&install_trace, &seed);
+            for recovery_event_index in 0..recovery_trace.len() {
+                let fixture = ProbeFixture::new();
+                seed_probe_recovery_shape(&fixture, &install_trace, &seed);
+                let observer = RootedObserver::interrupt_after(recovery_event_index);
+                expect_interruption(|| fixture.recover(Some(observer.clone())));
+                assert_event_prefix(
+                    &observer,
+                    &recovery_trace,
+                    recovery_event_index,
+                    &format!("rename probe recovery ({})", seed.label),
+                );
+                assert_valid_probe_recovery_residue(&fixture, &seed.label);
+                fixture.assert_fresh_recovery_and_reprobe();
+            }
         }
     }
 }
