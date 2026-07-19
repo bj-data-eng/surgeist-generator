@@ -718,6 +718,32 @@ mod imports {
         (metadata.dev(), metadata.ino())
     }
 
+    fn snapshot_path_identities(root: &Path) -> BTreeMap<PathBuf, (u64, u64)> {
+        fn visit(base: &Path, current: &Path, output: &mut BTreeMap<PathBuf, (u64, u64)>) {
+            let mut entries = fs::read_dir(current)
+                .expect("read identity snapshot directory")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("identity snapshot entries");
+            entries.sort_by_key(fs::DirEntry::file_name);
+            for entry in entries {
+                let path = entry.path();
+                output.insert(
+                    path.strip_prefix(base)
+                        .expect("relative identity snapshot path")
+                        .to_path_buf(),
+                    path_identity(&path),
+                );
+                if entry.file_type().expect("identity snapshot type").is_dir() {
+                    visit(base, &path, output);
+                }
+            }
+        }
+
+        let mut output = BTreeMap::new();
+        visit(root, root, &mut output);
+        output
+    }
+
     fn assert_no_import_intent_journal_or_stage(fixture: &Fixture) {
         let transactions = fixture.corpus.join(".surgeist-generator/transactions/css");
         if transactions.exists() {
@@ -2136,6 +2162,165 @@ mod imports {
      {
         assert_pre_lease_import_revalidation(
             PreLeaseImportMutation::SidecarSameBytesIdentityReplacement,
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PreLeaseHistoricalMutation {
+        ByteDrift,
+        SameBytesIdentityReplacement,
+    }
+
+    fn assert_pre_lease_historical_revalidation(mutation: PreLeaseHistoricalMutation) {
+        const SOURCE: &[u8] = b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n";
+
+        let fixture = imported_generation_fixture("declaration/Case.json", SOURCE, 1, &[]);
+        fixture.generate().expect("seed historical authority");
+        let published = PublishedGenerationProof::capture(&fixture);
+        let expectation_root = fixture.corpus.join("expectations");
+        let expectation = expectation_root.join("declaration/Case.json");
+        let report = expectation_root.join("generation-reports/all.json");
+        let displaced = fixture
+            .root
+            .join("displaced-pre-lease-historical-report.json");
+        let coordination = fixture.corpus.join(".surgeist-generator");
+        let owner = coordination.join("leases/css/owner.json");
+        let coordination_tree = snapshot_tree(&coordination);
+        let coordination_path_identities = snapshot_path_identities(&coordination);
+        let coordination_identity = path_identity(&coordination);
+        let owner_bytes = fs::read(&owner).expect("read historical lease owner");
+        let owner_identity = path_identity(&owner);
+        let original_report_bytes = published.report_bytes.clone();
+        let original_report_identity = published.report_identity;
+        let replacement_bytes = match mutation {
+            PreLeaseHistoricalMutation::ByteDrift => {
+                let output_digest = Sha256Digest::from_bytes(&published.output_bytes);
+                let drifted_digest =
+                    Sha256Digest::from_bytes(b"pre-lease historical report byte drift");
+                let report_text = String::from_utf8(original_report_bytes.clone())
+                    .expect("canonical historical report is UTF-8");
+                assert_eq!(
+                    report_text.matches(output_digest.as_str()).count(),
+                    1,
+                    "output digest must identify one canonical historical report field"
+                );
+                let drifted = report_text
+                    .replacen(output_digest.as_str(), drifted_digest.as_str(), 1)
+                    .into_bytes();
+                let report: GenerationReport = serde_json::from_slice(&drifted)
+                    .expect("byte-drifted historical report remains valid");
+                let mut canonical = serde_json::to_vec_pretty(&report)
+                    .expect("serialize drifted historical report");
+                canonical.push(b'\n');
+                assert_eq!(drifted, canonical);
+                assert_ne!(drifted, original_report_bytes);
+                drifted
+            }
+            PreLeaseHistoricalMutation::SameBytesIdentityReplacement => {
+                original_report_bytes.clone()
+            }
+        };
+        let replace_identity = matches!(
+            mutation,
+            PreLeaseHistoricalMutation::SameBytesIdentityReplacement
+        );
+        let hook_reached = Cell::new(false);
+        let replacement_identity = Cell::new(None);
+
+        let result = full_generation::run_with_pre_lease_hook(&fixture.generate_request(), || {
+            assert!(
+                !hook_reached.replace(true),
+                "pre-lease hook ran more than once"
+            );
+            published.assert_unchanged(&fixture);
+            assert_eq!(snapshot_tree(&coordination), coordination_tree);
+            assert_eq!(
+                snapshot_path_identities(&coordination),
+                coordination_path_identities
+            );
+            assert_eq!(path_identity(&coordination), coordination_identity);
+            assert_eq!(
+                fs::read(&owner).expect("read hook lease owner"),
+                owner_bytes
+            );
+            assert_eq!(path_identity(&owner), owner_identity);
+            assert_no_import_intent_journal_or_stage(&fixture);
+
+            if replace_identity {
+                fs::rename(&report, &displaced).expect("displace preflight historical report");
+            }
+            fs::write(&report, &replacement_bytes).expect("write raced historical report");
+            replacement_identity.set(Some(path_identity(&report)));
+        });
+        let error = result.expect_err("pre-lease historical report race must reject generation");
+
+        assert_eq!(
+            (error.kind(), hook_reached.get()),
+            (GeneratorErrorKind::InvalidInventory, true),
+            "historical report race must reject after the pre-lease hook"
+        );
+        assert_eq!(
+            error.to_string(),
+            "revalidate CSS generation inputs: CSS historical inventory changed before lease owner installation"
+        );
+        assert_eq!(snapshot_tree(&coordination), coordination_tree);
+        assert_eq!(
+            snapshot_path_identities(&coordination),
+            coordination_path_identities
+        );
+        assert_eq!(path_identity(&coordination), coordination_identity);
+        assert_eq!(
+            fs::read(&owner).expect("read retained lease owner"),
+            owner_bytes
+        );
+        assert_eq!(path_identity(&owner), owner_identity);
+        assert_no_import_intent_journal_or_stage(&fixture);
+
+        let mut expected_tree = published.tree.clone();
+        expected_tree.insert(
+            PathBuf::from("generation-reports/all.json"),
+            replacement_bytes.clone(),
+        );
+        assert_eq!(snapshot_tree(&expectation_root), expected_tree);
+        assert_eq!(path_identity(&expectation_root), published.root_identity);
+        assert_eq!(
+            fs::read(&expectation).expect("read retained expectation"),
+            published.output_bytes
+        );
+        assert_eq!(path_identity(&expectation), published.output_identity);
+        assert_eq!(
+            fs::read(&report).expect("read raced historical report"),
+            replacement_bytes
+        );
+        assert_eq!(
+            Some(path_identity(&report)),
+            replacement_identity.get(),
+            "rejection replaced the racer's historical report"
+        );
+        if replace_identity {
+            assert_ne!(path_identity(&report), original_report_identity);
+            assert_eq!(path_identity(&displaced), original_report_identity);
+            assert_eq!(
+                fs::read(&displaced).expect("read displaced historical report"),
+                original_report_bytes
+            );
+        } else {
+            assert_eq!(path_identity(&report), original_report_identity);
+            assert!(!displaced.exists());
+        }
+    }
+
+    #[test]
+    fn css_full_generate_pre_lease_revalidation_rejects_historical_report_byte_drift_before_owner_install()
+     {
+        assert_pre_lease_historical_revalidation(PreLeaseHistoricalMutation::ByteDrift);
+    }
+
+    #[test]
+    fn css_full_generate_pre_lease_revalidation_rejects_historical_report_same_byte_identity_replacement_before_owner_install()
+     {
+        assert_pre_lease_historical_revalidation(
+            PreLeaseHistoricalMutation::SameBytesIdentityReplacement,
         );
     }
 
