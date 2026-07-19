@@ -242,6 +242,28 @@ fn layout_schema2_rejects_only_declared_tightening_shapes() {
 }
 
 #[test]
+fn layout_schema2_rejects_three_exclusions_with_duplicate_member() {
+    let text = manifest_text(SHA1_REVISION, 1, "").replace(
+        "excluded_destination_dirs = [\"grid-lanes\", \"subgrid\"]",
+        "excluded_destination_dirs = [\"grid-lanes\", \"grid-lanes\", \"subgrid\"]",
+    );
+    let error = manifest::parse(text.as_bytes(), Path::new("corpus.toml"))
+        .expect_err("three-entry exclusion list with duplicate member");
+    assert_eq!(error.kind(), GeneratorErrorKind::InvalidManifest);
+}
+
+#[test]
+fn layout_schema2_rejects_noncanonical_scoped_report_files() {
+    for replacement in [r#"file = "dir\\name.json""#, r#"file = " scoped.json""#] {
+        let text =
+            manifest_text(SHA1_REVISION, 1, "").replacen(r#"file = "grid.json""#, replacement, 1);
+        let error = manifest::parse(text.as_bytes(), Path::new("corpus.toml"))
+            .expect_err("noncanonical scoped report file");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidManifest);
+    }
+}
+
+#[test]
 fn layout_schema2_launch_digest_preserves_manifest_order() {
     let original = manifest_text(SHA1_REVISION, 1, "");
     let reordered = original.replace(

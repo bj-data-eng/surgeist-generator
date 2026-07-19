@@ -88,7 +88,7 @@ struct RawFullReport {
 #[serde(deny_unknown_fields)]
 struct RawScopedReport {
     filter: RelativePath,
-    file: String,
+    file: RelativePath,
     generated: u64,
 }
 
@@ -359,16 +359,17 @@ fn validate_reports(reports: &RawGenerationReports) -> Result<()> {
                 "scoped report filter collides with the Taffy sidecar",
             ));
         }
-        if scoped.file.contains('/')
-            || scoped.file == "all.json"
-            || !scoped.file.ends_with(".json")
-            || scoped.file.len() == ".json".len()
+        let scoped_file = scoped.file.as_str();
+        if scoped_file.split('/').count() != 1
+            || scoped_file == "all.json"
+            || !scoped_file.ends_with(".json")
+            || scoped_file.len() == ".json".len()
         {
             return Err(invalid_manifest(
                 "scoped report file must be a unique one-component .json name",
             ));
         }
-        if !filters.insert(scoped.filter.clone()) || !files.insert(&scoped.file) {
+        if !filters.insert(scoped.filter.clone()) || !files.insert(scoped_file) {
             return Err(invalid_manifest(
                 "scoped report filters and files must be unique",
             ));
@@ -403,6 +404,11 @@ fn validate_source_roots(roots: &RawSourceRoots) -> Result<()> {
 }
 
 fn validate_exclusions(exclusions: Vec<RelativePath>) -> Result<()> {
+    if exclusions.len() != EXCLUDED_DIRECTORIES.len() {
+        return Err(invalid_manifest(
+            "imports.taffy.excluded_destination_dirs must contain grid-lanes and subgrid once each",
+        ));
+    }
     let actual = exclusions
         .into_iter()
         .map(|path| path.as_str().to_owned())
@@ -411,7 +417,7 @@ fn validate_exclusions(exclusions: Vec<RelativePath>) -> Result<()> {
         .into_iter()
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
-    if actual != expected || actual.len() != 2 {
+    if actual != expected || actual.len() != EXCLUDED_DIRECTORIES.len() {
         return Err(invalid_manifest(
             "imports.taffy.excluded_destination_dirs must contain grid-lanes and subgrid once each",
         ));
