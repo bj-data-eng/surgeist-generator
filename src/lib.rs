@@ -8,6 +8,9 @@ mod error;
 #[cfg(feature = "css-corpus")]
 pub mod css;
 
+#[cfg(feature = "layout-browser")]
+pub mod layout;
+
 pub use core::{
     ArtifactProvenance, CaseDisposition, CaseDispositionRecord, CorpusLocation, GenerationCounts,
     GenerationReport, ManifestVersion, PinnedSource, RelativePath, ReportArtifact, RunScope,

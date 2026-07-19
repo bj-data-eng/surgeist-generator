@@ -12,6 +12,8 @@ use surgeist_generator::{
 
 #[cfg(feature = "css-corpus")]
 use surgeist_generator::css::{CssCommand, CssRequest};
+#[cfg(feature = "layout-browser")]
+use surgeist_generator::layout::{LayoutCommand, LayoutRequest};
 
 const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
 const ZERO_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -378,6 +380,51 @@ fn portable_count_bounds_and_structural_report_counts_are_enforced() {
         vec![artifact],
     )
     .expect("shared reports do not invent artifacts for unsupported/failed cases");
+}
+
+#[cfg(feature = "layout-browser")]
+#[test]
+fn layout_import_public_request_is_io_free_and_accessors_are_exact() {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TestRoot(PathBuf);
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).expect("remove public API roots");
+        }
+    }
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let root = TestRoot(std::env::temp_dir().join(format!(
+        "surgeist-generator-layout-public-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )));
+    let owner = root.0.join("owner");
+    let corpus = owner.join("corpus");
+    fs::create_dir_all(&corpus).expect("create public API roots");
+    let location = CorpusLocation::new(&owner, &corpus).expect("location");
+    fs::rename(&owner, root.0.join("detached-owner"))
+        .expect("detach roots before request construction");
+    let source = PathBuf::from("a-source-that-need-not-exist");
+
+    assert_copy_debug_eq::<LayoutCommand>();
+    assert_clone_debug_eq::<LayoutRequest>();
+    let _: fn(LayoutRequest) -> surgeist_generator::Result<()> = surgeist_generator::layout::run;
+    let _: fn() -> surgeist_generator::Result<()> = surgeist_generator::layout::run_from_env;
+
+    let request = LayoutRequest::import_taffy(location.clone(), source.clone())
+        .expect("I/O-free import request");
+    assert_eq!(request.location(), &location);
+    assert_eq!(request.command(), LayoutCommand::ImportTaffy);
+    assert_eq!(request.source_root(), Some(source.as_path()));
+
+    let error = LayoutRequest::import_taffy(location, PathBuf::new())
+        .expect_err("empty import source root");
+    assert_eq!(error.kind(), GeneratorErrorKind::Cli);
 }
 
 #[cfg(feature = "css-corpus")]

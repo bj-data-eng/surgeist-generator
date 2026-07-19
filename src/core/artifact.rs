@@ -9,7 +9,7 @@ use super::coordination::{Domain, new_token};
 use super::fs::{CORPUS_FILE_MODE, NodeKind};
 use super::inventory::{Inventory, InventoryPolicy};
 use super::lease::{GenerationLease, LeaseBinding};
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 use super::transaction::external_stage_name;
 use super::transaction::{StagedTree, TransactionEngine, TransactionRequest};
 
@@ -79,12 +79,12 @@ pub(crate) struct ArtifactPlan {
     policy: PublicationPolicy,
     inventory: PublicationInventory,
     artifacts: BTreeMap<RelativePath, PlannedArtifact>,
-    #[cfg(feature = "css-corpus")]
+    #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
     transaction_token: Option<String>,
 }
 
 /// In-memory proof of the exact external stage namespace chosen before lease.
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 #[derive(Debug)]
 pub(crate) struct ArtifactReservation {
     domain: Domain,
@@ -92,7 +92,7 @@ pub(crate) struct ArtifactReservation {
     external_stage: RelativePath,
 }
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 impl ArtifactReservation {
     pub(crate) fn new(domain: Domain) -> Result<Self> {
         let token = new_token()?;
@@ -171,12 +171,12 @@ impl ArtifactPlan {
             policy,
             inventory,
             artifacts: planned,
-            #[cfg(feature = "css-corpus")]
+            #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
             transaction_token: None,
         })
     }
 
-    #[cfg(feature = "css-corpus")]
+    #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
     pub(crate) fn with_reservation(mut self, reservation: ArtifactReservation) -> Result<Self> {
         if reservation.domain != self.domain {
             return Err(plan_error(
@@ -198,7 +198,7 @@ impl ArtifactPlan {
     }
 
     /// Revalidates domain-owned read authorities at the last pre-intent boundary.
-    #[cfg(all(feature = "css-corpus", not(test)))]
+    #[cfg(all(any(feature = "css-corpus", feature = "layout-browser"), not(test)))]
     pub(crate) fn install_with_revalidation(
         self,
         pre_intent_revalidation: impl FnOnce(&super::fs::RootedFs) -> Result<()>,
@@ -207,7 +207,7 @@ impl ArtifactPlan {
         self.install_impl(pre_intent_revalidation, transaction_token)
     }
 
-    #[cfg(all(test, feature = "css-corpus"))]
+    #[cfg(all(test, any(feature = "css-corpus", feature = "layout-browser")))]
     pub(crate) fn install_with_revalidation_and_inter_scan_hook(
         self,
         pre_intent_revalidation: impl FnOnce(&super::fs::RootedFs) -> Result<()>,

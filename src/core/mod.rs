@@ -19,23 +19,27 @@ pub use manifest::{ManifestVersion, parse_manifest};
 pub use report::{ArtifactProvenance, GenerationCounts, GenerationReport, ReportArtifact};
 pub use source::{PinnedSource, SourceRevision, VerifiedSource, verify_git_source};
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 pub(crate) use artifact::{
     ArtifactPlan, ArtifactReservation, PublicationInventory, PublicationPolicy,
 };
 #[cfg(feature = "css-corpus")]
 pub(crate) use case::validate_disposition_reason;
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 pub(crate) use coordination::Domain;
-#[cfg(feature = "css-corpus")]
-pub(crate) use fs::{CORPUS_FILE_MODE, NodeKind, RootedFs};
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+pub(crate) use fs::{CORPUS_FILE_MODE, HeldIdentity, NodeKind, RootedFs};
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 pub(crate) use inventory::{Inventory, InventoryPolicy};
 #[cfg(feature = "css-corpus")]
-pub(crate) use lease::{GenerationCheck, GenerationLease};
+pub(crate) use lease::GenerationCheck;
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+pub(crate) use lease::GenerationLease;
 #[cfg(feature = "css-corpus")]
-pub(crate) use protection::{NamespaceDisjointness, ProtectedSourceDisjointness};
-#[cfg(feature = "css-corpus")]
+pub(crate) use protection::NamespaceDisjointness;
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+pub(crate) use protection::ProtectedSourceDisjointness;
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 pub(crate) use source::{
     ObjectFormat, ProtectedSource, ProtectedSourceInventory, ProtectedTreeEntryKind, SnapshotEntry,
     VerifiedSourceSnapshot, verify_protected_git_source_inventory,
@@ -54,7 +58,7 @@ pub(crate) fn validate_identifier(value: &str) -> bool {
 
 #[inline(always)]
 fn private_front_doors_are_linked() {
-    #[cfg(not(feature = "css-corpus"))]
+    #[cfg(not(any(feature = "css-corpus", feature = "layout-browser")))]
     {
         let _ = artifact::ArtifactPlan::new;
         let _ = artifact::PublicationInventory::new;
@@ -65,6 +69,13 @@ fn private_front_doors_are_linked() {
         let _ = inventory::Inventory::find;
         let _ = protection::ProtectedSourceDisjointness::for_mutation;
         let _ = source::ProtectedSource::snapshot;
+    }
+    #[cfg(all(feature = "layout-browser", not(feature = "css-corpus")))]
+    {
+        // C03-T02 replaces these two retained read-only references with the
+        // real layout checker. T01 must not expose that command prematurely.
+        let _ = lease::GenerationCheck::acquire;
+        let _ = lease::GenerationCheck::finish;
     }
     let _ = artifact::ArtifactPlan::install;
     let _ = artifact::ArtifactPlan::artifact_digest;

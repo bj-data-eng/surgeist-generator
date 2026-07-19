@@ -228,7 +228,7 @@ impl ProtectedSource {
     }
 }
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 #[derive(Debug)]
 pub(crate) struct ProtectedSourceInventory {
     verified: VerifiedSource,
@@ -236,7 +236,7 @@ pub(crate) struct ProtectedSourceInventory {
     protection: SourceProtection,
 }
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 impl ProtectedSourceInventory {
     pub(crate) const fn verified(&self) -> &VerifiedSource {
         &self.verified
@@ -313,14 +313,14 @@ pub(crate) struct SnapshotEntry {
     pub(crate) digest: Sha256Digest,
 }
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProtectedTreeSnapshot {
     pub(crate) object_format: ObjectFormat,
     pub(crate) entries: Vec<ProtectedTreeEntry>,
 }
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProtectedTreeEntry {
     pub(crate) path: ProtectedTreePath,
@@ -331,18 +331,18 @@ pub(crate) struct ProtectedTreeEntry {
     pub(crate) digest: Option<Sha256Digest>,
 }
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProtectedTreeEntryKind {
     Blob,
     Commit,
 }
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ProtectedTreePath(Vec<u8>);
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 impl ProtectedTreePath {
     fn new(bytes: &[u8], label: &str) -> Result<Self> {
         if bytes.is_empty()
@@ -576,7 +576,7 @@ pub(crate) fn verify_protected_git_source(
     verify_git_source_impl(checkout, pin, None)
 }
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 pub(crate) fn verify_protected_git_source_inventory(
     checkout: &Path,
     pin: &PinnedSource,
@@ -1636,7 +1636,7 @@ struct GitEntry {
     object_id: String,
 }
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProtectedGitEntry {
     kind: ProtectedTreeEntryKind,
@@ -1644,7 +1644,7 @@ struct ProtectedGitEntry {
     object_id: String,
 }
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProtectedIndexEntry {
     mode: String,
@@ -1914,7 +1914,7 @@ fn verify_raw_cleanliness(
     Ok(())
 }
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 fn verify_raw_cleanliness_for_protected_inventory(
     runner: &GitRunner,
     canonical_root: &Path,
@@ -2084,7 +2084,7 @@ fn build_snapshot(
     })
 }
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 fn build_protected_snapshot(
     runner: &GitRunner,
     pin: &PinnedSource,
@@ -2189,7 +2189,7 @@ fn parse_tree_inventory(
     Ok(entries)
 }
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 fn parse_protected_tree_inventory(
     bytes: &[u8],
     object_format: ObjectFormat,
@@ -2247,7 +2247,7 @@ fn parse_protected_tree_inventory(
     Ok(entries)
 }
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 fn parse_protected_index_inventory(
     bytes: &[u8],
     object_format: ObjectFormat,
@@ -2294,7 +2294,7 @@ fn parse_protected_index_inventory(
     Ok(entries)
 }
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 fn parse_protected_visibility_inventory(bytes: &[u8]) -> Result<BTreeSet<ProtectedTreePath>> {
     let mut paths = BTreeSet::new();
     for record in nul_records(bytes, "Git index visibility inventory")? {
@@ -2388,7 +2388,7 @@ fn validate_git_mode(mode: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 fn validate_protected_git_mode(mode: &str, label: &str) -> Result<()> {
     if !matches!(mode, "100644" | "100755" | "120000" | "160000") {
         return Err(invalid_source(format!(
@@ -2398,7 +2398,7 @@ fn validate_protected_git_mode(mode: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 fn validate_protected_tree_entry_shape(
     mode: &str,
     kind: ProtectedTreeEntryKind,

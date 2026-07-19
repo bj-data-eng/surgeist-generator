@@ -17,6 +17,11 @@ name = "surgeist-css-generate"
 path = "src/bin/surgeist-css-generate.rs"
 required-features = ["css-corpus"]
 
+[[bin]]
+name = "surgeist-layout-generate"
+path = "src/bin/surgeist-layout-generate.rs"
+required-features = ["layout-browser"]
+
 [features]
 default = []
 layout-browser = []

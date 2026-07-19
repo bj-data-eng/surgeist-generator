@@ -57,6 +57,13 @@ pub(crate) struct NamespaceDisjointness {
 pub(crate) struct ProtectedSourceDisjointness<'source> {
     source: &'source ProtectedSource,
     namespaces: NamespaceDisjointness,
+    retained_partition: Option<RetainedPartitionBindings>,
+}
+
+#[derive(Debug)]
+struct RetainedPartitionBindings {
+    root: NamespaceBinding,
+    files: Vec<NamespaceBinding>,
 }
 
 impl<'source> ProtectedSourceDisjointness<'source> {
@@ -79,14 +86,130 @@ impl<'source> ProtectedSourceDisjointness<'source> {
             .iter()
             .map(|(label, path)| (label.as_str(), path.as_path()))
             .collect::<Vec<_>>();
-        NamespaceDisjointness::for_mutation(location, writable, &complete_refs)
-            .map(|namespaces| Self { source, namespaces })
+        NamespaceDisjointness::for_mutation(location, writable, &complete_refs).map(|namespaces| {
+            Self {
+                source,
+                namespaces,
+                retained_partition: None,
+            }
+        })
+    }
+
+    /// Proves the one complete-root publication exception whose exact retained
+    /// files are protected inside that writable root.
+    #[cfg(feature = "layout-browser")]
+    pub(crate) fn for_partitioned_mutation(
+        location: &CorpusLocation,
+        partition_root: (&str, &Path),
+        other_writable: &[(&str, &Path)],
+        protected: &[(&str, &Path)],
+        retained_files: &[(&str, &Path)],
+        source: &'source ProtectedSource,
+    ) -> Result<Self> {
+        let mut writable = Vec::with_capacity(other_writable.len() + 1);
+        writable.push(partition_root);
+        writable.extend_from_slice(other_writable);
+        let complete_protected = protected
+            .iter()
+            .map(|(label, path)| ((*label).to_owned(), (*path).to_path_buf()))
+            .chain(
+                source
+                    .protection_namespaces()
+                    .map(|(label, path)| (label.to_owned(), path.to_path_buf())),
+            )
+            .collect::<Vec<_>>();
+        let complete_refs = complete_protected
+            .iter()
+            .map(|(label, path)| (label.as_str(), path.as_path()))
+            .collect::<Vec<_>>();
+        let namespaces = NamespaceDisjointness::for_mutation(location, &writable, &complete_refs)?;
+        let root = NamespaceSpec::new(partition_root.0, partition_root.1)
+            .and_then(|spec| spec.bind())
+            .map_err(retained_partition_error)?;
+        root.path
+            .require_existing_directory("bind retained partition root")
+            .map_err(retained_partition_error)?;
+        let files = retained_files
+            .iter()
+            .map(|(label, path)| {
+                NamespaceSpec::new(label, path)
+                    .and_then(|spec| spec.bind())
+                    .map_err(retained_partition_error)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        prove_retained_partition(&root, &files, &namespaces).map_err(retained_partition_error)?;
+        Ok(Self {
+            source,
+            namespaces,
+            retained_partition: Some(RetainedPartitionBindings { root, files }),
+        })
     }
 
     pub(crate) fn revalidate(&self, rooted: &RootedFs) -> Result<()> {
         self.source.closing_revalidate()?;
-        self.namespaces.revalidate(rooted)
+        self.namespaces.revalidate(rooted)?;
+        if let Some(partition) = &self.retained_partition {
+            partition
+                .root
+                .path
+                .revalidate()
+                .map_err(retained_partition_error)?;
+            for file in &partition.files {
+                file.path.revalidate().map_err(retained_partition_error)?;
+            }
+            prove_retained_partition(&partition.root, &partition.files, &self.namespaces)
+                .map_err(retained_partition_error)?;
+        }
+        Ok(())
     }
+}
+
+fn retained_partition_error(source: GeneratorError) -> GeneratorError {
+    GeneratorError::with_source(
+        GeneratorErrorKind::InvalidInventory,
+        "revalidate retained publication partition",
+        source.to_string(),
+        source,
+    )
+}
+
+fn prove_retained_partition(
+    root: &NamespaceBinding,
+    files: &[NamespaceBinding],
+    namespaces: &NamespaceDisjointness,
+) -> Result<()> {
+    for file in files {
+        if file.path.canonical_path() == root.path.canonical_path()
+            || !file
+                .path
+                .canonical_path()
+                .starts_with(root.path.canonical_path())
+            || !root.path.overlaps(&file.path)?
+        {
+            return Err(invalid_path(
+                "prove retained publication partition",
+                format!(
+                    "{} is not a strict descendant of {}",
+                    file.label, root.label
+                ),
+            ));
+        }
+        for protected in &namespaces.protected {
+            reject_overlap(file, protected)?;
+        }
+        for writable in &namespaces.writable {
+            if writable.label == root.label {
+                continue;
+            }
+            reject_overlap(file, &writable.bind()?)?;
+        }
+    }
+    for (index, file) in files.iter().enumerate() {
+        for other in &files[index + 1..] {
+            reject_overlap(file, other)?;
+        }
+    }
+    Ok(())
 }
 
 impl NamespaceDisjointness {
