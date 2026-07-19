@@ -62,6 +62,68 @@ fn disposition_validation_accepts_repeated_sources_and_sorts_only_by_case_id() {
 }
 
 #[test]
+fn disposition_records_preserve_source_independent_case_id_compatibility() {
+    let cases = [
+        ("other.json#/x", "source.json"),
+        ("non-json.fixture#/case", "metadata.toml"),
+        ("generic/case-id", "inputs/data.bin"),
+        ("legacy/case.txt#", "source/input.css"),
+    ];
+
+    for (case_id, source_path) in cases {
+        let record = CaseDispositionRecord::new(
+            case_id,
+            RelativePath::new(source_path).expect("strict source path"),
+            CaseDisposition::Active,
+            None::<String>,
+        )
+        .unwrap_or_else(|error| {
+            panic!("baseline-compatible case ID {case_id:?} was rejected: {error}")
+        });
+        assert_eq!(record.case_id(), case_id);
+        assert_eq!(record.source_path().as_str(), source_path);
+
+        let expected = format!(
+            "{{\"case_id\":\"{case_id}\",\"source_path\":\"{source_path}\",\"disposition\":\"active\"}}"
+        );
+        assert_eq!(
+            serde_json::to_string(&record).expect("serialize disposition record"),
+            expected
+        );
+        let decoded: CaseDispositionRecord =
+            serde_json::from_str(&expected).expect("deserialize baseline-compatible record");
+        assert_eq!(decoded, record);
+    }
+
+    let source = RelativePath::new("source.json").expect("strict source path");
+    for invalid in [
+        "other.json#not-a-pointer",
+        "other.json#/bad~2escape",
+        "nested//case#/x",
+        "/absolute#/x",
+        " other.json#/x",
+    ] {
+        assert!(
+            CaseDispositionRecord::new(
+                invalid,
+                source.clone(),
+                CaseDisposition::Active,
+                None::<String>,
+            )
+            .is_err(),
+            "accepted intrinsically malformed case ID {invalid:?}"
+        );
+        let encoded = format!(
+            "{{\"case_id\":\"{invalid}\",\"source_path\":\"source.json\",\"disposition\":\"active\"}}"
+        );
+        assert!(
+            serde_json::from_str::<CaseDispositionRecord>(&encoded).is_err(),
+            "deserialized intrinsically malformed case ID {invalid:?}"
+        );
+    }
+}
+
+#[test]
 fn disposition_case_ids_preserve_hashes_in_strict_sources_and_pointer_tokens() {
     let source = RelativePath::new("nested#source/Fixture#.json").unwrap();
     let id = "nested#source/Fixture#.json#/before#~1middle~1#after";
@@ -76,9 +138,7 @@ fn disposition_case_ids_preserve_hashes_in_strict_sources_and_pointer_tokens() {
     assert_eq!(record.source_path(), &source);
 
     for malformed in [
-        "nested#source/Fixture#.json#",
         "nested#source/Fixture#.json#pointer",
-        "nested#source/Fixture#.json##/pointer",
         "nested#source/Fixture#.json#/bad~2escape",
     ] {
         assert!(

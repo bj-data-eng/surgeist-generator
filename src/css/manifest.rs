@@ -3,7 +3,9 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::core::{validate_disposition_reason, validate_json_case_id_syntax};
+use crate::core::{
+    validate_disposition_reason, validate_json_case_id_for_source, validate_json_case_id_syntax,
+};
 use crate::{
     CaseDisposition, CaseDispositionRecord, GeneratorError, GeneratorErrorKind, ManifestVersion,
     RelativePath, Result, SourceRevision, parse_manifest,
@@ -40,6 +42,13 @@ impl CssCaseOverride {
     }
 
     pub(super) fn bind(&self, source_path: &RelativePath) -> Result<CaseDispositionRecord> {
+        if !validate_json_case_id_for_source(&self.id, source_path) {
+            return Err(super::invalid_inventory(format!(
+                "CSS case override {} does not belong to fixture {}",
+                self.id,
+                source_path.as_str()
+            )));
+        }
         CaseDispositionRecord::new(
             &self.id,
             source_path.clone(),

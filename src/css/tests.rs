@@ -58,6 +58,23 @@ fn css_manifest_valid_schema_1_matrix_is_accepted() {
 }
 
 #[test]
+fn css_manifest_override_binding_uses_the_exact_json_fixture_source() {
+    let id = "nested#context/Fixture#.json#/before#~1middle~1#after";
+    let text = manifest_text(SHA1_REVISION, 1).replace("declaration/Declaration.json#/case", id);
+    let parsed =
+        manifest::parse(text.as_bytes(), Path::new("corpus.toml")).expect("valid override syntax");
+    let record = parsed.cases[0]
+        .bind(&RelativePath::new("nested#context/Fixture#.json").expect("matching source"))
+        .expect("exact source-bound override");
+    assert_eq!(record.case_id(), id);
+
+    let error = parsed.cases[0]
+        .bind(&RelativePath::new("other/Fixture.json").expect("mismatched source"))
+        .expect_err("override must remain owned by its exact fixture source");
+    assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+}
+
+#[test]
 fn css_manifest_invalid_schema_1_matrix_is_rejected() {
     let valid = manifest_text(SHA1_REVISION, 1);
     let invalid = [
@@ -100,6 +117,10 @@ fn css_manifest_invalid_schema_1_matrix_is_rejected() {
         valid.replace(
             "declaration/Declaration.json#/case",
             "declaration/Declaration.json#not-a-pointer",
+        ),
+        valid.replace(
+            "declaration/Declaration.json#/case",
+            "declaration/Declaration.css#/case",
         ),
         valid.replace(
             "declaration/Declaration.json#/case",

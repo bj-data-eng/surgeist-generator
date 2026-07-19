@@ -4,9 +4,10 @@ use std::fmt;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::core::validate_json_case_id_for_source;
 use crate::{
-    CaseDisposition, CaseDispositionRecord, GenerationCounts, GeneratorError, GeneratorErrorKind,
-    RelativePath, Result, Sha256Digest, SourceRevision,
+    CaseDisposition, GenerationCounts, GeneratorError, GeneratorErrorKind, RelativePath, Result,
+    Sha256Digest, SourceRevision,
 };
 
 use super::fixture::ValidatedImport;
@@ -246,9 +247,13 @@ pub(super) fn derive(
 }
 
 fn validate_derived_id(id: &str, source: &RelativePath) -> Result<()> {
-    CaseDispositionRecord::new(id, source.clone(), CaseDisposition::Active, None::<String>)
-        .map(|_| ())
-        .map_err(|error| invalid_inventory(error.to_string()))
+    if !validate_json_case_id_for_source(id, source) {
+        return Err(invalid_inventory(format!(
+            "derived CSS case ID {id} does not belong to fixture {}",
+            source.as_str()
+        )));
+    }
+    Ok(())
 }
 
 fn disposition_index(disposition: CaseDisposition) -> usize {

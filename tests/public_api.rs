@@ -271,7 +271,6 @@ fn public_constructor_grammars_and_exit_codes_are_exact() {
     }
 
     for invalid in [
-        "a.json##/x",
         "a.json#not-a-pointer",
         "a.json#/bad~2escape",
         "a.json#/control\u{7f}",

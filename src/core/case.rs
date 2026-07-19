@@ -32,7 +32,7 @@ impl CaseDispositionRecord {
         reason: Option<impl Into<String>>,
     ) -> Result<Self> {
         let case_id = case_id.into();
-        if !validate_case_id(&case_id, &source_path) {
+        if !validate_case_id(&case_id) {
             return Err(invalid_inventory(
                 "case ID does not match the canonical grammar",
             ));
@@ -162,18 +162,20 @@ impl<'de> Deserialize<'de> for CaseDisposition {
     }
 }
 
-fn validate_case_id(value: &str, source_path: &RelativePath) -> bool {
+fn validate_case_id(value: &str) -> bool {
     if !validate_case_id_text(value) {
         return false;
     }
-    if !value.contains('#') || value == source_path.as_str() {
+    if !value.contains('#') {
         return RelativePath::new(value).is_ok();
     }
-    RelativePath::with_extension(source_path.as_str(), "json").is_ok()
-        && value
-            .strip_prefix(source_path.as_str())
-            .and_then(|suffix| suffix.strip_prefix('#'))
-            .is_some_and(validate_json_pointer)
+    value.match_indices('#').any(|(delimiter, _)| {
+        let (source, suffix) = value.split_at(delimiter);
+        RelativePath::new(source).is_ok()
+            && suffix
+                .strip_prefix('#')
+                .is_some_and(validate_generic_case_pointer)
+    })
 }
 
 #[cfg(feature = "css-corpus")]
@@ -186,6 +188,16 @@ pub(crate) fn validate_json_case_id_syntax(value: &str) -> bool {
         })
 }
 
+#[cfg(feature = "css-corpus")]
+pub(crate) fn validate_json_case_id_for_source(value: &str, source_path: &RelativePath) -> bool {
+    validate_case_id_text(value)
+        && RelativePath::with_extension(source_path.as_str(), "json").is_ok()
+        && value
+            .strip_prefix(source_path.as_str())
+            .and_then(|suffix| suffix.strip_prefix('#'))
+            .is_some_and(validate_json_pointer)
+}
+
 fn validate_case_id_text(value: &str) -> bool {
     if value.is_empty()
         || value.len() > 4096
@@ -196,6 +208,10 @@ fn validate_case_id_text(value: &str) -> bool {
         return false;
     }
     true
+}
+
+fn validate_generic_case_pointer(pointer: &str) -> bool {
+    pointer.is_empty() || validate_json_pointer(pointer)
 }
 
 fn validate_json_pointer(pointer: &str) -> bool {
@@ -323,24 +339,24 @@ mod tests {
     }
 
     #[test]
-    fn case_ids_anchor_the_delimiter_to_their_json_source_and_preserve_hash_tokens() {
+    fn case_ids_preserve_compatible_decompositions_and_literal_hashes() {
         let source = source("nested#context/Fixture#.json");
         for id in [
             "nested#context/Fixture#.json#/",
             "nested#context/Fixture#.json#/label#tail",
             "nested#context/Fixture#.json#/before#~1middle~1#after~0tail",
+            "nested#context/Fixture#.json#",
+            "nested#context/Fixture#.json##/extra-delimiter",
+            "nested#context/Other.json#/label",
         ] {
             CaseDispositionRecord::new(id, source.clone(), CaseDisposition::Active, None::<String>)
                 .unwrap_or_else(|error| panic!("rejected canonical case ID {id:?}: {error}"));
         }
 
         for id in [
-            "nested#context/Fixture#.json#",
             "nested#context/Fixture#.json#not-a-pointer",
-            "nested#context/Fixture#.json##/extra-delimiter",
             "nested#context/Fixture#.json#/bad~",
             "nested#context/Fixture#.json#/bad~2escape",
-            "nested#context/Other.json#/label",
         ] {
             assert!(
                 CaseDispositionRecord::new(
@@ -350,7 +366,7 @@ mod tests {
                     None::<String>,
                 )
                 .is_err(),
-                "accepted malformed or source-mismatched case ID {id:?}"
+                "accepted malformed case ID {id:?}"
             );
         }
     }
