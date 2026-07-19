@@ -14,8 +14,10 @@
 //!     None,
 //! )?;
 //! css::run(request)?;
-//! let request = CssRequest::new(location, CssCommand::Generate, None, None)?;
-//! css::run(request)
+//! let request = CssRequest::new(location.clone(), CssCommand::Generate, None, None)?;
+//! css::run(request)?;
+//! let check = CssRequest::new(location, CssCommand::CheckCorpus, None, None)?;
+//! css::run(check)
 //! # }
 //! ```
 
@@ -24,6 +26,7 @@ use std::path::{Path, PathBuf};
 use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, RelativePath, Result};
 
 mod case;
+mod check;
 mod cli;
 mod expectation;
 mod filter;
@@ -49,6 +52,8 @@ pub enum CssCommand {
     /// Filtered generation updates only matching expectations already owned by the
     /// historical full report and preserves every other expectation and report.
     Generate,
+    /// Verify the current import and expectation corpus without changing it.
+    CheckCorpus,
 }
 
 /// Checked request for one CSS corpus operation.
@@ -97,6 +102,20 @@ impl CssRequest {
                     ));
                 }
             }
+            CssCommand::CheckCorpus => {
+                if source_root.is_some() {
+                    return Err(cli_error(
+                        "construct CSS request",
+                        "check-corpus forbids a source root",
+                    ));
+                }
+                if filter.is_some() {
+                    return Err(cli_error(
+                        "construct CSS request",
+                        "check-corpus forbids a filter",
+                    ));
+                }
+            }
         }
         Ok(Self {
             location,
@@ -136,6 +155,7 @@ pub fn run(request: CssRequest) -> Result<()> {
     match request.command() {
         CssCommand::ImportCsstree => importer::run(&request),
         CssCommand::Generate => full_generation::run(&request),
+        CssCommand::CheckCorpus => check::run(&request),
     }
 }
 

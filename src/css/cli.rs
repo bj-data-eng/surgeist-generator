@@ -53,6 +53,9 @@ fn run_from_args(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
             Some("generate") => {
                 set_once(&mut command, CssCommand::Generate, "CSS command")?;
             }
+            Some("check-corpus") => {
+                set_once(&mut command, CssCommand::CheckCorpus, "CSS command")?;
+            }
             Some(value) => return Err(cli_error(format!("unknown CSS command: {value}"))),
             None => return Err(cli_error("CSS command name must be UTF-8")),
         }
@@ -73,6 +76,14 @@ fn run_from_args(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
         CssCommand::Generate => {
             if source_root.is_some() {
                 return Err(cli_error("generate forbids --source-root"));
+            }
+        }
+        CssCommand::CheckCorpus => {
+            if source_root.is_some() {
+                return Err(cli_error("check-corpus forbids --source-root"));
+            }
+            if filter.is_some() {
+                return Err(cli_error("check-corpus forbids --filter"));
             }
         }
     }

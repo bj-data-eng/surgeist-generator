@@ -84,6 +84,16 @@ fn css_cli_filter_syntax_and_option_matrix_precede_io() {
             ["--filter", "declaration"],
             "surgeist-css-generate: parse CSS command line: import-csstree forbids --filter\n",
         ),
+        (
+            "check-corpus",
+            ["--source-root", "checkout"],
+            "surgeist-css-generate: parse CSS command line: check-corpus forbids --source-root\n",
+        ),
+        (
+            "check-corpus",
+            ["--filter", "declaration"],
+            "surgeist-css-generate: parse CSS command line: check-corpus forbids --filter\n",
+        ),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_surgeist-css-generate"))
             .args([
@@ -114,6 +124,21 @@ fn css_cli_filter_syntax_and_option_matrix_precede_io() {
             "generate",
             "--filter",
             "declaration",
+        ])
+        .output()
+        .expect("run packaged CSS binary");
+    assert_eq!(accepted.status.code(), Some(1));
+    assert!(accepted.stdout.is_empty());
+    let diagnostic = String::from_utf8(accepted.stderr).expect("UTF-8 diagnostic");
+    assert!(diagnostic.starts_with("surgeist-css-generate: canonicalize owner root:"));
+
+    let accepted = Command::new(env!("CARGO_BIN_EXE_surgeist-css-generate"))
+        .args([
+            "--owner-root",
+            "does-not-exist",
+            "--corpus-root",
+            "does-not-exist",
+            "check-corpus",
         ])
         .output()
         .expect("run packaged CSS binary");
@@ -200,7 +225,7 @@ fn css_cli_import_csstree_executes_real_public_path() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn css_cli_generate_executes_real_full_and_filtered_public_paths() {
+fn css_cli_generate_filtered_and_check_execute_real_public_paths() {
     let root = TestRoot::new();
     let owner = root.0.join("owner");
     let corpus = owner.join("corpus");
@@ -340,4 +365,64 @@ fn css_cli_generate_executes_real_full_and_filtered_public_paths() {
         fs::read(report).expect("read preserved report"),
         report_bytes
     );
+
+    let repair = Command::new(env!("CARGO_BIN_EXE_surgeist-css-generate"))
+        .arg("--owner-root")
+        .arg(&owner)
+        .arg("--corpus-root")
+        .arg(&corpus)
+        .arg("generate")
+        .output()
+        .expect("repair the intentionally stale unselected expectation");
+    assert!(
+        repair.status.success(),
+        "CSS repair generation failed: {}",
+        String::from_utf8_lossy(&repair.stderr)
+    );
+    fs::remove_dir_all(&checkout).expect("remove source checkout before read-only check");
+    let before = snapshot_tree(&corpus);
+
+    let check = Command::new(env!("CARGO_BIN_EXE_surgeist-css-generate"))
+        .arg("--owner-root")
+        .arg(&owner)
+        .arg("--corpus-root")
+        .arg(&corpus)
+        .arg("check-corpus")
+        .output()
+        .expect("run packaged CSS corpus check");
+    assert!(
+        check.status.success(),
+        "CSS corpus check failed: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    assert!(check.stdout.is_empty());
+    assert!(check.stderr.is_empty());
+    assert_eq!(snapshot_tree(&corpus), before);
+}
+
+fn snapshot_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn visit(base: &Path, current: &Path, output: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let mut entries = fs::read_dir(current)
+            .expect("read CLI snapshot directory")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("read CLI snapshot entries");
+        entries.sort_by_key(fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            if entry.file_type().expect("CLI snapshot entry type").is_dir() {
+                visit(base, &path, output);
+            } else {
+                output.push((
+                    path.strip_prefix(base)
+                        .expect("CLI snapshot relative path")
+                        .to_path_buf(),
+                    fs::read(path).expect("read CLI snapshot file"),
+                ));
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    visit(root, root, &mut output);
+    output
 }

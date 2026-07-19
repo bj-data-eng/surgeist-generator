@@ -272,10 +272,12 @@ mod imports {
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use crate::core::{Domain, GenerationLease};
     use crate::css::{CssCommand, CssRequest};
     use crate::{
         ArtifactProvenance, CorpusLocation, GenerationCounts, GenerationReport, GeneratorErrorKind,
-        ManifestVersion, PinnedSource, RelativePath, ReportArtifact, Sha256Digest, SourceRevision,
+        ManifestVersion, PinnedSource, RelativePath, ReportArtifact, RunScope, Sha256Digest,
+        SourceRevision,
     };
 
     use super::{CSSTREE_REPOSITORY, manifest_text};
@@ -398,6 +400,11 @@ mod imports {
             .expect("filtered generation request")
         }
 
+        fn check_request(&self) -> CssRequest {
+            CssRequest::new(self.location.clone(), CssCommand::CheckCorpus, None, None)
+                .expect("corpus check request")
+        }
+
         fn pin(&self) -> PinnedSource {
             PinnedSource::new(
                 "csstree",
@@ -418,6 +425,10 @@ mod imports {
 
         fn generate_filtered(&self, filter: &str) -> crate::Result<()> {
             crate::css::run(self.filtered_generate_request(filter))
+        }
+
+        fn check(&self) -> crate::Result<()> {
+            crate::css::run(self.check_request())
         }
 
         fn set_manifest(
@@ -2983,5 +2994,245 @@ mod imports {
         assert!(!pre_lease_reached.get());
         assert_eq!(snapshot_tree(&expectation_root), before);
         assert_no_import_intent_journal_or_stage(&fixture);
+    }
+
+    fn current_check_fixture() -> Fixture {
+        let fixture = imported_generation_fixture(
+            "declaration/Case.json",
+            b"{\"case\":{\"source\":\"a{}\",\"ast\":{},\"generate\":\"a{}\"}}\n",
+            1,
+            &[],
+        );
+        fixture.generate().expect("publish current CSS corpus");
+        fixture
+    }
+
+    fn other_hex(value: &str) -> String {
+        if value.starts_with('0') {
+            "1".repeat(value.len())
+        } else {
+            "0".repeat(value.len())
+        }
+    }
+
+    fn assert_check_error_preserves(fixture: &Fixture, expected: GeneratorErrorKind) {
+        let before_bytes = snapshot_tree(&fixture.root);
+        let before_identities = snapshot_path_identities(&fixture.root);
+        let before_root_identity = path_identity(&fixture.root);
+
+        let error = fixture
+            .check()
+            .expect_err("CSS corpus check must reject state");
+
+        assert_eq!(
+            error.kind(),
+            expected,
+            "unexpected check diagnostic: {error}"
+        );
+        assert_eq!(snapshot_tree(&fixture.root), before_bytes);
+        assert_eq!(snapshot_path_identities(&fixture.root), before_identities);
+        assert_eq!(path_identity(&fixture.root), before_root_identity);
+    }
+
+    #[test]
+    fn css_read_only_current_check_needs_no_source_and_preserves_every_identity() {
+        let fixture = current_check_fixture();
+        remove_completed_coordination(&fixture);
+        fs::remove_dir_all(&fixture.source).expect("remove source checkout before check");
+        let outside = fixture.root.join("outside-sentinel");
+        fs::write(&outside, b"outside bytes must remain unchanged\n").expect("write sentinel");
+        let before_bytes = snapshot_tree(&fixture.root);
+        let before_identities = snapshot_path_identities(&fixture.root);
+        let before_root_identity = path_identity(&fixture.root);
+
+        fixture.check().expect("current corpus check");
+
+        assert_eq!(snapshot_tree(&fixture.root), before_bytes);
+        assert_eq!(snapshot_path_identities(&fixture.root), before_identities);
+        assert_eq!(path_identity(&fixture.root), before_root_identity);
+        assert!(!fixture.corpus.join(".surgeist-generator").exists());
+    }
+
+    #[test]
+    fn css_check_absent_and_stale_known_states_are_verification() {
+        let absent_import = Fixture::new(&[(
+            "declaration/Case.json",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+            false,
+        )]);
+        absent_import.set_manifest(1, 1, &[]);
+        assert_check_error_preserves(&absent_import, GeneratorErrorKind::Verification);
+
+        let absent_expectations = imported_generation_fixture(
+            "declaration/Case.json",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+            1,
+            &[],
+        );
+        assert_check_error_preserves(&absent_expectations, GeneratorErrorKind::Verification);
+
+        let missing_expectation = current_check_fixture();
+        fs::remove_file(
+            missing_expectation
+                .corpus
+                .join("expectations/declaration/Case.json"),
+        )
+        .expect("remove known expectation");
+        assert_check_error_preserves(&missing_expectation, GeneratorErrorKind::Verification);
+
+        let stale_sidecar = current_check_fixture();
+        let sidecar_path = stale_sidecar.imported(".surgeist-source.json");
+        let sidecar = fs::read(&sidecar_path).expect("read sidecar");
+        fs::write(
+            &sidecar_path,
+            canonical_sidecar_replacement(
+                &sidecar,
+                &stale_sidecar.revision,
+                &other_hex(&stale_sidecar.revision),
+                "source revision",
+            ),
+        )
+        .expect("write stale sidecar");
+        assert_check_error_preserves(&stale_sidecar, GeneratorErrorKind::Verification);
+
+        let stale_source = current_check_fixture();
+        fs::write(
+            stale_source.imported("declaration/Case.json"),
+            b"{\"case\":{\"source\":\"stale\",\"ast\":{}}}\n",
+        )
+        .expect("write stale imported source");
+        assert_check_error_preserves(&stale_source, GeneratorErrorKind::Verification);
+
+        let stale_expectation = current_check_fixture();
+        let expectation_path = stale_expectation
+            .corpus
+            .join("expectations/declaration/Case.json");
+        let expectation = fs::read(&expectation_path).expect("read expectation");
+        fs::write(
+            &expectation_path,
+            canonical_sidecar_replacement(
+                &expectation,
+                &stale_expectation.revision,
+                &other_hex(&stale_expectation.revision),
+                "expectation source revision",
+            ),
+        )
+        .expect("write stale canonical expectation");
+        assert_check_error_preserves(&stale_expectation, GeneratorErrorKind::Verification);
+
+        let stale_report = current_check_fixture();
+        let manifest_digest = Sha256Digest::from_file(stale_report.corpus.join("corpus.toml"))
+            .expect("manifest digest")
+            .as_str()
+            .to_owned();
+        let report_path = stale_report
+            .corpus
+            .join("expectations/generation-reports/all.json");
+        let report = fs::read(&report_path).expect("read report");
+        fs::write(
+            &report_path,
+            canonical_sidecar_replacement(
+                &report,
+                &manifest_digest,
+                &other_hex(&manifest_digest),
+                "report manifest digest",
+            ),
+        )
+        .expect("write stale canonical report");
+        assert_check_error_preserves(&stale_report, GeneratorErrorKind::Verification);
+    }
+
+    #[test]
+    fn css_check_unknown_and_malformed_artifacts_are_invalid_inventory() {
+        let unknown_import = current_check_fixture();
+        fs::write(unknown_import.imported("unknown.json"), b"{}\n")
+            .expect("write unknown import entry");
+        assert_check_error_preserves(&unknown_import, GeneratorErrorKind::InvalidInventory);
+
+        let unknown_expectation = current_check_fixture();
+        fs::write(
+            unknown_expectation.corpus.join("expectations/unknown.json"),
+            b"{}\n",
+        )
+        .expect("write unknown expectation entry");
+        assert_check_error_preserves(&unknown_expectation, GeneratorErrorKind::InvalidInventory);
+
+        let malformed_sidecar = current_check_fixture();
+        fs::write(malformed_sidecar.imported(".surgeist-source.json"), b"{}\n")
+            .expect("write malformed sidecar");
+        assert_check_error_preserves(&malformed_sidecar, GeneratorErrorKind::InvalidInventory);
+
+        let malformed_expectation = current_check_fixture();
+        fs::write(
+            malformed_expectation
+                .corpus
+                .join("expectations/declaration/Case.json"),
+            b"not JSON\n",
+        )
+        .expect("write malformed expectation");
+        assert_check_error_preserves(&malformed_expectation, GeneratorErrorKind::InvalidInventory);
+
+        let malformed_report = current_check_fixture();
+        fs::write(
+            malformed_report
+                .corpus
+                .join("expectations/generation-reports/all.json"),
+            b"{}\n",
+        )
+        .expect("write malformed report authority");
+        assert_check_error_preserves(&malformed_report, GeneratorErrorKind::InvalidInventory);
+    }
+
+    #[test]
+    fn css_check_rejects_persisted_report_path_collision() {
+        let fixture = current_check_fixture();
+        let sidecar_path = fixture.imported(".surgeist-source.json");
+        let sidecar = String::from_utf8(fs::read(&sidecar_path).expect("sidecar"))
+            .expect("UTF-8 sidecar")
+            .replace("declaration/Case.json", "generation-reports/all.json");
+        fs::write(&sidecar_path, sidecar).expect("persist colliding sidecar");
+        fs::remove_dir_all(fixture.corpus.join("source/declaration"))
+            .expect("remove original source fixture");
+        let colliding = fixture.imported("generation-reports/all.json");
+        fs::create_dir_all(colliding.parent().expect("collision parent"))
+            .expect("create collision parent");
+        fs::write(colliding, b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n")
+            .expect("write colliding fixture");
+
+        assert_check_error_preserves(&fixture, GeneratorErrorKind::InvalidInventory);
+    }
+
+    #[test]
+    fn css_read_only_coordination_states_are_verification_and_byte_identical() {
+        let active = current_check_fixture();
+        let lease = GenerationLease::acquire(
+            &active.location,
+            Domain::Css,
+            "surgeist-css-generate",
+            &RunScope::Full,
+            "generate",
+        )
+        .expect("hold active exclusive CSS lease");
+        assert_check_error_preserves(&active, GeneratorErrorKind::Verification);
+        drop(lease);
+
+        let resumable = current_check_fixture();
+        let active_transaction = resumable
+            .corpus
+            .join(".surgeist-generator/transactions/css/active-read-only-test");
+        fs::create_dir(&active_transaction).expect("create resumable transaction residue");
+        fs::set_permissions(&active_transaction, fs::Permissions::from_mode(0o700))
+            .expect("set private residue mode");
+        assert_check_error_preserves(&resumable, GeneratorErrorKind::Verification);
+
+        let malformed = current_check_fixture();
+        fs::write(
+            malformed
+                .corpus
+                .join(".surgeist-generator/acquisition.lock"),
+            b"malformed lock header\n",
+        )
+        .expect("malform immutable acquisition lock");
+        assert_check_error_preserves(&malformed, GeneratorErrorKind::Verification);
     }
 }

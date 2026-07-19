@@ -22,6 +22,10 @@ impl HistoricalInventory {
         &self.classified_paths
     }
 
+    pub(super) const fn has_report(&self) -> bool {
+        self.report.is_some()
+    }
+
     pub(super) fn validate_union(&self, desired: &BTreeSet<RelativePath>) -> Result<()> {
         let Some(inventory) = &self.inventory else {
             return Ok(());

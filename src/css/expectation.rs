@@ -64,6 +64,43 @@ enum UpstreamOutcome {
     Rejected,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedExpectationFile {
+    schema_version: u8,
+    generator: String,
+    source: RelativePath,
+    source_sha256: Sha256Digest,
+    source_revision: SourceRevision,
+    import_provenance_sha256: Sha256Digest,
+    cases: Vec<PersistedExpectationCase>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedExpectationCase {
+    id: String,
+    context: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    input: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<CanonicalObject>,
+    upstream_outcome: PersistedUpstreamOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canonical_css: Option<String>,
+    status: CaseDisposition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum PersistedUpstreamOutcome {
+    Parsed,
+    Rejected,
+}
+
 #[derive(Serialize)]
 #[serde(transparent)]
 struct CanonicalObject(BTreeMap<String, CanonicalValue>);
@@ -249,6 +286,139 @@ pub(super) fn derive(
         0,
     )?;
     Ok(DerivedExpectations { artifacts, counts })
+}
+
+pub(super) fn validate_persisted(
+    bytes: &[u8],
+    fixture_path: &RelativePath,
+    manifest: &CssManifest,
+) -> Result<()> {
+    reject_duplicate_members_and_trailing(bytes, fixture_path)?;
+    let persisted: PersistedExpectationFile = serde_json::from_slice(bytes).map_err(|error| {
+        invalid_inventory_with_source(
+            "parse persisted CSS expectation",
+            format!("invalid expectation schema: {}", fixture_path.as_str()),
+            error,
+        )
+    })?;
+    let mut canonical = serde_json::to_vec_pretty(&persisted).map_err(|error| {
+        invalid_inventory_with_source(
+            "serialize persisted CSS expectation",
+            fixture_path.as_str(),
+            error,
+        )
+    })?;
+    canonical.push(b'\n');
+    if canonical != bytes {
+        return Err(invalid_inventory(format!(
+            "CSS expectation bytes are not canonical: {}",
+            fixture_path.as_str()
+        )));
+    }
+    if persisted.schema_version != 1 || persisted.generator != GENERATOR {
+        return Err(invalid_inventory(format!(
+            "CSS expectation header is noncanonical: {}",
+            fixture_path.as_str()
+        )));
+    }
+    if persisted.source != prefixed(&manifest.import_root, fixture_path)? {
+        return Err(invalid_inventory(format!(
+            "CSS expectation source mapping is invalid: {}",
+            fixture_path.as_str()
+        )));
+    }
+    if persisted.cases.is_empty() {
+        return Err(invalid_inventory(format!(
+            "CSS expectation has no cases: {}",
+            fixture_path.as_str()
+        )));
+    }
+
+    let context = fixture_path
+        .as_str()
+        .split('/')
+        .next()
+        .ok_or_else(|| invalid_inventory("CSS expectation path has no context component"))?;
+    let mut prior_id = None::<&str>;
+    let mut rejected_indices = BTreeSet::new();
+    for case in &persisted.cases {
+        CssCaseId::new(&case.id, fixture_path)?;
+        if prior_id.is_some_and(|prior| prior >= case.id.as_str()) {
+            return Err(invalid_inventory(format!(
+                "CSS expectation case IDs are not strictly increasing: {}",
+                fixture_path.as_str()
+            )));
+        }
+        prior_id = Some(&case.id);
+        if case.context != context
+            || !crate::core::validate_disposition_reason(case.status, case.reason.as_deref())
+        {
+            return Err(invalid_inventory(format!(
+                "CSS expectation case metadata is invalid: {}",
+                case.id
+            )));
+        }
+        match case.upstream_outcome {
+            PersistedUpstreamOutcome::Parsed => {
+                let label = case.label.as_deref().ok_or_else(|| {
+                    invalid_inventory(format!("parsed CSS expectation has no label: {}", case.id))
+                })?;
+                let expected_id = format!(
+                    "{}#/{}",
+                    fixture_path.as_str(),
+                    escape_json_pointer_token(label)
+                );
+                if case.id != expected_id {
+                    return Err(invalid_inventory(format!(
+                        "parsed CSS expectation ID does not match its label: {}",
+                        case.id
+                    )));
+                }
+            }
+            PersistedUpstreamOutcome::Rejected => {
+                if case.label.is_some() || case.options.is_some() || case.canonical_css.is_some() {
+                    return Err(invalid_inventory(format!(
+                        "rejected CSS expectation contains parsed-only fields: {}",
+                        case.id
+                    )));
+                }
+                let prefix = format!("{}#/error/", fixture_path.as_str());
+                let index = case
+                    .id
+                    .strip_prefix(&prefix)
+                    .and_then(parse_canonical_index)
+                    .ok_or_else(|| {
+                        invalid_inventory(format!(
+                            "rejected CSS expectation ID is invalid: {}",
+                            case.id
+                        ))
+                    })?;
+                if !rejected_indices.insert(index) {
+                    return Err(invalid_inventory(format!(
+                        "duplicate rejected CSS expectation index: {index}"
+                    )));
+                }
+            }
+        }
+    }
+    if rejected_indices
+        .iter()
+        .copied()
+        .ne(0..rejected_indices.len())
+    {
+        return Err(invalid_inventory(format!(
+            "rejected CSS expectation indices are not contiguous: {}",
+            fixture_path.as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn parse_canonical_index(value: &str) -> Option<usize> {
+    if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
+        return None;
+    }
+    value.parse().ok()
 }
 
 fn disposition_index(disposition: CaseDisposition) -> usize {

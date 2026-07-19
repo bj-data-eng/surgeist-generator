@@ -382,7 +382,7 @@ fn portable_count_bounds_and_structural_report_counts_are_enforced() {
 
 #[cfg(feature = "css-corpus")]
 #[test]
-fn css_public_request_constructs_import_full_and_filtered_generate_payloads() {
+fn css_public_request_constructs_import_generate_and_check_payloads() {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -441,6 +441,13 @@ fn css_public_request_constructs_import_full_and_filtered_generate_payloads() {
     assert_eq!(filtered.source_root(), None);
     assert_eq!(filtered.filter(), Some(&filter));
 
+    let check = CssRequest::new(location.clone(), CssCommand::CheckCorpus, None, None)
+        .expect("I/O-free corpus check request");
+    assert_eq!(check.location(), &location);
+    assert_eq!(check.command(), CssCommand::CheckCorpus);
+    assert_eq!(check.source_root(), None);
+    assert_eq!(check.filter(), None);
+
     for (source_root, filter) in [
         (None, None),
         (Some(PathBuf::new()), None),
@@ -468,6 +475,23 @@ fn css_public_request_constructs_import_full_and_filtered_generate_payloads() {
     ] {
         let error = CssRequest::new(location.clone(), CssCommand::Generate, source_root, filter)
             .expect_err("invalid generation payload");
+        assert_eq!(error.kind(), GeneratorErrorKind::Cli);
+    }
+
+    for (source_root, filter) in [
+        (Some(source), None),
+        (
+            None,
+            Some(RelativePath::new("declaration").expect("filter")),
+        ),
+    ] {
+        let error = CssRequest::new(
+            location.clone(),
+            CssCommand::CheckCorpus,
+            source_root,
+            filter,
+        )
+        .expect_err("invalid corpus check payload");
         assert_eq!(error.kind(), GeneratorErrorKind::Cli);
     }
 }

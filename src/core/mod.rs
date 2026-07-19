@@ -32,7 +32,7 @@ pub(crate) use fs::{CORPUS_FILE_MODE, NodeKind, RootedFs};
 #[cfg(feature = "css-corpus")]
 pub(crate) use inventory::{Inventory, InventoryPolicy};
 #[cfg(feature = "css-corpus")]
-pub(crate) use lease::GenerationLease;
+pub(crate) use lease::{GenerationCheck, GenerationLease};
 #[cfg(feature = "css-corpus")]
 pub(crate) use protection::{NamespaceDisjointness, ProtectedSourceDisjointness};
 #[cfg(feature = "css-corpus")]
@@ -61,8 +61,6 @@ fn private_front_doors_are_linked() {
     let _ = artifact::PublicationPolicy::DiagnosticFull;
     let _ = lease::GenerationLease::acquire;
     let _ = lease::GenerationLease::acquire_with_protected_source;
-    let _ = lease::GenerationCheck::acquire;
-    let _ = lease::GenerationCheck::finish;
     let _ = inventory::InventoryEntry::symlink;
     let _ = inventory::InventoryEntry::length;
     let _ = inventory::InventoryEntry::digest;
