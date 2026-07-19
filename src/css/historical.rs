@@ -160,11 +160,11 @@ fn validate_report(
     }
     validate_nonoverlapping_paths(
         paths.iter().map(|(source, _)| source),
-        "historical source paths",
+        "historical source path",
     )?;
     validate_nonoverlapping_paths(
         paths.iter().map(|(_, output)| output),
-        "historical output paths",
+        "historical output path",
     )?;
 
     let mut classified = BTreeSet::from([report_relative]);
@@ -190,19 +190,54 @@ fn validate_nonoverlapping_paths<'a>(
 ) -> Result<()> {
     let mut prior = Vec::<&RelativePath>::new();
     for path in paths {
-        if let Some(collision) = prior
-            .iter()
-            .find(|candidate| sidecar::paths_overlap(candidate.as_str(), path.as_str()))
-        {
-            return Err(invalid_inventory(format!(
-                "CSS {label} collide: {} and {}",
-                collision.as_str(),
-                path.as_str()
-            )));
+        for collision in &prior {
+            if paths_overlap(collision, path, label)? {
+                return Err(invalid_inventory(format!(
+                    "CSS {label}s collide: {} and {}",
+                    collision.as_str(),
+                    path.as_str()
+                )));
+            }
         }
         prior.push(path);
     }
     Ok(())
+}
+
+fn paths_overlap(left: &RelativePath, right: &RelativePath, label: &str) -> Result<bool> {
+    Ok(is_same_or_descendant(left, right, label)? || is_same_or_descendant(right, left, label)?)
+}
+
+fn is_same_or_descendant(
+    path: &RelativePath,
+    ancestor: &RelativePath,
+    label: &str,
+) -> Result<bool> {
+    let mut path_components = path.as_str().split('/');
+    for ancestor_component in ancestor.as_str().split('/') {
+        let Some(path_component) = path_components.next() else {
+            return Ok(false);
+        };
+        if !target_components_equal(path_component, ancestor_component, label)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn target_components_equal(left: &str, right: &str, label: &str) -> Result<bool> {
+    if left == right {
+        return Ok(true);
+    }
+    if left.is_ascii() && right.is_ascii() {
+        #[cfg(target_os = "macos")]
+        return Ok(left.eq_ignore_ascii_case(right));
+        #[cfg(not(target_os = "macos"))]
+        return Ok(false);
+    }
+    Err(invalid_inventory(format!(
+        "cannot prove distinct {label} components: {left:?} and {right:?}"
+    )))
 }
 
 fn strip_root(path: &RelativePath, root: &RelativePath) -> Option<RelativePath> {
@@ -249,20 +284,20 @@ mod tests {
             ["a.json/b.json", "a.json"],
         ] {
             let paths = paths(&colliding);
-            validate_nonoverlapping_paths(paths.iter(), "test paths")
+            validate_nonoverlapping_paths(paths.iter(), "test path")
                 .expect_err("exact or ancestor collision");
         }
 
         let distinct = paths(&["a.json", "a.json-copy/b.json"]);
-        validate_nonoverlapping_paths(distinct.iter(), "test paths")
+        validate_nonoverlapping_paths(distinct.iter(), "test path")
             .expect("partial component is not a collision");
 
         let target_aliases = paths(&["Case.json", "case.json"]);
         #[cfg(target_os = "macos")]
-        validate_nonoverlapping_paths(target_aliases.iter(), "test paths")
+        validate_nonoverlapping_paths(target_aliases.iter(), "test path")
             .expect_err("macOS target aliases collide");
         #[cfg(not(target_os = "macos"))]
-        validate_nonoverlapping_paths(target_aliases.iter(), "test paths")
+        validate_nonoverlapping_paths(target_aliases.iter(), "test path")
             .expect("case-distinct paths do not alias on this target");
     }
 }

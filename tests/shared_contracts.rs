@@ -124,32 +124,45 @@ fn disposition_records_preserve_source_independent_case_id_compatibility() {
 }
 
 #[test]
-fn disposition_case_ids_preserve_hashes_in_strict_sources_and_pointer_tokens() {
-    let source = RelativePath::new("nested#source/Fixture#.json").unwrap();
-    let id = "nested#source/Fixture#.json#/before#~1middle~1#after";
-    let record = CaseDispositionRecord::new(
-        id,
-        source.clone(),
-        CaseDisposition::ExpectedFail,
-        Some("known hash-label mismatch"),
+fn disposition_record_constructor_rejects_multiple_hash_delimiters() {
+    let error = CaseDispositionRecord::new(
+        "a.json##/x",
+        RelativePath::new("source.json").expect("strict source path"),
+        CaseDisposition::Active,
+        None::<String>,
     )
-    .unwrap();
-    assert_eq!(record.case_id(), id);
-    assert_eq!(record.source_path(), &source);
+    .expect_err("generic case IDs have at most one hash delimiter");
+    assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+}
 
-    for malformed in [
+#[test]
+fn disposition_record_deserializer_rejects_multiple_hash_delimiters() {
+    let encoded = r#"{"case_id":"a.json##/x","source_path":"source.json","disposition":"active"}"#;
+    let error = serde_json::from_str::<CaseDispositionRecord>(encoded)
+        .expect_err("public serde preserves the generic case-ID grammar");
+    assert!(
+        error.to_string().contains("InvalidInventory"),
+        "unexpected serde diagnostic: {error}"
+    );
+}
+
+#[test]
+fn disposition_case_ids_keep_literal_hash_support_outside_the_public_generic_grammar() {
+    let source = RelativePath::new("nested#source/Fixture#.json").unwrap();
+    for private_css_id in [
+        "nested#source/Fixture#.json#/before#~1middle~1#after",
         "nested#source/Fixture#.json#pointer",
         "nested#source/Fixture#.json#/bad~2escape",
     ] {
         assert!(
             CaseDispositionRecord::new(
-                malformed,
+                private_css_id,
                 source.clone(),
                 CaseDisposition::Active,
                 None::<String>,
             )
             .is_err(),
-            "accepted malformed delimiter spelling {malformed:?}"
+            "public generic constructor accepted private CSS ID {private_css_id:?}"
         );
     }
 }

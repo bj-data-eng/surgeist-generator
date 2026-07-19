@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::core::{ObjectFormat, SnapshotEntry, VerifiedSourceSnapshot};
 use crate::{GeneratorErrorKind, PinnedSource, RelativePath, Sha256Digest, SourceRevision};
 
-use super::{manifest, sidecar};
+use super::{case, manifest, sidecar};
 
 const CSSTREE_REPOSITORY: &str = "https://github.com/csstree/csstree.git";
 const SHA1_REVISION: &str = "1111111111111111111111111111111111111111";
@@ -66,12 +66,29 @@ fn css_manifest_override_binding_uses_the_exact_json_fixture_source() {
     let record = parsed.cases[0]
         .bind(&RelativePath::new("nested#context/Fixture#.json").expect("matching source"))
         .expect("exact source-bound override");
-    assert_eq!(record.case_id(), id);
+    assert_eq!(record.case_id().as_str(), id);
 
     let error = parsed.cases[0]
         .bind(&RelativePath::new("other/Fixture.json").expect("mismatched source"))
         .expect_err("override must remain owned by its exact fixture source");
     assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+}
+
+#[test]
+fn css_case_private_parser_accepts_historical_source_and_pointer_token_hashes() {
+    let source = RelativePath::new("nested#context/Fixture#.json").expect("strict CSS source");
+    let id = "nested#context/Fixture#.json#/before#~1middle~1#after";
+    let parsed = case::CssCaseId::new(id, &source).expect("private source-bound CSS case ID");
+    assert_eq!(parsed.as_str(), id);
+    let record = case::CssCaseDispositionRecord::new(
+        id,
+        &source,
+        crate::CaseDisposition::ExpectedFail,
+        Some("historical hash-label mismatch"),
+    )
+    .expect("private source-bound CSS record");
+    assert_eq!(record.disposition(), crate::CaseDisposition::ExpectedFail);
+    assert_eq!(record.reason(), Some("historical hash-label mismatch"));
 }
 
 #[test]
@@ -1747,6 +1764,25 @@ mod imports {
             ("one.json", "two.json"),
             ("a.json", "a.json/b.json"),
             "historical output paths collide",
+        );
+    }
+
+    #[test]
+    fn css_historical_inventory_rejects_unicode_case_ambiguous_sources_before_lease_or_intent() {
+        assert_historical_path_collision_is_pre_lease(
+            ("\u{00c9}.json", "\u{00e9}.json"),
+            ("one.json", "two.json"),
+            "cannot prove distinct historical source path components",
+        );
+    }
+
+    #[test]
+    fn css_historical_inventory_rejects_unicode_normalization_ambiguous_outputs_before_lease_or_intent()
+     {
+        assert_historical_path_collision_is_pre_lease(
+            ("one.json", "two.json"),
+            ("\u{00e9}.json", "e\u{0301}.json"),
+            "cannot prove distinct historical output path components",
         );
     }
 

@@ -3,13 +3,13 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::core::{
-    validate_disposition_reason, validate_json_case_id_for_source, validate_json_case_id_syntax,
-};
+use crate::core::validate_disposition_reason;
 use crate::{
-    CaseDisposition, CaseDispositionRecord, GeneratorError, GeneratorErrorKind, ManifestVersion,
-    RelativePath, Result, SourceRevision, parse_manifest,
+    CaseDisposition, GeneratorError, GeneratorErrorKind, ManifestVersion, RelativePath, Result,
+    SourceRevision, parse_manifest,
 };
+
+use super::case::{CssCaseDispositionRecord, has_bindable_syntax};
 
 pub(super) const CSSTREE_REPOSITORY: &str = "https://github.com/csstree/csstree.git";
 pub(super) const FIXTURE_ROOT: &str = "fixtures/ast";
@@ -41,20 +41,8 @@ impl CssCaseOverride {
         &self.id
     }
 
-    pub(super) fn bind(&self, source_path: &RelativePath) -> Result<CaseDispositionRecord> {
-        if !validate_json_case_id_for_source(&self.id, source_path) {
-            return Err(super::invalid_inventory(format!(
-                "CSS case override {} does not belong to fixture {}",
-                self.id,
-                source_path.as_str()
-            )));
-        }
-        CaseDispositionRecord::new(
-            &self.id,
-            source_path.clone(),
-            self.status,
-            self.reason.clone(),
-        )
+    pub(super) fn bind(&self, source_path: &RelativePath) -> Result<CssCaseDispositionRecord> {
+        CssCaseDispositionRecord::new(&self.id, source_path, self.status, self.reason.clone())
     }
 }
 
@@ -143,7 +131,7 @@ pub(super) fn parse(bytes: &[u8], path: &Path) -> Result<CssManifest> {
     let mut case_ids = BTreeSet::new();
     let mut cases = Vec::with_capacity(raw.cases.len());
     for case in raw.cases {
-        if !validate_json_case_id_syntax(&case.id) {
+        if !has_bindable_syntax(&case.id) {
             return Err(invalid_manifest(
                 "case ID must contain a strict JSON source and canonical JSON pointer",
             ));

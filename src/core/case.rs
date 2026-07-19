@@ -163,42 +163,6 @@ impl<'de> Deserialize<'de> for CaseDisposition {
 }
 
 fn validate_case_id(value: &str) -> bool {
-    if !validate_case_id_text(value) {
-        return false;
-    }
-    if !value.contains('#') {
-        return RelativePath::new(value).is_ok();
-    }
-    value.match_indices('#').any(|(delimiter, _)| {
-        let (source, suffix) = value.split_at(delimiter);
-        RelativePath::new(source).is_ok()
-            && suffix
-                .strip_prefix('#')
-                .is_some_and(validate_generic_case_pointer)
-    })
-}
-
-#[cfg(feature = "css-corpus")]
-pub(crate) fn validate_json_case_id_syntax(value: &str) -> bool {
-    validate_case_id_text(value)
-        && value.match_indices('#').any(|(delimiter, _)| {
-            let (source, suffix) = value.split_at(delimiter);
-            RelativePath::with_extension(source, "json").is_ok()
-                && suffix.strip_prefix('#').is_some_and(validate_json_pointer)
-        })
-}
-
-#[cfg(feature = "css-corpus")]
-pub(crate) fn validate_json_case_id_for_source(value: &str, source_path: &RelativePath) -> bool {
-    validate_case_id_text(value)
-        && RelativePath::with_extension(source_path.as_str(), "json").is_ok()
-        && value
-            .strip_prefix(source_path.as_str())
-            .and_then(|suffix| suffix.strip_prefix('#'))
-            .is_some_and(validate_json_pointer)
-}
-
-fn validate_case_id_text(value: &str) -> bool {
     if value.is_empty()
         || value.len() > 4096
         || value.trim() != value
@@ -207,15 +171,18 @@ fn validate_case_id_text(value: &str) -> bool {
     {
         return false;
     }
-    true
-}
-
-fn validate_generic_case_pointer(pointer: &str) -> bool {
-    pointer.is_empty() || validate_json_pointer(pointer)
-}
-
-fn validate_json_pointer(pointer: &str) -> bool {
-    if !pointer.starts_with('/') {
+    let mut parts = value.split('#');
+    let Some(path) = parts.next() else {
+        return false;
+    };
+    let suffix = parts.next();
+    if parts.next().is_some() || RelativePath::new(path).is_err() {
+        return false;
+    }
+    let Some(pointer) = suffix else {
+        return true;
+    };
+    if !pointer.is_empty() && !pointer.starts_with('/') {
         return false;
     }
     let bytes = pointer.as_bytes();
@@ -339,24 +306,24 @@ mod tests {
     }
 
     #[test]
-    fn case_ids_preserve_compatible_decompositions_and_literal_hashes() {
+    fn case_ids_reject_multiple_hash_delimiters_and_remain_source_independent() {
         let source = source("nested#context/Fixture#.json");
         for id in [
-            "nested#context/Fixture#.json#/",
-            "nested#context/Fixture#.json#/label#tail",
-            "nested#context/Fixture#.json#/before#~1middle~1#after~0tail",
-            "nested#context/Fixture#.json#",
-            "nested#context/Fixture#.json##/extra-delimiter",
-            "nested#context/Other.json#/label",
+            "nested/Fixture.json#/",
+            "nested/Fixture.json#/label~1tail",
+            "nested/Fixture.json#",
+            "nested/Other.json#/label",
         ] {
             CaseDispositionRecord::new(id, source.clone(), CaseDisposition::Active, None::<String>)
                 .unwrap_or_else(|error| panic!("rejected canonical case ID {id:?}: {error}"));
         }
 
         for id in [
-            "nested#context/Fixture#.json#not-a-pointer",
-            "nested#context/Fixture#.json#/bad~",
-            "nested#context/Fixture#.json#/bad~2escape",
+            "nested/Fixture.json##/extra-delimiter",
+            "nested/Fixture.json#/label#tail",
+            "nested/Fixture.json#not-a-pointer",
+            "nested/Fixture.json#/bad~",
+            "nested/Fixture.json#/bad~2escape",
         ] {
             assert!(
                 CaseDispositionRecord::new(

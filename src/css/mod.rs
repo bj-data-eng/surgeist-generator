@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, RelativePath, Result};
 
+mod case;
 mod cli;
 mod expectation;
 mod fixture;

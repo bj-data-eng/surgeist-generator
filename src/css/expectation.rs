@@ -4,12 +4,12 @@ use std::fmt;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::core::validate_json_case_id_for_source;
 use crate::{
     CaseDisposition, GenerationCounts, GeneratorError, GeneratorErrorKind, RelativePath, Result,
     Sha256Digest, SourceRevision,
 };
 
+use super::case::CssCaseId;
 use super::fixture::ValidatedImport;
 use super::manifest::CssManifest;
 
@@ -42,7 +42,7 @@ struct ExpectationFile<'a> {
 
 #[derive(Serialize)]
 struct ExpectationCase {
-    id: String,
+    id: CssCaseId,
     context: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     label: Option<String>,
@@ -141,12 +141,14 @@ pub(super) fn derive(
             .to_owned();
         let mut cases = Vec::with_capacity(raw.ordinary.len() + raw.errors.len());
         for (label, ordinary) in raw.ordinary {
-            let id = format!(
-                "{}#/{}",
-                fixture.path.as_str(),
-                escape_json_pointer_token(&label)
-            );
-            validate_derived_id(&id, &fixture.path)?;
+            let id = CssCaseId::new(
+                format!(
+                    "{}#/{}",
+                    fixture.path.as_str(),
+                    escape_json_pointer_token(&label)
+                ),
+                &fixture.path,
+            )?;
             cases.push(ExpectationCase {
                 id,
                 context: context.clone(),
@@ -160,8 +162,10 @@ pub(super) fn derive(
             });
         }
         for (index, error) in raw.errors.into_iter().enumerate() {
-            let id = format!("{}#/error/{index}", fixture.path.as_str());
-            validate_derived_id(&id, &fixture.path)?;
+            let id = CssCaseId::new(
+                format!("{}#/error/{index}", fixture.path.as_str()),
+                &fixture.path,
+            )?;
             cases.push(ExpectationCase {
                 id,
                 context: context.clone(),
@@ -185,13 +189,14 @@ pub(super) fn derive(
             if !all_ids.insert(case.id.clone()) {
                 return Err(invalid_inventory(format!(
                     "duplicate derived CSS case ID: {}",
-                    case.id
+                    case.id.as_str()
                 )));
             }
-            if let Some(record) = overrides.remove(&case.id) {
+            if let Some(record) = overrides.remove(case.id.as_str()) {
                 let record = record
                     .bind(&fixture.path)
                     .map_err(|error| invalid_inventory(error.to_string()))?;
+                case.id = record.case_id().clone();
                 case.status = record.disposition();
                 case.reason = record.reason().map(str::to_owned);
             }
@@ -244,16 +249,6 @@ pub(super) fn derive(
         0,
     )?;
     Ok(DerivedExpectations { artifacts, counts })
-}
-
-fn validate_derived_id(id: &str, source: &RelativePath) -> Result<()> {
-    if !validate_json_case_id_for_source(id, source) {
-        return Err(invalid_inventory(format!(
-            "derived CSS case ID {id} does not belong to fixture {}",
-            source.as_str()
-        )));
-    }
-    Ok(())
 }
 
 fn disposition_index(disposition: CaseDisposition) -> usize {
