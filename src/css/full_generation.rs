@@ -13,15 +13,27 @@ const COMMAND: &str = "generate";
 const MANIFEST_FILE: &str = "corpus.toml";
 
 pub(super) fn run(request: &CssRequest) -> Result<()> {
+    #[cfg(test)]
+    return run_impl(request, || {}, || {});
+    #[cfg(not(test))]
     run_impl(request, || {})
 }
 
 #[cfg(test)]
 pub(super) fn run_with_pre_lease_hook(request: &CssRequest, hook: impl FnOnce()) -> Result<()> {
-    run_impl(request, hook)
+    run_impl(request, hook, || {})
 }
 
-fn run_impl(request: &CssRequest, pre_lease_hook: impl FnOnce()) -> Result<()> {
+#[cfg(test)]
+pub(super) fn run_with_inter_scan_hook(request: &CssRequest, hook: impl FnOnce()) -> Result<()> {
+    run_impl(request, || {}, hook)
+}
+
+fn run_impl(
+    request: &CssRequest,
+    pre_lease_hook: impl FnOnce(),
+    #[cfg(test)] inter_scan_hook: impl FnOnce(),
+) -> Result<()> {
     let location = request.location();
     let manifest_path = location.corpus_root().join(MANIFEST_FILE);
     let manifest_bytes = super::importer::read_manifest_file(&manifest_path)?;
@@ -133,7 +145,7 @@ fn run_impl(request: &CssRequest, pre_lease_hook: impl FnOnce()) -> Result<()> {
         Ok(())
     };
     #[cfg(test)]
-    return plan.install_with_revalidation_and_inter_scan_hook(revalidate, || {});
+    return plan.install_with_revalidation_and_inter_scan_hook(revalidate, inter_scan_hook);
     #[cfg(not(test))]
     plan.install_with_revalidation(revalidate)
 }

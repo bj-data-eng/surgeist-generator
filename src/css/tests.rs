@@ -1841,6 +1841,141 @@ mod imports {
     }
 
     #[test]
+    fn css_full_generate_held_revalidation_rejects_current_import_byte_or_identity_change_before_intent()
+     {
+        for replace_identity in [false, true] {
+            let fixture = imported_generation_fixture(
+                "declaration/Case.json",
+                b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+                1,
+                &[],
+            );
+            fixture.generate().expect("seed current expectations");
+            let expectation_root = fixture.corpus.join("expectations");
+            let expectation = expectation_root.join("declaration/Case.json");
+            let report = expectation_root.join("generation-reports/all.json");
+            let before_tree = snapshot_tree(&expectation_root);
+            let before_root_identity = path_identity(&expectation_root);
+            let before_expectation_identity = path_identity(&expectation);
+            let before_report_identity = path_identity(&report);
+            let before_report_bytes = fixture.report();
+            let imported = fixture.imported("declaration/Case.json");
+            let displaced = fixture.root.join("displaced-imported-fixture.json");
+            let original_import_identity = path_identity(&imported);
+            let replacement_identity = Cell::new(None);
+            let replacement_bytes = if replace_identity {
+                fs::read(&imported).expect("read current imported fixture")
+            } else {
+                b"{\"case\":{\"source\":\"changed after validation\",\"ast\":{}}}\n".to_vec()
+            };
+
+            let error =
+                full_generation::run_with_inter_scan_hook(&fixture.generate_request(), || {
+                    if replace_identity {
+                        fs::rename(&imported, &displaced)
+                            .expect("displace validated imported fixture");
+                    }
+                    fs::write(&imported, &replacement_bytes)
+                        .expect("replace validated imported fixture");
+                    replacement_identity.set(Some(path_identity(&imported)));
+                })
+                .expect_err("held import proof change must reject generation");
+
+            if replace_identity {
+                assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+                assert_eq!(
+                    error.to_string(),
+                    "revalidate CSS generation inputs: current CSS import changed after held validation"
+                );
+            } else {
+                assert_eq!(error.kind(), GeneratorErrorKind::Verification);
+                assert_eq!(
+                    error.to_string(),
+                    "validate current CSS import: CSS imported fixture digest is stale: declaration/Case.json"
+                );
+            }
+            let retained_import_identity = path_identity(&imported);
+            assert_eq!(Some(retained_import_identity), replacement_identity.get());
+            if replace_identity {
+                assert_ne!(retained_import_identity, original_import_identity);
+            } else {
+                assert_eq!(retained_import_identity, original_import_identity);
+            }
+            assert_eq!(
+                fs::read(&imported).expect("read raced import"),
+                replacement_bytes
+            );
+            assert_eq!(snapshot_tree(&expectation_root), before_tree);
+            assert_eq!(path_identity(&expectation_root), before_root_identity);
+            assert_eq!(path_identity(&expectation), before_expectation_identity);
+            assert_eq!(fixture.report(), before_report_bytes);
+            assert_eq!(path_identity(&report), before_report_identity);
+            assert_no_import_intent_journal_or_stage(&fixture);
+        }
+    }
+
+    #[test]
+    fn css_full_generate_held_revalidation_rejects_historical_report_byte_or_identity_change_before_intent()
+     {
+        for replace_identity in [false, true] {
+            let fixture = imported_generation_fixture(
+                "declaration/Case.json",
+                b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+                1,
+                &[],
+            );
+            fixture.generate().expect("seed historical authority");
+            let expectation_root = fixture.corpus.join("expectations");
+            let expectation = expectation_root.join("declaration/Case.json");
+            let report = expectation_root.join("generation-reports/all.json");
+            let displaced = fixture.root.join("displaced-historical-report.json");
+            let mut expected_tree = snapshot_tree(&expectation_root);
+            let before_root_identity = path_identity(&expectation_root);
+            let before_expectation_identity = path_identity(&expectation);
+            let original_report_identity = path_identity(&report);
+            let mut replacement_bytes = fixture.report();
+            if !replace_identity {
+                replacement_bytes.extend_from_slice(b"late historical change\n");
+                expected_tree.insert(
+                    PathBuf::from("generation-reports/all.json"),
+                    replacement_bytes.clone(),
+                );
+            }
+            let replacement_identity = Cell::new(None);
+
+            let error =
+                full_generation::run_with_inter_scan_hook(&fixture.generate_request(), || {
+                    if replace_identity {
+                        fs::rename(&report, &displaced)
+                            .expect("displace validated historical report");
+                    }
+                    fs::write(&report, &replacement_bytes)
+                        .expect("replace validated historical report");
+                    replacement_identity.set(Some(path_identity(&report)));
+                })
+                .expect_err("held historical authority change must reject generation");
+
+            assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+            assert_eq!(
+                error.to_string(),
+                "revalidate current publication tree: publication inventory changed before transaction intent"
+            );
+            let retained_report_identity = path_identity(&report);
+            assert_eq!(Some(retained_report_identity), replacement_identity.get());
+            if replace_identity {
+                assert_ne!(retained_report_identity, original_report_identity);
+            } else {
+                assert_eq!(retained_report_identity, original_report_identity);
+            }
+            assert_eq!(snapshot_tree(&expectation_root), expected_tree);
+            assert_eq!(path_identity(&expectation_root), before_root_identity);
+            assert_eq!(path_identity(&expectation), before_expectation_identity);
+            assert_eq!(fixture.report(), replacement_bytes);
+            assert_no_import_intent_journal_or_stage(&fixture);
+        }
+    }
+
+    #[test]
     fn css_full_generate_rejects_persisted_report_path_collision() {
         let fixture = imported_generation_fixture(
             "declaration/Case.json",
