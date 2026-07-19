@@ -29,7 +29,20 @@ pub(super) fn run_with_pre_lease_hook(request: &CssRequest, hook: impl FnOnce())
     run_impl(request, hook)
 }
 
+#[cfg(test)]
+pub(super) fn run_with_inter_scan_hook(request: &CssRequest, hook: impl FnOnce()) -> Result<()> {
+    run_impl_with_inter_scan_hook(request, || {}, hook)
+}
+
 fn run_impl(request: &CssRequest, pre_lease_hook: impl FnOnce()) -> Result<()> {
+    run_impl_with_inter_scan_hook(request, pre_lease_hook, || {})
+}
+
+fn run_impl_with_inter_scan_hook(
+    request: &CssRequest,
+    pre_lease_hook: impl FnOnce(),
+    inter_scan_hook: impl FnOnce(),
+) -> Result<()> {
     let location = request.location();
     let manifest_path = location.corpus_root().join(MANIFEST_FILE);
     let manifest_bytes = read_manifest_file(&manifest_path)?;
@@ -127,7 +140,7 @@ fn run_impl(request: &CssRequest, pre_lease_hook: impl FnOnce()) -> Result<()> {
         inventory,
     )?
     .with_reservation(reservation)?;
-    plan.install_with_revalidation(|rooted| {
+    let revalidate = |rooted: &RootedFs| {
         protection.revalidate(rooted)?;
         revalidate_manifest(rooted, &manifest_bytes)?;
         if inspect_import(rooted, &manifest)? != existing_import {
@@ -148,7 +161,14 @@ fn run_impl(request: &CssRequest, pre_lease_hook: impl FnOnce()) -> Result<()> {
             ));
         }
         Ok(())
-    })
+    };
+    #[cfg(test)]
+    return plan.install_with_revalidation_and_inter_scan_hook(revalidate, inter_scan_hook);
+    #[cfg(not(test))]
+    {
+        let _ = inter_scan_hook;
+        plan.install_with_revalidation(revalidate)
+    }
 }
 
 fn validate_snapshot(manifest: &CssManifest, source: &ProtectedSource) -> Result<()> {

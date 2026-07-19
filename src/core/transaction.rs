@@ -363,7 +363,16 @@ impl<'a> TransactionEngine<'a> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn install(&self, request: &TransactionRequest) -> Result<()> {
+        self.install_with_pre_intent_validation(request, |_, _| Ok(()))
+    }
+
+    pub(crate) fn install_with_pre_intent_validation(
+        &self,
+        request: &TransactionRequest,
+        pre_intent_validation: impl FnOnce(&RootedFs, Option<&Inventory>) -> Result<()>,
+    ) -> Result<()> {
         #[cfg(test)]
         let _observation_phase = self
             .rooted
@@ -383,6 +392,7 @@ impl<'a> TransactionEngine<'a> {
             InventoryPolicy::FinalCorpus,
         )
         .map_err(pre_intent_error)?;
+        pre_intent_validation(self.rooted, old.as_ref())?;
         let old_sidecar = InventorySidecar::from_inventory(old.clone());
         let old_sidecar_bytes = old_sidecar.canonical_bytes()?;
         let old_sidecar_digest = Sha256Digest::from_bytes(&old_sidecar_bytes);

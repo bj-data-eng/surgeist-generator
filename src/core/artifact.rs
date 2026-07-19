@@ -198,7 +198,7 @@ impl ArtifactPlan {
     }
 
     /// Revalidates domain-owned read authorities at the last pre-intent boundary.
-    #[cfg(feature = "css-corpus")]
+    #[cfg(all(feature = "css-corpus", not(test)))]
     pub(crate) fn install_with_revalidation(
         self,
         pre_intent_revalidation: impl FnOnce(&super::fs::RootedFs) -> Result<()>,
@@ -207,12 +207,31 @@ impl ArtifactPlan {
         self.install_impl(pre_intent_revalidation, transaction_token)
     }
 
+    #[cfg(all(test, feature = "css-corpus"))]
+    pub(crate) fn install_with_revalidation_and_inter_scan_hook(
+        self,
+        pre_intent_revalidation: impl FnOnce(&super::fs::RootedFs) -> Result<()>,
+        inter_scan_hook: impl FnOnce(),
+    ) -> Result<()> {
+        let transaction_token = self.transaction_token.clone();
+        self.install_impl_inner(pre_intent_revalidation, transaction_token, inter_scan_hook)
+    }
+
     fn install_impl(
         &self,
         pre_intent_revalidation: impl FnOnce(&super::fs::RootedFs) -> Result<()>,
         transaction_token: Option<String>,
     ) -> Result<()> {
-        // This validation intentionally precedes every descriptor recheck, probe, and write.
+        self.install_impl_inner(pre_intent_revalidation, transaction_token, || {})
+    }
+
+    fn install_impl_inner(
+        &self,
+        pre_intent_revalidation: impl FnOnce(&super::fs::RootedFs) -> Result<()>,
+        transaction_token: Option<String>,
+        inter_scan_hook: impl FnOnce(),
+    ) -> Result<()> {
+        // Classify once before staging; the engine repeats this against its post-recovery scan.
         let state = self.binding.validate(&self.location, self.domain)?;
         let rooted = state.rooted();
         rooted.revalidate_root()?;
@@ -223,7 +242,6 @@ impl ArtifactPlan {
         )
         .map_err(pre_intent_error)?;
         self.validate_current(current.as_ref())?;
-        pre_intent_revalidation(rooted)?;
 
         let mut desired = BTreeMap::new();
         if let Some(current) = current.as_ref() {
@@ -274,13 +292,24 @@ impl ArtifactPlan {
             self.final_root.clone(),
             StagedTree::new(desired)?,
         )?;
+        inter_scan_hook();
         TransactionEngine::new(
             rooted,
             state.transaction_parent(),
             state.authority_key(),
             self.domain.as_str(),
         )?
-        .install(&request)
+        .install_with_pre_intent_validation(&request, |actual_rooted, actual| {
+            self.validate_current(actual)?;
+            if actual != current.as_ref() {
+                return Err(GeneratorError::new(
+                    GeneratorErrorKind::InvalidInventory,
+                    "revalidate current publication tree",
+                    "publication inventory changed before transaction intent",
+                ));
+            }
+            pre_intent_revalidation(actual_rooted)
+        })
     }
 
     pub(crate) fn artifact_digest(&self, path: &RelativePath) -> Option<&Sha256Digest> {

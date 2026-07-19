@@ -163,7 +163,7 @@ mod imports {
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -300,6 +300,28 @@ mod imports {
             fs::write(
                 self.corpus.join("corpus.toml"),
                 manifest_text(&self.revision, files.len()),
+            )
+            .expect("update manifest");
+        }
+
+        fn replace_fixture_with_symlink(&mut self, relative: &str, target: &str) {
+            let path = self.source.join("fixtures/ast").join(relative);
+            fs::remove_file(&path).expect("remove regular fixture");
+            symlink(target, &path).expect("create fixture symlink");
+            run_git(&self.source, &[OsStr::new("add"), OsStr::new("--all")]);
+            run_git(
+                &self.source,
+                &[
+                    OsStr::new("commit"),
+                    OsStr::new("--quiet"),
+                    OsStr::new("-m"),
+                    OsStr::new("replace fixture with symlink"),
+                ],
+            );
+            self.revision = run_git(&self.source, &[OsStr::new("rev-parse"), OsStr::new("HEAD")]);
+            fs::write(
+                self.corpus.join("corpus.toml"),
+                manifest_text(&self.revision, 1),
             )
             .expect("update manifest");
         }
@@ -515,6 +537,26 @@ mod imports {
     }
 
     #[test]
+    fn css_import_rejects_symlink_fixture_as_invalid_inventory() {
+        let mut fixture =
+            Fixture::new(&[("declaration/Declaration.json", b"{\"case\":{}}\n", false)]);
+        fixture.replace_fixture_with_symlink("declaration/Declaration.json", "missing.json");
+
+        let error = fixture.import().expect_err("symlink fixture");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert!(!fixture.corpus.join("source").exists());
+    }
+
+    #[test]
+    fn css_import_rejects_non_json_fixture_as_invalid_inventory() {
+        let fixture = Fixture::new(&[("declaration/Declaration.txt", b"not JSON\n", false)]);
+
+        let error = fixture.import().expect_err("non-JSON fixture");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert!(!fixture.corpus.join("source").exists());
+    }
+
+    #[test]
     fn css_import_rejects_sidecar_path_collision() {
         let fixture = Fixture::new(&[(".surgeist-source.json", b"{}\n", false)]);
         let error = fixture.import().expect_err("reserved sidecar collision");
@@ -617,6 +659,47 @@ mod imports {
         let error = fixture.import().expect_err("unknown old import entry");
         assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
         assert_eq!(snapshot_tree(&fixture.corpus.join("source")), before);
+    }
+
+    #[test]
+    fn css_import_inter_scan_unknown_is_invalid_unchanged_and_has_no_intent() {
+        let mut fixture =
+            Fixture::new(&[("declaration/Declaration.json", b"{\"old\":true}\n", false)]);
+        fixture.import().expect("initial import");
+        fixture.replace_commit(&[("declaration/Declaration.json", b"{\"new\":true}\n", false)]);
+        let request = fixture.request();
+        let unknown_path = fixture.imported("late-unknown.json");
+        let unknown_bytes = b"{\"unknown\":true}\n";
+        let mut expected = snapshot_tree(&fixture.corpus.join("source"));
+        expected.insert(PathBuf::from("late-unknown.json"), unknown_bytes.to_vec());
+
+        let error = importer::run_with_inter_scan_hook(&request, move || {
+            fs::write(unknown_path, unknown_bytes).expect("insert inter-scan unknown entry");
+        })
+        .expect_err("inter-scan unknown entry");
+
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert_eq!(snapshot_tree(&fixture.corpus.join("source")), expected);
+        let transactions = fixture.corpus.join(".surgeist-generator/transactions/css");
+        assert_eq!(
+            fs::read_dir(transactions)
+                .expect("inspect CSS transactions")
+                .count(),
+            0,
+            "inter-scan rejection created transaction intent or residue"
+        );
+        assert!(
+            fs::read_dir(&fixture.corpus)
+                .expect("inspect corpus root")
+                .all(|entry| {
+                    !entry
+                        .expect("corpus entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("._surgeist-")
+                }),
+            "inter-scan rejection created an external stage"
+        );
     }
 
     #[test]

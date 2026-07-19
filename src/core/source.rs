@@ -1748,23 +1748,11 @@ fn build_snapshot(
     let prefix = format!("{}/", pin.source_subdirectory().as_str());
     let mut entries = Vec::with_capacity(inventory.len());
     for (full_path, entry) in inventory {
-        if !matches!(entry.mode.as_str(), "100644" | "100755") {
-            return Err(invalid_source(format!(
-                "source snapshot contains a non-regular mode at {}",
-                full_path.as_str()
-            )));
-        }
         let relative = full_path.as_str().strip_prefix(&prefix).ok_or_else(|| {
             invalid_source("source snapshot path lacks the exact declared component prefix")
         })?;
         let path = RelativePath::new(relative)
             .map_err(|_| invalid_source("source snapshot contains a noncanonical relative path"))?;
-        if Path::new(path.as_str()).extension() != Some(OsStr::new("json")) {
-            return Err(invalid_source(format!(
-                "source snapshot contains a non-JSON entry: {}",
-                path.as_str()
-            )));
-        }
         let bytes = cat_file_blob(runner, &entry.object_id)?;
         entries.push(SnapshotEntry {
             path,
