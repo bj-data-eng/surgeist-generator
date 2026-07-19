@@ -2046,11 +2046,23 @@ fn build_snapshot(
     let prefix = format!("{}/", pin.source_subdirectory().as_str());
     let mut entries = Vec::with_capacity(inventory.len());
     for (full_path, entry) in inventory {
+        if !matches!(entry.mode.as_str(), "100644" | "100755") {
+            return Err(invalid_source(format!(
+                "source snapshot contains a non-regular mode at {}",
+                full_path.as_str()
+            )));
+        }
         let relative = full_path.as_str().strip_prefix(&prefix).ok_or_else(|| {
             invalid_source("source snapshot path lacks the exact declared component prefix")
         })?;
         let path = RelativePath::new(relative)
             .map_err(|_| invalid_source("source snapshot contains a noncanonical relative path"))?;
+        if Path::new(path.as_str()).extension() != Some(OsStr::new("json")) {
+            return Err(invalid_source(format!(
+                "source snapshot contains a non-JSON entry: {}",
+                path.as_str()
+            )));
+        }
         let bytes = cat_file_blob(runner, &entry.object_id)?;
         entries.push(SnapshotEntry {
             path,
@@ -3848,6 +3860,74 @@ mod tests {
         )
         .expect_err("closing source-root replacement must fail");
         assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+    }
+
+    #[test]
+    fn public_verify_git_source_rejects_clean_source_subtree_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, origin, _revision) = repository();
+        symlink("case.json", directory.path().join("fixtures/alias.json"))
+            .expect("create tracked source symlink");
+        run_git(
+            directory.path(),
+            &[OsStr::new("add"), OsStr::new("fixtures/alias.json")],
+        );
+        run_git(
+            directory.path(),
+            &[
+                OsStr::new("commit"),
+                OsStr::new("--quiet"),
+                OsStr::new("-m"),
+                OsStr::new("source symlink"),
+            ],
+        );
+        let revision = SourceRevision::new(run_git(
+            directory.path(),
+            &[OsStr::new("rev-parse"), OsStr::new("HEAD")],
+        ))
+        .expect("source symlink revision");
+
+        let error = crate::verify_git_source(directory.path(), &pin(&origin, revision, "fixtures"))
+            .expect_err("generic public source verification must reject a tracked symlink");
+        assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+        assert_eq!(
+            error.to_string(),
+            "verify pinned source: source snapshot contains a non-regular mode at fixtures/alias.json"
+        );
+    }
+
+    #[test]
+    fn public_verify_git_source_rejects_clean_source_subtree_non_json_regular_entry() {
+        let (directory, origin, _revision) = repository();
+        fs::write(directory.path().join("fixtures/readme.txt"), b"fixture\n")
+            .expect("write tracked non-JSON source entry");
+        run_git(
+            directory.path(),
+            &[OsStr::new("add"), OsStr::new("fixtures/readme.txt")],
+        );
+        run_git(
+            directory.path(),
+            &[
+                OsStr::new("commit"),
+                OsStr::new("--quiet"),
+                OsStr::new("-m"),
+                OsStr::new("non-JSON source entry"),
+            ],
+        );
+        let revision = SourceRevision::new(run_git(
+            directory.path(),
+            &[OsStr::new("rev-parse"), OsStr::new("HEAD")],
+        ))
+        .expect("non-JSON source revision");
+
+        let error = crate::verify_git_source(directory.path(), &pin(&origin, revision, "fixtures"))
+            .expect_err("generic public source verification must reject a non-JSON regular entry");
+        assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+        assert_eq!(
+            error.to_string(),
+            "verify pinned source: source snapshot contains a non-JSON entry: readme.txt"
+        );
     }
 
     #[test]
