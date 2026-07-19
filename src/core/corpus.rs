@@ -230,6 +230,10 @@ impl CorpusLocation {
     pub fn corpus_root(&self) -> &Path {
         &self.corpus_root
     }
+
+    pub(crate) fn coordination_root(&self) -> PathBuf {
+        self.corpus_root.join(COORDINATION_COMPONENT)
+    }
 }
 
 /// Scope and mutation authority for a generation run.

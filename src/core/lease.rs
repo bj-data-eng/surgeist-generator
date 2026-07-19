@@ -10,6 +10,7 @@ use super::coordination::{
 #[cfg(test)]
 use super::coordination::{ExclusiveAcquisitionControl, acquire_exclusive_controlled};
 use super::fs::{HeldIdentity, RootedFs};
+use super::protection::ProtectedSourceDisjointness;
 
 /// A live, exclusive mutation authority for one fixed corpus and domain.
 #[derive(Debug)]
@@ -41,6 +42,21 @@ impl GenerationLease {
         let metadata = LeaseMetadata::new(generator, scope, command)?;
         acquire_exclusive(location, domain, metadata, protected_revalidation)
             .map(|guard| Self { guard })
+    }
+
+    /// Acquires the domain mutex, then closes both source identity and the
+    /// complete writable/protected namespace matrix before owner intent.
+    pub(crate) fn acquire_with_protected_source(
+        location: &CorpusLocation,
+        domain: Domain,
+        generator: &str,
+        scope: &RunScope,
+        command: &str,
+        protection: &ProtectedSourceDisjointness<'_>,
+    ) -> Result<Self> {
+        Self::acquire_with_revalidation(location, domain, generator, scope, command, |rooted| {
+            protection.revalidate(rooted)
+        })
     }
 
     /// Creates a non-owning binding to this exact acquisition.

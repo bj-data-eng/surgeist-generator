@@ -1,6 +1,4 @@
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use std::path::Component;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -344,6 +342,383 @@ impl std::fmt::Display for FilesystemId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}:{}", self.words[0], self.words[1])
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundComponent {
+    name: Option<String>,
+    path: PathBuf,
+    identity: HeldIdentity,
+}
+
+/// A read-only binding of an absolute namespace to its nearest existing object.
+///
+/// Supported mutation hosts retain descriptors for every existing ancestor. An
+/// absent suffix remains symbolic as exact UTF-8 components until closing
+/// revalidation proves that the namespace is still separated from protected
+/// authorities.
+pub(crate) struct BoundPath {
+    requested: PathBuf,
+    canonical_path: PathBuf,
+    remaining: Vec<String>,
+    components: Vec<BoundComponent>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    descriptors: Vec<rustix::fd::OwnedFd>,
+}
+
+impl std::fmt::Debug for BoundPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundPath")
+            .field("requested", &self.requested)
+            .field("canonical_path", &self.canonical_path)
+            .field("remaining", &self.remaining)
+            .field("components", &self.components)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BoundPath {
+    pub(crate) fn bind(path: &Path) -> Result<Self> {
+        MutationTarget::current().require_supported("bind protected namespace path")?;
+        bind_path(path)
+    }
+
+    pub(crate) fn require_existing_directory(&self, operation: &str) -> Result<()> {
+        if !self.remaining.is_empty()
+            || self
+                .components
+                .last()
+                .is_none_or(|component| component.identity.kind() != NodeKind::Directory)
+        {
+            return Err(invalid_path(
+                operation,
+                format!(
+                    "namespace is not an existing directory: {}",
+                    self.requested.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+
+    pub(crate) fn existing_identity(&self) -> &HeldIdentity {
+        &self
+            .components
+            .last()
+            .expect("a bound absolute path always contains the filesystem root")
+            .identity
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<()> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        for (component, descriptor) in self.components.iter().zip(&self.descriptors) {
+            let current = identity_from_fd(descriptor, "revalidate held namespace descriptor")
+                .map_err(|error| {
+                    GeneratorError::with_source(
+                        GeneratorErrorKind::InvalidPath,
+                        "revalidate protected namespace",
+                        component.path.display().to_string(),
+                        error,
+                    )
+                })?;
+            if !component.identity.matches_recovery(&current) {
+                return Err(invalid_path(
+                    "revalidate protected namespace",
+                    format!("held identity changed: {}", component.path.display()),
+                ));
+            }
+        }
+
+        let current = Self::bind(&self.requested)?;
+        if !self.same_binding(&current) {
+            return Err(invalid_path(
+                "revalidate protected namespace",
+                format!(
+                    "path identity or absent suffix changed: {}",
+                    self.requested.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn overlaps(&self, other: &Self) -> Result<bool> {
+        if self.canonical_path == other.canonical_path
+            || self.canonical_path.starts_with(&other.canonical_path)
+            || other.canonical_path.starts_with(&self.canonical_path)
+        {
+            return Ok(true);
+        }
+        Ok(self.descriptor_ancestor_of(other)? || other.descriptor_ancestor_of(self)?)
+    }
+
+    fn same_binding(&self, other: &Self) -> bool {
+        self.canonical_path == other.canonical_path
+            && self.remaining == other.remaining
+            && self.components == other.components
+    }
+
+    fn descriptor_ancestor_of(&self, other: &Self) -> Result<bool> {
+        let existing = self.existing_identity();
+        if self.remaining.is_empty()
+            && other
+                .components
+                .iter()
+                .any(|component| existing.same_object(&component.identity))
+        {
+            return Ok(true);
+        }
+
+        let Some(anchor_index) = other
+            .components
+            .iter()
+            .rposition(|component| existing.same_object(&component.identity))
+        else {
+            return Ok(false);
+        };
+        if self.remaining.is_empty() {
+            return Ok(true);
+        }
+
+        let mut other_tail = other.components[anchor_index + 1..]
+            .iter()
+            .map(|component| {
+                component.name.as_deref().ok_or_else(|| {
+                    invalid_path(
+                        "compare namespace ancestry",
+                        "filesystem root unexpectedly appeared inside an ancestry tail",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        other_tail.extend(other.remaining.iter().map(String::as_str));
+        component_prefix(&self.remaining, &other_tail)
+    }
+}
+
+fn component_prefix(prefix: &[String], value: &[&str]) -> Result<bool> {
+    for (left, right) in prefix.iter().map(String::as_str).zip(value.iter().copied()) {
+        if left == right {
+            continue;
+        }
+        if left.is_ascii() && right.is_ascii() && !left.eq_ignore_ascii_case(right) {
+            return Ok(false);
+        }
+        return Err(invalid_path(
+            "compare absent namespace suffixes",
+            format!("cannot prove distinct path components: {left:?} and {right:?}"),
+        ));
+    }
+    Ok(prefix.len() <= value.len())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn bind_path(path: &Path) -> Result<BoundPath> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, open, openat, statat};
+
+    validate_absolute_namespace_path(path)?;
+    let mut nearest = path.to_path_buf();
+    let mut remaining = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&nearest) {
+            Ok(_) => break,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                let name = nearest
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| {
+                        invalid_path(
+                            "bind protected namespace path",
+                            format!("cannot represent absent suffix: {}", path.display()),
+                        )
+                    })?;
+                remaining.insert(0, name.to_owned());
+                if !nearest.pop() {
+                    return Err(invalid_path(
+                        "bind protected namespace path",
+                        format!("cannot resolve an existing ancestor: {}", path.display()),
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(namespace_io_error(
+                    "inspect protected namespace ancestor",
+                    &nearest,
+                    error,
+                ));
+            }
+        }
+    }
+
+    let canonical_existing = std::fs::canonicalize(&nearest).map_err(|error| {
+        namespace_io_error("canonicalize protected namespace ancestor", &nearest, error)
+    })?;
+    validate_absolute_namespace_path(&canonical_existing)?;
+    if !remaining.is_empty() && !canonical_existing.is_dir() {
+        return Err(invalid_path(
+            "bind protected namespace path",
+            format!(
+                "absent suffix has a nondirectory ancestor: {}",
+                canonical_existing.display()
+            ),
+        ));
+    }
+
+    let root = open(
+        "/",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|source| {
+        namespace_io_error("open namespace filesystem root", Path::new("/"), source)
+    })?;
+    let root_identity = identity_from_fd(&root, "inspect namespace filesystem root")
+        .map_err(|error| invalid_path("bind protected namespace path", error))?;
+    let mut descriptors = vec![root];
+    let mut components = vec![BoundComponent {
+        name: None,
+        path: PathBuf::from("/"),
+        identity: root_identity,
+    }];
+    let names = canonical_existing
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_str().map(str::to_owned).ok_or_else(|| {
+                invalid_path(
+                    "bind protected namespace path",
+                    format!(
+                        "non-UTF-8 canonical component: {}",
+                        canonical_existing.display()
+                    ),
+                )
+            })),
+            Component::RootDir => None,
+            _ => Some(Err(invalid_path(
+                "bind protected namespace path",
+                format!(
+                    "nonnormal canonical component: {}",
+                    canonical_existing.display()
+                ),
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut current_path = PathBuf::from("/");
+    for (index, name) in names.iter().enumerate() {
+        let parent = descriptors
+            .last()
+            .expect("the namespace filesystem root descriptor is retained");
+        require_exact_entry_name(parent, name)
+            .map_err(|error| invalid_path("bind protected namespace path", error))?;
+        let stat = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|source| {
+            namespace_io_error(
+                "inspect protected namespace component",
+                &current_path.join(name),
+                source,
+            )
+        })?;
+        let kind = FileType::from_raw_mode(stat.st_mode);
+        let directory_required = index + 1 != names.len();
+        let flags = if kind == FileType::Directory {
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW
+        } else if kind == FileType::RegularFile && !directory_required {
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW
+        } else {
+            return Err(invalid_path(
+                "bind protected namespace path",
+                format!(
+                    "symlink, special object, or nondirectory ancestor is not allowed: {}",
+                    current_path.join(name).display()
+                ),
+            ));
+        };
+        let opened = openat(parent, name, flags, Mode::empty()).map_err(|source| {
+            namespace_io_error(
+                "open protected namespace component",
+                &current_path.join(name),
+                source,
+            )
+        })?;
+        let identity = identity_from_fd(&opened, "inspect held namespace component")
+            .map_err(|error| invalid_path("bind protected namespace path", error))?;
+        current_path.push(name);
+        components.push(BoundComponent {
+            name: Some(name.clone()),
+            path: current_path.clone(),
+            identity,
+        });
+        descriptors.push(opened);
+    }
+
+    let canonical_path = remaining
+        .iter()
+        .fold(canonical_existing, |mut current, component| {
+            current.push(component);
+            current
+        });
+    Ok(BoundPath {
+        requested: path.to_path_buf(),
+        canonical_path,
+        remaining,
+        components,
+        descriptors,
+    })
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn bind_path(_path: &Path) -> Result<BoundPath> {
+    MutationTarget::Unsupported.require_supported("bind protected namespace path")?;
+    unreachable!("unsupported mutation target returned success")
+}
+
+fn validate_absolute_namespace_path(path: &Path) -> Result<()> {
+    let rendered = path.to_str().ok_or_else(|| {
+        invalid_path(
+            "validate protected namespace path",
+            "namespace contains a non-UTF-8 component",
+        )
+    })?;
+    if !path.is_absolute()
+        || rendered.contains('\0')
+        || rendered.contains('\\')
+        || (rendered != "/" && rendered.ends_with('/'))
+        || rendered.contains("//")
+        || rendered
+            .split('/')
+            .skip(1)
+            .any(|component| matches!(component, "" | "." | ".."))
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(invalid_path(
+            "validate protected namespace path",
+            format!("namespace is not a normalized absolute path: {rendered}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn namespace_io_error<E>(operation: &str, path: &Path, source: E) -> GeneratorError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    GeneratorError::with_source(
+        GeneratorErrorKind::InvalidPath,
+        operation,
+        path.display().to_string(),
+        source,
+    )
 }
 
 pub(crate) struct RootedFs {

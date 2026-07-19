@@ -16,6 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Visitor};
 
 use crate::{GeneratorError, GeneratorErrorKind, RelativePath, Result, Sha256Digest};
 
+use super::fs::BoundPath;
 use super::{validate_identifier, validate_repository_url};
 
 /// Exact lowercase hexadecimal Git object revision.
@@ -179,8 +180,6 @@ pub struct VerifiedSource {
     canonical_root: PathBuf,
     canonical_source_root: PathBuf,
     revision: SourceRevision,
-    pub(crate) snapshot: VerifiedSourceSnapshot,
-    pub(crate) protection: SourceProtection,
 }
 
 impl VerifiedSource {
@@ -197,6 +196,35 @@ impl VerifiedSource {
     #[must_use]
     pub const fn revision(&self) -> &SourceRevision {
         &self.revision
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ProtectedSource {
+    verified: VerifiedSource,
+    snapshot: VerifiedSourceSnapshot,
+    protection: SourceProtection,
+}
+
+impl ProtectedSource {
+    pub(crate) const fn verified(&self) -> &VerifiedSource {
+        &self.verified
+    }
+
+    pub(crate) const fn snapshot(&self) -> &VerifiedSourceSnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) fn protection_namespaces(&self) -> impl Iterator<Item = (&'static str, &Path)> {
+        self.protection.namespaces()
+    }
+
+    pub(crate) fn closing_revalidate(&self) -> Result<()> {
+        revalidate_protection(&self.protection)
+    }
+
+    fn into_verified(self) -> VerifiedSource {
+        self.verified
     }
 }
 
@@ -284,15 +312,70 @@ pub(crate) struct ProtectionEntry {
     pub(crate) identity: ObjectIdentity,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct SourceProtection {
-    directories: Vec<ProtectionEntry>,
+    authorities: Vec<SourceAuthority>,
     alternate_graph: AlternateGraph,
 }
 
 impl SourceProtection {
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &ProtectionEntry> {
-        self.directories.iter()
+    fn namespaces(&self) -> impl Iterator<Item = (&'static str, &Path)> {
+        self.authorities
+            .iter()
+            .map(|authority| (authority.kind.label(), authority.entry.path.as_path()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceAuthorityKind {
+    Worktree,
+    SourceRoot,
+    WorktreeGitDirectory,
+    CommonGitDirectory,
+    PrimaryObjectDirectory,
+    AlternateObjectDirectory,
+}
+
+impl SourceAuthorityKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Worktree => "source worktree",
+            Self::SourceRoot => "source content root",
+            Self::WorktreeGitDirectory => "source per-worktree Git directory",
+            Self::CommonGitDirectory => "source common Git directory",
+            Self::PrimaryObjectDirectory => "source primary object directory",
+            Self::AlternateObjectDirectory => "source alternate object directory",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SourceAuthority {
+    kind: SourceAuthorityKind,
+    entry: ProtectionEntry,
+    binding: BoundPath,
+}
+
+impl SourceAuthority {
+    fn new(kind: SourceAuthorityKind, entry: ProtectionEntry) -> Result<Self> {
+        let binding = BoundPath::bind(&entry.path)
+            .and_then(|binding| {
+                binding.require_existing_directory("bind protected source directory")?;
+                Ok(binding)
+            })
+            .map_err(|error| {
+                GeneratorError::with_source(
+                    GeneratorErrorKind::SourceVerification,
+                    "bind protected source authority",
+                    format!("{} at {}", kind.label(), entry.path.display()),
+                    error,
+                )
+            })?;
+        Ok(Self {
+            kind,
+            entry,
+            binding,
+        })
     }
 }
 
@@ -358,7 +441,14 @@ struct TrustedGit {
 
 /// Verifies an existing Git checkout without fetching or mutating Git state.
 pub fn verify_git_source(checkout: impl AsRef<Path>, pin: &PinnedSource) -> Result<VerifiedSource> {
-    verify_git_source_impl(checkout.as_ref(), pin, None)
+    verify_protected_git_source(checkout.as_ref(), pin).map(ProtectedSource::into_verified)
+}
+
+pub(crate) fn verify_protected_git_source(
+    checkout: &Path,
+    pin: &PinnedSource,
+) -> Result<ProtectedSource> {
+    verify_git_source_impl(checkout, pin, None)
 }
 
 #[cfg(test)]
@@ -366,7 +456,7 @@ fn verify_git_source_with_test_hook<F>(
     checkout: impl AsRef<Path>,
     pin: &PinnedSource,
     hook: F,
-) -> Result<VerifiedSource>
+) -> Result<ProtectedSource>
 where
     F: FnOnce() + 'static,
 {
@@ -377,7 +467,7 @@ fn verify_git_source_impl(
     checkout: &Path,
     pin: &PinnedSource,
     closing_hook: Option<Box<dyn FnOnce()>>,
-) -> Result<VerifiedSource> {
+) -> Result<ProtectedSource> {
     let checkout = canonical_checkout_directory(checkout)?;
     let trust = TrustedGit::discover()?;
     let initial_runner = GitRunner::new(trust.clone(), checkout.clone());
@@ -461,22 +551,32 @@ fn verify_git_source_impl(
     }
 
     let alternate_graph = collect_alternate_graph(&primary_objects.path)?;
-    let mut protected_directories = vec![
-        protected_directory(&canonical_root, "protect Git worktree root")?,
-        protected_directory(&canonical_source_root, "protect pinned source directory")?,
-        worktree_git_dir,
-        common_git_dir,
-        primary_objects,
+    let mut authorities = vec![
+        SourceAuthority::new(
+            SourceAuthorityKind::Worktree,
+            protected_directory(&canonical_root, "protect Git worktree root")?,
+        )?,
+        SourceAuthority::new(
+            SourceAuthorityKind::SourceRoot,
+            protected_directory(&canonical_source_root, "protect pinned source directory")?,
+        )?,
+        SourceAuthority::new(SourceAuthorityKind::WorktreeGitDirectory, worktree_git_dir)?,
+        SourceAuthority::new(SourceAuthorityKind::CommonGitDirectory, common_git_dir)?,
+        SourceAuthority::new(
+            SourceAuthorityKind::PrimaryObjectDirectory,
+            primary_objects.clone(),
+        )?,
     ];
-    protected_directories.extend(
-        alternate_graph
-            .object_directories
-            .iter()
-            .map(|entry| entry.directory.clone()),
-    );
-    deduplicate_protection(&mut protected_directories);
+    for alternate in &alternate_graph.object_directories {
+        if alternate.directory.identity != primary_objects.identity {
+            authorities.push(SourceAuthority::new(
+                SourceAuthorityKind::AlternateObjectDirectory,
+                alternate.directory.clone(),
+            )?);
+        }
+    }
     let protection = SourceProtection {
-        directories: protected_directories,
+        authorities,
         alternate_graph,
     };
     let snapshot = build_snapshot(&runner, pin, object_format)?;
@@ -499,10 +599,12 @@ fn verify_git_source_impl(
     }
     runner.trust.revalidate()?;
 
-    Ok(VerifiedSource {
-        canonical_root,
-        canonical_source_root,
-        revision: pin.revision.clone(),
+    Ok(ProtectedSource {
+        verified: VerifiedSource {
+            canonical_root,
+            canonical_source_root,
+            revision: pin.revision.clone(),
+        },
         snapshot,
         protection,
     })
@@ -1471,23 +1573,28 @@ fn collect_alternate_graph(primary_objects: &Path) -> Result<AlternateGraph> {
     })
 }
 
-fn deduplicate_protection(protection: &mut Vec<ProtectionEntry>) {
-    protection.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.identity.cmp(&right.identity))
-    });
-    let mut identities = BTreeSet::new();
-    protection.retain(|entry| identities.insert(entry.identity.clone()));
-}
-
-pub(crate) fn revalidate_protection(protection: &SourceProtection) -> Result<()> {
-    for entry in protection.iter() {
-        let current = protected_directory(&entry.path, "revalidate protected source directory")?;
-        if current != *entry {
+fn revalidate_protection(protection: &SourceProtection) -> Result<()> {
+    for authority in &protection.authorities {
+        authority.binding.revalidate().map_err(|error| {
+            GeneratorError::with_source(
+                GeneratorErrorKind::SourceVerification,
+                "revalidate protected source authority",
+                format!(
+                    "{} at {}",
+                    authority.kind.label(),
+                    authority.entry.path.display()
+                ),
+                error,
+            )
+        })?;
+        let current = protected_directory(
+            &authority.entry.path,
+            "revalidate protected source directory",
+        )?;
+        if current != authority.entry {
             return Err(invalid_source(format!(
                 "protected source directory identity changed: {}",
-                entry.path.display()
+                authority.entry.path.display()
             )));
         }
     }
@@ -2143,9 +2250,12 @@ mod tests {
 
     use super::{
         GitRunner, PinnedSource, SourceRevision, TrustedGit, validate_read_only_git_arguments,
-        verify_git_source,
+        verify_git_source, verify_protected_git_source,
     };
-    use crate::{GeneratorErrorKind, RelativePath, Sha256Digest};
+    use crate::core::coordination::Domain;
+    use crate::core::lease::GenerationLease;
+    use crate::core::protection::ProtectedSourceDisjointness;
+    use crate::{CorpusLocation, GeneratorErrorKind, RelativePath, RunScope, Sha256Digest};
 
     struct TestDirectory(PathBuf);
 
@@ -2343,6 +2453,121 @@ mod tests {
             ],
         );
         (base, middle, leaf, origin, revision)
+    }
+
+    #[test]
+    fn protected_source_snapshot_covers_git_and_recursive_alternates() {
+        let (base, middle, leaf, origin, revision) =
+            recursive_alternate_repository("protected-snapshot");
+        let protected =
+            verify_protected_git_source(leaf.path(), &pin(&origin, revision.clone(), "fixtures"))
+                .expect("protected recursive source");
+
+        let leaf_root = fs::canonicalize(leaf.path()).expect("canonical leaf worktree");
+        assert_eq!(protected.verified().canonical_root(), leaf_root);
+        assert_eq!(protected.verified().revision(), &revision);
+        assert_eq!(protected.snapshot().entries.len(), 1);
+        assert_eq!(protected.snapshot().entries[0].bytes, b"{}\n");
+        let public = verify_git_source(leaf.path(), &pin(&origin, revision.clone(), "fixtures"))
+            .expect("unchanged public source proof");
+        assert_eq!(&public, protected.verified());
+        let public_debug = format!("{public:?}");
+        assert!(!public_debug.contains("snapshot:"));
+        assert!(!public_debug.contains("protection:"));
+
+        let authorities = protected
+            .protection_namespaces()
+            .map(|(label, path)| (label, path.to_path_buf()))
+            .collect::<Vec<_>>();
+        let leaf_git = fs::canonicalize(leaf.path().join(".git")).expect("leaf Git directory");
+        let leaf_objects =
+            fs::canonicalize(leaf.path().join(".git/objects")).expect("leaf objects");
+        let middle_objects =
+            fs::canonicalize(middle.path().join(".git/objects")).expect("middle objects");
+        let base_objects =
+            fs::canonicalize(base.path().join(".git/objects")).expect("base objects");
+
+        for expected in [
+            ("source worktree", leaf_root.as_path()),
+            ("source per-worktree Git directory", leaf_git.as_path()),
+            ("source common Git directory", leaf_git.as_path()),
+            ("source primary object directory", leaf_objects.as_path()),
+            (
+                "source alternate object directory",
+                middle_objects.as_path(),
+            ),
+            ("source alternate object directory", base_objects.as_path()),
+        ] {
+            assert!(
+                authorities
+                    .iter()
+                    .any(|(label, path)| label == &expected.0 && path == expected.1),
+                "missing protected authority: {expected:?}; got {authorities:?}"
+            );
+        }
+
+        let corpus_directory = TestDirectory::new("protected-object-overlap");
+        let corpus = corpus_directory.path().join("corpus");
+        fs::create_dir(&corpus).expect("create object-overlap corpus");
+        let location =
+            CorpusLocation::new(corpus_directory.path(), &corpus).expect("corpus location");
+        let error = ProtectedSourceDisjointness::for_mutation(
+            &location,
+            &[("writable output", base_objects.join("stage").as_path())],
+            &[],
+            &protected,
+        )
+        .expect_err("writable root beneath a protected object store must fail");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn protected_source_closing_revalidation_rejects_identity_change() {
+        let (source_directory, origin, revision) = repository();
+        let protected = verify_protected_git_source(
+            source_directory.path(),
+            &pin(&origin, revision, "fixtures"),
+        )
+        .expect("protected source");
+
+        let corpus_directory = TestDirectory::new("closing-revalidation-corpus");
+        let corpus = corpus_directory.path().join("corpus");
+        fs::create_dir(&corpus).expect("create corpus");
+        let manifest = corpus.join("corpus.toml");
+        fs::write(&manifest, b"version = 1\n").expect("write protected manifest");
+        let location =
+            CorpusLocation::new(corpus_directory.path(), &corpus).expect("corpus location");
+        let namespaces = ProtectedSourceDisjointness::for_mutation(
+            &location,
+            &[("import root", corpus.join("import").as_path())],
+            &[("corpus manifest", manifest.as_path())],
+            &protected,
+        )
+        .expect("namespace preflight");
+
+        let source_root = source_directory.path().join("fixtures");
+        let displaced = source_directory.path().join("fixtures-displaced");
+        fs::rename(&source_root, &displaced).expect("displace protected source root");
+        fs::create_dir(&source_root).expect("replace protected source root identity");
+        fs::write(source_root.join("case.json"), b"{}\n").expect("replace source bytes");
+
+        let error = GenerationLease::acquire_with_protected_source(
+            &location,
+            Domain::Css,
+            "surgeist-css-generate",
+            &RunScope::Full,
+            "import-csstree",
+            &namespaces,
+        )
+        .expect_err("closing identity change must fail before owner intent");
+        assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+        assert!(
+            !corpus
+                .join(".surgeist-generator/leases/css/owner.json")
+                .exists(),
+            "closing failure created owner intent"
+        );
     }
 
     fn pin(origin: &str, revision: SourceRevision, source: &str) -> PinnedSource {
@@ -3203,14 +3428,14 @@ mod tests {
             ],
         );
 
-        let verified = verify_git_source(
+        let verified = verify_protected_git_source(
             directory.path(),
             &pin(&origin, original_revision, "fixtures"),
         )
         .expect("replacement refs do not alter the pinned snapshot");
         assert_eq!(
             verified
-                .snapshot
+                .snapshot()
                 .entries
                 .iter()
                 .map(|entry| entry.path.as_str())
@@ -3218,7 +3443,7 @@ mod tests {
             ["case.json", "nested/[literal].json"]
         );
         let case = verified
-            .snapshot
+            .snapshot()
             .entries
             .iter()
             .find(|entry| entry.path.as_str() == "case.json")
@@ -3268,21 +3493,20 @@ mod tests {
                 OsStr::new(origin),
             ],
         );
-        let verified = verify_git_source(leaf.path(), &pin(origin, revision.clone(), "fixtures"))
-            .expect("recursive local alternates");
+        let verified =
+            verify_protected_git_source(leaf.path(), &pin(origin, revision.clone(), "fixtures"))
+                .expect("recursive local alternates");
         let base_objects = fs::canonicalize(base.path().join(".git/objects")).unwrap();
         let middle_objects = fs::canonicalize(middle.path().join(".git/objects")).unwrap();
         assert!(
             verified
-                .protection
-                .iter()
-                .any(|entry| entry.path == base_objects)
+                .protection_namespaces()
+                .any(|(_label, path)| path == base_objects)
         );
         assert!(
             verified
-                .protection
-                .iter()
-                .any(|entry| entry.path == middle_objects)
+                .protection_namespaces()
+                .any(|(_label, path)| path == middle_objects)
         );
 
         fs::create_dir_all(base.path().join(".git/objects/info")).unwrap();

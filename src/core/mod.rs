@@ -7,6 +7,7 @@ mod hash;
 mod inventory;
 mod lease;
 mod manifest;
+mod protection;
 mod report;
 mod source;
 mod transaction;
@@ -37,6 +38,7 @@ fn private_front_doors_are_linked() {
     let _ = artifact::PublicationInventory::new;
     let _ = artifact::PublicationPolicy::DiagnosticFull;
     let _ = lease::GenerationLease::acquire;
+    let _ = lease::GenerationLease::acquire_with_protected_source;
     let _ = lease::GenerationCheck::acquire;
     let _ = lease::GenerationCheck::finish;
     let _ = inventory::InventoryEntry::symlink;
@@ -46,6 +48,10 @@ fn private_front_doors_are_linked() {
     let _ = inventory::InventoryEntry::link_count;
     let _ = inventory::Inventory::find;
     let _ = inventory::InventoryPolicy::Private;
+    let _ = protection::NamespaceDisjointness::for_mutation;
+    let _ = protection::ProtectedSourceDisjointness::for_mutation;
+    let _ = source::ProtectedSource::verified;
+    let _ = source::ProtectedSource::snapshot;
 }
 
 pub(crate) fn validate_repository_url(value: &str) -> bool {
