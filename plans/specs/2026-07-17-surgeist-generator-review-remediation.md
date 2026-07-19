@@ -89,6 +89,16 @@ cannot prove an imported tree's source revision from a mutable manifest alone.
 The sidecars bind exact source pins and byte inventories without requiring the
 external checkout during ordinary checking.
 
+Hard-coded corpus revisions and expected inventory counts are rejected. The
+layout and CSS corpus manifests own their mutable Taffy and CSSTree revision and
+count values; changing one of those pins must not require a generator source
+change or generator release. The generator owns the revision/count grammar,
+canonical source contract, duplicate-pin equality where the preserved layout
+schema carries the value twice, explicit-checkout verification, and
+sidecar/report binding. A corpus owner updates its manifest values and reruns the
+applicable import and generation commands against the explicitly supplied pinned
+checkout.
+
 ## SR-02 Acceptance And Finding Traceability
 
 | Baseline finding | Required closure |
@@ -1240,7 +1250,7 @@ generated = 0
 [source_roots.taffy]
 kind = "taffy"
 path = "html"
-upstream_commit = "d1ff7e339b9ee35b33858779f8d7653197e93d92"
+upstream_commit = "<manifest-owned exact lowercase 40- or 64-hex revision>"
 description = "<nonempty trimmed text>"
 
 [source_roots.surgeist]
@@ -1250,10 +1260,10 @@ description = "<nonempty trimmed text>"
 
 [imports.taffy]
 repo = "https://github.com/DioxusLabs/taffy.git"
-commit = "d1ff7e339b9ee35b33858779f8d7653197e93d92"
+commit = "<same revision as source_roots.taffy.upstream_commit>"
 source_dir = "test_fixtures"
 destination = "html"
-expected_count = 1103
+expected_count = 1
 excluded_destination_dirs = ["grid-lanes", "subgrid"]
 
 [[cases]]
@@ -1274,8 +1284,14 @@ lifecycle strings/booleans are exactly the shown values. `arguments` contains
 exactly 28 entries whose normalized keys are unique, includes normalized
 `use-mock-keychain`, and satisfies SR-03.2's switch restrictions. The two
 excluded destination directories are exactly the shown unique set in either
-order. The Taffy repository, revision, source directory, pre-exclusion count,
-destination, source-root kinds/paths, and upstream commit are exact.
+order. The canonical Taffy repository, source directory, destination,
+source-root kinds/paths, and exclusions are exact schema policy. The corpus
+manifest owns both copies of the mutable Taffy revision and the mutable
+pre-exclusion `expected_count`: both revision fields must be identical exact
+lowercase 40- or 64-hex values, and `expected_count` must be positive. The shown
+count `1` is grammar data, not a generator-owned corpus constant. Any valid pin
+and matching positive count can replace those manifest values without changing
+generator source or publishing a new generator release.
 
 `provenance_format` contains `{version}` and
 `{repository_relative_executable}` exactly once each and contains no other `{` or
@@ -1336,6 +1352,8 @@ tightenings of inputs formerly accepted by the loose parser are:
 Named compatibility fixtures are
 `layout_schema2_preserves_taffy_compatibility_records`,
 `layout_schema2_preserves_raw_ids_and_reason_defaults`,
+`layout_schema2_accepts_manifest_owned_taffy_pin_and_count`,
+`layout_schema2_rejects_mismatched_taffy_revision_fields`,
 `layout_schema2_rejects_html_source_root`,
 `layout_schema2_rejects_duplicate_ids_and_sources`,
 `layout_schema2_rejects_only_declared_tightenings`,
@@ -1343,7 +1361,8 @@ Named compatibility fixtures are
 `layout_schema2_launch_switch_set_is_order_independent`. Each acceptance fixture
 is run through both a preserved-parser test adapter and the new parser/effective
 representation; rejection fixtures name the one deliberate divergence. A
-full-field TOML golden fixes all domain values and launch digest.
+full-field synthetic TOML golden fixes all schema/value relationships and its
+launch digest without fixing a production corpus revision or count.
 
 The preserved launch digest is lowercase SHA-256 of the exact bytes returned by
 `serde_json::to_vec` for this tuple, with no final LF:
@@ -1382,9 +1401,10 @@ either sibling migration.
 
 ### SR-06.2 Taffy import and offline proof
 
-`import-taffy` verifies the explicit source checkout against the manifest pin,
-takes an immutable byte snapshot of regular `.html` files below `source_dir`,
-requires `expected_count`, and constructs canonical
+`import-taffy` verifies the explicit source checkout against the manifest-owned
+pin, takes an immutable byte snapshot of regular `.html` files below
+`source_dir`, requires the positive manifest-owned `expected_count`, and
+constructs canonical
 `html/.surgeist-taffy-source.json`. Its compact JSON plus final LF contains, in
 order: `schema_version: 1`, canonical repository/revision/source directory,
 object format, pre-exclusion source count, sorted excluded-directory set,
@@ -1394,18 +1414,24 @@ relative path, Git mode `100644`, blob object ID, and SHA-256.
 The exact sidecar shape is:
 
 ```json
-{"schema_version":1,"source":{"label":"taffy","repository_url":"https://github.com/DioxusLabs/taffy.git","revision":"<full-object-id>","source_subdirectory":"test_fixtures"},"object_format":"<sha1-or-sha256>","source_file_count":1103,"excluded_destination_dirs":["grid-lanes","subgrid"],"imported_file_count":1,"files":[{"path":"relative.html","git_mode":"100644","blob_object_id":"<full-blob-id>","sha256":"<raw-byte-sha256>"}]}
+{"schema_version":1,"source":{"label":"taffy","repository_url":"https://github.com/DioxusLabs/taffy.git","revision":"<full-object-id>","source_subdirectory":"test_fixtures"},"object_format":"<sha1-or-sha256>","source_file_count":1,"excluded_destination_dirs":["grid-lanes","subgrid"],"imported_file_count":1,"files":[{"path":"relative.html","git_mode":"100644","blob_object_id":"<full-blob-id>","sha256":"<raw-byte-sha256>"}]}
 ```
 
-`expected_count`/`source_file_count` counts every regular upstream `.html` before
-exclusion. A file is excluded exactly when its first relative component is
+`source.revision` equals both manifest revision fields and
+`source_file_count` equals the manifest `expected_count`; neither is compared
+with a generator-owned literal. The count covers every regular upstream `.html`
+before exclusion. A file is excluded exactly when its first relative component is
 `grid-lanes` or `subgrid`; excluded bytes are neither copied nor listed.
 `imported_file_count` equals `files.len()` after exclusion. `object_format` is
 derived from the verified repository and is `sha1` for a 40-hex revision or
 `sha256` for a 64-hex revision; every blob ID has the matching width. Files are
 strictly increasing by `RelativePath`. The SHA-256 golden names are
 `layout_taffy_sidecar_sha1_golden` and
-`layout_taffy_sidecar_sha256_golden`.
+`layout_taffy_sidecar_sha256_golden`. A paired synthetic-pin test named
+`layout_taffy_pin_and_count_update_requires_reimport_not_generator_change`
+validates two different manifest-owned revisions and counts through the same
+compiled parser/import contract, and proves that the old sidecar becomes stale
+against the updated manifest until re-imported.
 
 Import first derives the exact desired Taffy destination set from the verified
 pinned snapshot after exclusions and requires it to be disjoint from the exact
