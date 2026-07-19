@@ -11,16 +11,19 @@
   `05293743a551454adcf63345e80ef0d3982786b1`.
 - Clean reviewed specification:
   `plans/specs/2026-07-17-surgeist-generator-review-remediation.md` at commit
-  `e2bc72e1434f31c60f2578d4558824f252cc57b1`, normalized semantic-content
+  `d2fbbedb033177731af5487d3498ba7f14b721d8`, normalized semantic-content
   SHA-256
-  `e3965c21336153f876f5d2cbe304ab62497213e10cf893a4e4bf28561cc74fe0`.
+  `faa4320f1e06ad9c003f2525fcf7171e387458eacc4ec3fd0d2d88f7c0e1eb71`.
 - Scope remains this leaf repository. Root integration, root API artifacts,
   sibling corpus adoption, and root gitlink promotion remain excluded.
 - Across every cycle, exhaustive real durability, byte-prefix, recovery-prefix,
   and process-prefix enumerators are explicit opt-in diagnostics; ordinary Cargo
   test matrices compile but never execute them. C01 through C04 compare the exact
   cumulative ignored inventory; only C04, after every initiative implementation
-  task is complete, runs that inventory once in one sequential Cargo invocation.
+  task is complete, runs that inventory once in this exact sequential invocation:
+  `cargo test --locked --offline -p surgeist-generator --all-features --lib -- --ignored --test-threads=1`.
+  A failure stops C04 publication; no automatic rerun is assumed, and any rerun
+  requires fresh user authority under the canonical workflow.
 
 ## Ordered Cycles
 
@@ -167,7 +170,7 @@
   complete supported offline feature, quality, provenance, dependency, and
   unsafe-absence matrix is clean. After every C01–C04 implementation task is
   complete, the exact cumulative ignored diagnostic inventory runs once through
-  the specification's single sequential all-features Cargo command; any failure
+  the Authority section's sequential all-features Cargo command; any failure
   stops publication and is not rerun without new user authority.
 - Handoff: publish and remotely verify the immutable C04 leaf candidate and
   produce the canonical leaf completion record for the user's independent
