@@ -72,13 +72,39 @@
   schemas, field order, final LF, path grammar, disposition rules, counts,
   provenance, historical authority, and error precedence in SR-07 and SR-04.5.
   No visible entry is classified from extension or the new desired set alone.
-- The exact cumulative ignored inventory remains the 15 C01 diagnostics. C02
-  adds no ignored test. Ordinary task and final matrices compile and skip them;
-  the only permitted ignored command also contains `--list` and compares the
-  exact names. No ignored body runs before the one initiative-final C04 command.
-- `private_front_doors_are_linked` remains until T08 proves every represented
-  CSS core path has a real caller; T08 then removes only artificial references
-  made obsolete by the production front door.
+- The first compiled CSS task wires a real feature-gated public module and binary
+  to one complete import command. Generate, filtered generation, and checking are
+  added only as complete reachable increments in later tasks; no unreferenced
+  private staging, placeholder command arm, artificial caller, or dead-code
+  suppression is permitted. Unit tests remain inside the private CSS submodules;
+  public/process tests use only the public front and packaged binary.
+- The exact cumulative ignored inventory is the following 15 fully qualified
+  names. C02 adds no ignored test. After every task and at the final gate, the
+  list-only command output must equal this set with no extra, missing, or renamed
+  entry:
+  ```text
+  core::transaction::tests::production_recovery::transaction_install_every_prefix_recovers
+  core::transaction::tests::production_recovery::transaction_recovery_every_prefix_is_idempotent
+  core::coordination::tests::bootstrap_header_every_byte_prefix_recovers
+  core::coordination::tests::bootstrap_uncontended_every_prefix_recovers
+  core::coordination::tests::bootstrap_winner_held_every_prefix_recovers
+  core::coordination::tests::bootstrap_winner_released_every_prefix_recovers
+  core::coordination::tests::owner_record_install_every_prefix_recovers_absent
+  core::coordination::tests::owner_record_install_every_prefix_recovers_swap
+  core::coordination::tests::owner_record_recovery_every_prefix_is_idempotent
+  core::coordination::tests::rename_probe_install_every_prefix_recovers
+  core::coordination::tests::rename_probe_exclusive_unsupported_every_prefix_recovers
+  core::coordination::tests::rename_probe_swap_unsupported_every_prefix_recovers
+  core::coordination::tests::rename_probe_unsupported_cleanup_failure_preserves_evidence
+  core::coordination::tests::rename_probe_recovery_every_prefix_is_idempotent
+  core::lease::tests::lease_acquisition_recovers_owner_and_probe_prefixes
+  ```
+  Ordinary matrices compile and skip them. No command may contain `--ignored`
+  without `--list`; only C04, after every initiative task, executes the one
+  sequential all-features ignored run.
+- `private_front_doors_are_linked` may lose a reference only when a real CSS
+  command reaches the represented core path; C02-T06 removes the function once
+  all remaining references have real callers.
 - Supported mutation remains Darwin arm64. The default library remains portable
   under warning-denied `wasm32-unknown-unknown`.
 
@@ -127,177 +153,149 @@
 - Dependencies: published C01 candidate and reviewed C02 plan only.
 - Intended commit: `feat(core): bind protected source authorities`.
 
-### C02-T02 — Validate CSS manifests and canonical import sidecars
+### C02-T02 — Expose and execute atomic CSSTree import
 
-- Files/area: private feature-gated `src/css/` module, manifest and import-model
-  source, plus focused tests.
-- Intended behavior/outcome: implement the exact SR-07.1 schema-1 manifest and
-  strict SHA-1/SHA-256 import-sidecar model without yet publishing a corpus.
-- RED evidence: first add manifest matrix tests plus
-  `css_import_sidecar_sha1_golden`, `css_import_sidecar_sha256_golden`, and
-  reserved-report collision cases. They fail because no CSS domain/schema exists.
-- Acceptance criteria: unknown/duplicate fields, invalid pins/counts/roots/cases,
-  unmatched overrides, and either reserved collision are rejected with the exact
-  owning kind; canonical sidecars have sorted unique records, fixed object-ID
-  widths, exact compact bytes, and one final LF.
+- Files/area: `Cargo.toml`, `src/lib.rs`, the real feature-gated public `css`
+  front and private submodules, `src/bin/surgeist-css-generate.rs`, public/process
+  tests, and protected source, lease, inventory, and artifact integration.
+- Intended behavior/outcome: expose a non-exhaustive `CssCommand` containing
+  `ImportCsstree`, the final-signature `CssRequest::new` and accessors, and real
+  `run`/`run_from_env`/binary paths for import. Validate the exact manifest and
+  sidecar, verify the immutable `fixtures/ast` snapshot, capture only regular Git
+  `100644` JSON, close revalidation, then atomically publish sidecar plus snapshot
+  as one CleanFull import while preserving downstream bytes.
+- RED evidence: first add public construction and packaged invalid-syntax tests,
+  manifest matrices, SHA-1/SHA-256 sidecar goldens, report-path collisions,
+  source pin/snapshot/replacement cases, stale removal, unchanged import, and
+  downstream-preservation tests. They fail because no CSS front or executor exists.
+- Acceptance criteria: every new production item is reached by the public import
+  path with no placeholder arm or artificial/dead-code linkage; constructor and
+  parser are I/O-free through syntax validation; the binary is at most 15 lines
+  with exact error/exit behavior; schema, count, mode, path, digest, and source
+  proof are exact; unknown old entries fail; changed sidecar makes classifiable
+  downstream stale without mutation; unchanged import retains freshness; C01
+  publication/error/recovery semantics remain exact.
 - Commands:
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_manifest_`
-  - `cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_import_sidecar_`
+  - `cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_import_`
+  - `cargo test --locked --offline -p surgeist-generator --features css-corpus --test public_api`
+  - `cargo test --locked --offline -p surgeist-generator --features css-corpus --test css_cli`
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus`
+  - `cargo test --locked --offline -p surgeist-generator --no-default-features`
   - `cargo test --locked --offline -p surgeist-generator --all-features --lib -- --ignored --list`
+  - `cargo metadata --locked --offline --no-deps --format-version 1`
   - `cargo clippy --locked --offline -p surgeist-generator --features css-corpus --all-targets -- -F unsafe-code -D warnings`
   - `cargo fmt --check`
 - Dependencies: C02-T01 is task-clean.
-- Intended commit: `feat(css): validate manifest and import proof`.
-
-### C02-T03 — Import CSSTree atomically from a protected checkout
-
-- Files/area: CSS import executor plus necessary private source, lease,
-  inventory, and artifact integration.
-- Intended behavior/outcome: verify the explicit checkout and immutable
-  `fixtures/ast` snapshot, capture only regular Git `100644` JSON, run protected
-  closing revalidation, and publish the sidecar plus exact snapshot as one
-  clean-full import-root transaction while preserving downstream bytes.
-- RED evidence: first add `css_import_rejects_report_path_collision`, source
-  pin/snapshot/replacement cases, stale-file removal, unchanged-import, and
-  downstream-preservation tests. They fail before any import intent because no
-  CSS executor consumes protected source snapshots or publication primitives.
-- Acceptance criteria: exact count/mode/path/digest proof is enforced; unknown
-  old import entries fail; stale known files disappear atomically; sidecar digest
-  change makes existing downstream stale without mutating it; unchanged import
-  retains freshness; pre/post-commit errors follow SR-04.5 and leave resumable
-  evidence only when recovery cannot finish.
-- Commands:
-  - `cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_import_`
-  - `cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_source_`
-  - `cargo test --locked --offline -p surgeist-generator --features css-corpus`
-  - `cargo test --locked --offline -p surgeist-generator --all-features --lib -- --ignored --list`
-  - `cargo clippy --locked --offline -p surgeist-generator --features css-corpus --all-targets -- -F unsafe-code -D warnings`
-  - `cargo fmt --check`
-- Dependencies: C02-T02 is task-clean.
 - Intended commit: `feat(css): import protected csstree fixtures`.
 
-### C02-T04 — Derive neutral expectations deterministically
+### C02-T03 — Add complete full CSS generation
 
-- Files/area: CSS fixture prepass, typed case derivation, disposition resolution,
-  canonical options, expectation model/serialization, and focused tests.
-- Intended behavior/outcome: turn each validated imported fixture into the exact
-  SR-07.3 neutral expectation without retaining AST, diagnostic prose, offsets,
-  comments, recovery data, or source object-member order.
-- RED evidence: first add `css_expectation_case_order_golden`, ordinary/error
-  byte goldens, JSON-pointer escaping, duplicate-depth, malformed/empty fixture,
-  options ordering, default/override, repeated-source, and count-mismatch tests.
-- Acceptance criteria: the streaming prepass rejects duplicate decoded members
-  at every depth and trailing values; IDs/context/outcomes are exact; cases sort
-  by final escaped ID; options recurse deterministically; dispositions/reasons
-  classify each case once; pretty JSON field order and final LF are exact.
+- Files/area: additive `Generate` command/front dispatch, fixture prepass, typed
+  derivation, disposition resolution, expectation/report models, historical
+  inventory validation, full orchestration, artifact planning, and focused tests.
+- Intended behavior/outcome: make unfiltered `Generate` a complete reachable
+  command. Derive exact neutral SR-07.3 expectations, validate the old full report
+  as sole historical authority, and atomically publish the complete expectation
+  set plus report. The request and CLI reject filters until C02-T04 completes.
+- RED evidence: first add expectation byte/order goldens, pointer escaping,
+  duplicate-at-depth, malformed/empty fixture, options/default/override/count
+  cases, historical removal/rename/addition and malformed-authority tests, report
+  provenance/digest cases, stale cleanup, unknown entry, and persisted report
+  collision. They fail because `Generate` and derivation do not exist.
+- Acceptance criteria: streaming rejects duplicate decoded members and trailing
+  values; IDs/context/outcomes/options/dispositions/reasons are exact and ordered;
+  no AST, prose, offsets, comments, or recovery data persists; `historical ∪
+  desired` classifies every visible entry; malformed authority fails before
+  intent; CleanFull removes only classified stale outputs; any derivation failure
+  publishes nothing; the real public/CLI command is warning-clean and threadless.
 - Commands:
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_expectation_`
-  - `cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_fixture_`
-  - `cargo test --locked --offline -p surgeist-generator --features css-corpus`
-  - `cargo test --locked --offline -p surgeist-generator --all-features --lib -- --ignored --list`
-  - `cargo clippy --locked --offline -p surgeist-generator --features css-corpus --all-targets -- -F unsafe-code -D warnings`
-  - `cargo fmt --check`
-- Dependencies: C02-T03 is task-clean.
-- Intended commit: `feat(css): derive neutral expectations`.
-
-### C02-T05 — Publish full CSS generations with historical authority
-
-- Files/area: CSS full-generation orchestration, report/historical validation,
-  inventory classification, artifact planning, and focused tests.
-- Intended behavior/outcome: validate current import proof, derive the complete
-  desired set, validate the old full report as the sole historical authority,
-  and atomically publish all expectations plus one exact shared report.
-- RED evidence: first add
-  `css_historical_inventory_removal_rename_addition_regenerates`,
-  `css_historical_inventory_rejects_malformed_authority`, report
-  provenance/count/digest cases, stale-root cleanup, unknown-entry, and
-  `css_full_generate_rejects_persisted_report_path_collision` tests.
-- Acceptance criteria: `historical ∪ desired` classifies every visible entry;
-  malformed/missing nonempty authority fails before intent; CleanFull removes
-  only classified stale outputs; report artifacts/counts/provenance bind every
-  fixture/case/output exactly; any derivation failure publishes nothing; durable
-  failures follow the C01 commit oracle.
-- Commands:
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_historical_inventory_`
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_full_generate_`
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus`
   - `cargo test --locked --offline -p surgeist-generator --all-features --lib -- --ignored --list`
   - `cargo clippy --locked --offline -p surgeist-generator --features css-corpus --all-targets -- -F unsafe-code -D warnings`
   - `cargo fmt --check`
-- Dependencies: C02-T04 is task-clean.
-- Intended commit: `feat(css): publish full expectation generations`.
+- Dependencies: C02-T02 is task-clean.
+- Intended commit: `feat(css): publish full neutral expectations`.
 
-### C02-T06 — Filter only historically owned CSS expectations
+### C02-T04 — Filter only historically owned CSS expectations
 
-- Files/area: CSS filter matching, selection ledger, historical ownership gate,
-  filtered artifact planning, and focused tests.
-- Intended behavior/outcome: select current sidecar fixtures by exact `.json` or
-  complete component prefix and update only expectations already owned by the
+- Files/area: additive Generate filter acceptance, CLI parsing, exact matching,
+  selection ledger, historical ownership gate, filtered artifact planning, and
+  focused public/domain/process tests.
+- Intended behavior/outcome: complete the final optional-filter capability on the
+  already real `Generate` command. Select current sidecar fixtures by exact
+  `.json` or complete component prefix and update only expectations owned by the
   validated current-schema historical report.
-- RED evidence: first add `css_filter_exact_file`,
-  `css_filter_component_prefix`, `css_filter_rejects_partial_component`,
-  `css_filter_rejects_reserved`, `css_filter_absent_is_verification`,
-  `css_filtered_add_then_rename_requires_full_before_creation`, and persisted
-  report-collision tests.
-- Acceptance criteria: syntax/reserved errors precede I/O; zero match and
-  unowned selection are `Verification` before lease; absent final root cannot be
-  filtered; selected whole fixtures/cases update atomically; every unselected
-  expectation/report byte is preserved; filtered runs never write/remove reports
-  or prune stale outputs.
+- RED evidence: first add exact-file/component-prefix and partial/reserved/zero
+  match cases, absent-root verification, add-then-rename requiring full creation,
+  persisted report collision, and process option-matrix tests. They fail because
+  C02-T03 deliberately rejects every filter.
+- Acceptance criteria: syntax/reserved errors precede I/O; zero match and unowned
+  selection are `Verification` before lease; absent final root cannot be filtered;
+  selected whole fixtures update atomically; every unselected expectation/report
+  byte is preserved; filtered runs never write/remove reports or prune stale
+  outputs; the public accessor and CLI expose the completed behavior directly.
 - Commands:
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_filter_`
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_filtered_`
+  - `cargo test --locked --offline -p surgeist-generator --features css-corpus --test css_cli`
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus`
   - `cargo test --locked --offline -p surgeist-generator --all-features --lib -- --ignored --list`
   - `cargo clippy --locked --offline -p surgeist-generator --features css-corpus --all-targets -- -F unsafe-code -D warnings`
   - `cargo fmt --check`
-- Dependencies: C02-T05 is task-clean.
+- Dependencies: C02-T03 is task-clean.
 - Intended commit: `feat(css): filter owned expectations`.
 
-### C02-T07 — Verify CSS corpora without mutation
+### C02-T05 — Add read-only CSS corpus checking
 
-- Files/area: CSS current-state reader, sidecar/expectation/report/inventory
-  verifier, read-only coordination integration, and focused tests.
-- Intended behavior/outcome: make `check-corpus` validate the manifest, current
-  sidecar/files, every expectation byte/schema, counts, hashes, provenance,
-  report relationships, exact inventory, and coordination without Git or repair.
-- RED evidence: first add current/stale/absent/unknown/malformed state tests,
-  active/resumable/malformed coordination tests, outside-sentinel snapshots, and
-  `css_check_rejects_persisted_report_path_collision`.
+- Files/area: additive `CheckCorpus` command/front dispatch, current-state reader,
+  sidecar/expectation/report/inventory verifier, read-only coordination integration,
+  and focused public/domain/process tests.
+- Intended behavior/outcome: make `check-corpus` a complete reachable command that
+  validates manifest, current sidecar/files, exact expectation bytes/schema,
+  counts, hashes, provenance, report relationships, inventory, and coordination
+  without Git invocation, recovery, lease acquisition, repair, or mutation.
+- RED evidence: first add public/CLI matrix tests, current/stale/absent/unknown/
+  malformed states, active/resumable/malformed coordination, outside-sentinel
+  snapshots, and persisted report collision. They fail because no check path exists.
 - Acceptance criteria: current returns `Ok`; known absent/stale state and any
   coordination state return `Verification`; malformed artifacts/authority or
   unknown inventory return `InvalidInventory`; the command never bootstraps,
-  recovers, leases exclusively, removes, or changes any byte/identity.
+  recovers, leases exclusively, removes, invokes Git, or changes any byte/identity;
+  the new enum variant and dispatch are real and warning-clean immediately.
 - Commands:
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_check_`
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_read_only_`
+  - `cargo test --locked --offline -p surgeist-generator --features css-corpus --test public_api`
+  - `cargo test --locked --offline -p surgeist-generator --features css-corpus --test css_cli`
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus`
   - `cargo test --locked --offline -p surgeist-generator --all-features --lib -- --ignored --list`
   - `cargo clippy --locked --offline -p surgeist-generator --features css-corpus --all-targets -- -F unsafe-code -D warnings`
   - `cargo fmt --check`
-- Dependencies: C02-T06 is task-clean.
+- Dependencies: C02-T04 is task-clean.
 - Intended commit: `feat(css): verify corpus state read only`.
 
-### C02-T08 — Expose the exact CSS API and thin real binary
+### C02-T06 — Close the exact CSS interface and transition matrix
 
-- Files/area: `src/lib.rs`, CSS request/dispatch/parser front, Cargo binary
-  target, `src/bin/surgeist-css-generate.rs`, public API/process integration
-  tests, and obsolete artificial linkage only.
-- Intended behavior/outcome: expose exactly SR-05.3 behind `css-corpus`; parse the
-  exact SR-07.1 CLI matrix; route all three commands to their real domain paths;
-  and package a binary of at most 15 physical lines with exact prefix/exit code.
-- RED evidence: first add feature public-API construction/trait/accessor/matrix
-  tests and a packaged invalid-syntax process test requiring no stdout, exact
-  the `surgeist-css-generate: ` prefix followed by the rendered error on stderr,
-  exit 64, and no filesystem access.
-  They fail because no public module, parser, target, or real binary exists.
-- Acceptance criteria: `CssRequest::new` is I/O-free and rejects the exact option
-  mismatches; `run` is synchronous/threadless and calls real import/generate/check;
-  `run_from_env` uses only `args_os`; invalid syntax is `Cli`; public surface is
-  exact/additive with acquisition-free rustdoc; no core implementation type leaks;
-  Cargo metadata has exactly the required CSS target; artificial linkage is gone
-  only where real CSS callers replace it; default/layout-only builds remain clean.
+- Files/area: final CSS public/front integration, cross-command state fixtures,
+  Cargo metadata, rustdoc/examples, process tests, and obsolete artificial core
+  linkage only.
+- Intended behavior/outcome: prove the accumulated surface is exactly SR-05.3 and
+  the CLI exactly SR-05.4, with all three commands routed to their real domain
+  paths and every import/generate/filter/check transition coherently composed.
+- RED evidence: first add full feature API trait/accessor/invalid-matrix tests and
+  source-change/freshness, import-to-generate, filtered-to-check, historical
+  membership, collision-precedence, and exact error-rendering process sequences.
+  They expose any mismatch left by the individually complete vertical increments.
+- Acceptance criteria: `CssRequest::new` is I/O-free and enforces the final exact
+  matrix; `run` is synchronous/threadless; `run_from_env` uses only `args_os`;
+  invalid syntax is `Cli`; surface/rustdoc/examples are exact and no core type
+  leaks; metadata has only the required CSS target; the binary remains at most 15
+  lines; real domain callers replace every artificial core reference before
+  `private_front_doors_are_linked` is removed; default/layout-only remain clean.
 - Commands:
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus --test public_api`
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus --test css_cli`
@@ -307,8 +305,8 @@
   - `cargo metadata --locked --offline --no-deps --format-version 1`
   - `cargo clippy --locked --offline -p surgeist-generator --all-features --all-targets -- -F unsafe-code -D warnings`
   - `cargo fmt --check`
-- Dependencies: C02-T07 is task-clean.
-- Intended commit: `feat(css): expose generator interface`.
+- Dependencies: C02-T05 is task-clean.
+- Intended commit: `feat(css): close generator interface`.
 
 ## Completion
 
