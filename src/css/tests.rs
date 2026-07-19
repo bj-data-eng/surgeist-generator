@@ -1840,6 +1840,131 @@ mod imports {
         assert!(!fixture.corpus.join("expectations").exists());
     }
 
+    #[derive(Clone, Copy)]
+    enum HeldSidecarMutation {
+        ByteDrift,
+        SameBytesIdentityReplacement,
+    }
+
+    fn assert_full_generation_held_sidecar_revalidation(mutation: HeldSidecarMutation) {
+        const SOURCE: &[u8] = b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n";
+
+        let fixture = imported_generation_fixture("declaration/Case.json", SOURCE, 1, &[]);
+        fixture.generate().expect("seed current expectations");
+        let expectation_root = fixture.corpus.join("expectations");
+        let expectation = expectation_root.join("declaration/Case.json");
+        let report = expectation_root.join("generation-reports/all.json");
+        let sidecar = fixture.imported(".surgeist-source.json");
+        let displaced = fixture.root.join("displaced-import-sidecar.json");
+        let before_tree = snapshot_tree(&expectation_root);
+        let before_expectation_bytes = fixture.expectation("declaration/Case.json");
+        let before_report_bytes = fixture.report();
+        let before_root_identity = path_identity(&expectation_root);
+        let before_expectation_identity = path_identity(&expectation);
+        let before_report_identity = path_identity(&report);
+        let original_sidecar_bytes = fixture.sidecar();
+        let original_sidecar_identity = path_identity(&sidecar);
+        let raced_sidecar_bytes = match mutation {
+            HeldSidecarMutation::ByteDrift => {
+                let original_digest = Sha256Digest::from_bytes(SOURCE);
+                let drifted_digest = Sha256Digest::from_bytes(b"held sidecar byte drift");
+                let sidecar_text = String::from_utf8(original_sidecar_bytes.clone())
+                    .expect("canonical sidecar is UTF-8");
+                assert_eq!(
+                    sidecar_text.matches(original_digest.as_str()).count(),
+                    1,
+                    "fixture digest must identify one canonical sidecar field"
+                );
+                let drifted = sidecar_text
+                    .replacen(original_digest.as_str(), drifted_digest.as_str(), 1)
+                    .into_bytes();
+                assert_eq!(drifted.len(), original_sidecar_bytes.len());
+                assert_ne!(drifted, original_sidecar_bytes);
+                drifted
+            }
+            HeldSidecarMutation::SameBytesIdentityReplacement => original_sidecar_bytes.clone(),
+        };
+        let hook_reached = Cell::new(false);
+        let raced_sidecar_identity = Cell::new(None);
+
+        let error = full_generation::run_with_inter_scan_hook(&fixture.generate_request(), || {
+            assert!(
+                !hook_reached.replace(true),
+                "inter-scan hook ran more than once"
+            );
+            assert_eq!(fixture.sidecar(), original_sidecar_bytes);
+            assert_eq!(path_identity(&sidecar), original_sidecar_identity);
+            assert_eq!(snapshot_tree(&expectation_root), before_tree);
+            assert_no_import_intent_journal_or_stage(&fixture);
+            if matches!(mutation, HeldSidecarMutation::SameBytesIdentityReplacement) {
+                fs::rename(&sidecar, &displaced).expect("displace validated import sidecar");
+            }
+            fs::write(&sidecar, &raced_sidecar_bytes)
+                .expect("write raced canonical import sidecar");
+            raced_sidecar_identity.set(Some(path_identity(&sidecar)));
+        })
+        .expect_err("held import sidecar change must reject generation");
+
+        assert!(hook_reached.get(), "inter-scan hook was not reached");
+        match mutation {
+            HeldSidecarMutation::ByteDrift => {
+                assert_eq!(error.kind(), GeneratorErrorKind::Verification);
+                assert_eq!(
+                    error.to_string(),
+                    "validate current CSS import: CSS imported fixture digest is stale: declaration/Case.json"
+                );
+                assert_eq!(path_identity(&sidecar), original_sidecar_identity);
+                assert!(!displaced.exists());
+            }
+            HeldSidecarMutation::SameBytesIdentityReplacement => {
+                assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+                assert_eq!(
+                    error.to_string(),
+                    "revalidate CSS generation inputs: current CSS import changed after held validation"
+                );
+                assert_ne!(path_identity(&sidecar), original_sidecar_identity);
+                assert_eq!(path_identity(&displaced), original_sidecar_identity);
+                assert_eq!(
+                    fs::read(&displaced).expect("read displaced sidecar"),
+                    original_sidecar_bytes
+                );
+            }
+        }
+        assert_eq!(
+            Some(path_identity(&sidecar)),
+            raced_sidecar_identity.get(),
+            "rejection replaced the racer's canonical sidecar"
+        );
+        assert_eq!(
+            fs::read(&sidecar).expect("read raced canonical sidecar"),
+            raced_sidecar_bytes,
+            "rejection changed the racer's canonical sidecar bytes"
+        );
+        assert_eq!(snapshot_tree(&expectation_root), before_tree);
+        assert_eq!(
+            fixture.expectation("declaration/Case.json"),
+            before_expectation_bytes
+        );
+        assert_eq!(fixture.report(), before_report_bytes);
+        assert_eq!(path_identity(&expectation_root), before_root_identity);
+        assert_eq!(path_identity(&expectation), before_expectation_identity);
+        assert_eq!(path_identity(&report), before_report_identity);
+        assert_no_import_intent_journal_or_stage(&fixture);
+    }
+
+    #[test]
+    fn css_full_generate_held_revalidation_rejects_sidecar_byte_drift_before_intent() {
+        assert_full_generation_held_sidecar_revalidation(HeldSidecarMutation::ByteDrift);
+    }
+
+    #[test]
+    fn css_full_generate_held_revalidation_rejects_sidecar_same_byte_identity_replacement_before_intent()
+     {
+        assert_full_generation_held_sidecar_revalidation(
+            HeldSidecarMutation::SameBytesIdentityReplacement,
+        );
+    }
+
     #[test]
     fn css_full_generate_held_revalidation_rejects_current_import_byte_or_identity_change_before_intent()
      {
