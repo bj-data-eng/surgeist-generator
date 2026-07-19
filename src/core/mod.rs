@@ -33,11 +33,10 @@ pub(crate) use inventory::{Inventory, InventoryPolicy};
 pub(crate) use lease::GenerationLease;
 #[cfg(feature = "css-corpus")]
 pub(crate) use protection::ProtectedSourceDisjointness;
-#[cfg(all(feature = "css-corpus", test))]
-pub(crate) use source::SnapshotEntry;
 #[cfg(feature = "css-corpus")]
 pub(crate) use source::{
-    ObjectFormat, ProtectedSource, VerifiedSourceSnapshot, verify_protected_git_source,
+    ObjectFormat, ProtectedSource, ProtectedSourceInventory, ProtectedTreeEntryKind, SnapshotEntry,
+    VerifiedSourceSnapshot, verify_protected_git_source_inventory,
 };
 
 pub(crate) fn validate_identifier(value: &str) -> bool {

@@ -4,8 +4,9 @@ use std::path::Path;
 
 use crate::core::{
     ArtifactPlan, ArtifactReservation, CORPUS_FILE_MODE, Domain, GenerationLease, Inventory,
-    InventoryPolicy, NodeKind, ProtectedSource, ProtectedSourceDisjointness, PublicationInventory,
-    PublicationPolicy, RootedFs, VerifiedSourceSnapshot, verify_protected_git_source,
+    InventoryPolicy, NodeKind, ProtectedSource, ProtectedSourceDisjointness,
+    ProtectedSourceInventory, ProtectedTreeEntryKind, PublicationInventory, PublicationPolicy,
+    RootedFs, SnapshotEntry, VerifiedSourceSnapshot, verify_protected_git_source_inventory,
 };
 use crate::{
     GenerationReport, GeneratorError, GeneratorErrorKind, PinnedSource, RelativePath, Result,
@@ -53,20 +54,20 @@ fn run_impl_with_inter_scan_hook(
         manifest.revision.clone(),
         manifest.fixture_root.clone(),
     )?;
-    let source = verify_protected_git_source(
+    let source_inventory = verify_protected_git_source_inventory(
         request
             .source_root()
             .expect("CssRequest guarantees an import source root"),
         &pin,
     )?;
-    if source.verified().revision() != pin.revision() {
+    if source_inventory.verified().revision() != pin.revision() {
         return Err(GeneratorError::new(
             GeneratorErrorKind::SourceVerification,
             "verify CSS import source",
             "verified revision differs from the manifest pin",
         ));
     }
-    validate_snapshot(&manifest, &source)?;
+    let source = validate_snapshot(&manifest, source_inventory)?;
     let desired_sidecar = CssImportSidecar::from_snapshot(&pin, source.snapshot())?;
     let desired_sidecar_bytes = desired_sidecar.canonical_bytes()?;
     let desired_sidecar_digest = Sha256Digest::from_bytes(&desired_sidecar_bytes);
@@ -171,7 +172,10 @@ fn run_impl_with_inter_scan_hook(
     }
 }
 
-fn validate_snapshot(manifest: &CssManifest, source: &ProtectedSource) -> Result<()> {
+fn validate_snapshot(
+    manifest: &CssManifest,
+    source: ProtectedSourceInventory,
+) -> Result<ProtectedSource> {
     let snapshot = source.snapshot();
     if snapshot.entries.len() != manifest.expected_files {
         return Err(invalid_inventory(format!(
@@ -180,22 +184,50 @@ fn validate_snapshot(manifest: &CssManifest, source: &ProtectedSource) -> Result
             snapshot.entries.len()
         )));
     }
+    let mut verified_entries = Vec::with_capacity(snapshot.entries.len());
     for entry in &snapshot.entries {
-        if entry.git_mode != "100644" {
+        let display = entry.path.display();
+        if entry.kind != ProtectedTreeEntryKind::Blob || entry.git_mode != "100644" {
             return Err(invalid_inventory(format!(
-                "CSSTree fixture must use Git mode 100644: {}",
-                entry.path.as_str()
+                "CSSTree fixture must be a Git mode 100644 blob: {display}"
             )));
         }
-        sidecar::validate_fixture_path(&entry.path)?;
-        if entry.digest != Sha256Digest::from_bytes(&entry.bytes) {
+        let path = entry.path.to_relative_path().ok_or_else(|| {
+            invalid_inventory(format!("CSSTree fixture path is not canonical: {display}"))
+        })?;
+        sidecar::validate_fixture_path(&path)?;
+        let bytes = entry.bytes.as_ref().ok_or_else(|| {
+            invalid_inventory(format!("CSSTree fixture blob bytes are absent: {display}"))
+        })?;
+        let digest = entry.digest.as_ref().ok_or_else(|| {
+            invalid_inventory(format!("CSSTree fixture blob digest is absent: {display}"))
+        })?;
+        if digest != &Sha256Digest::from_bytes(bytes) {
             return Err(invalid_inventory(format!(
-                "immutable snapshot digest mismatch: {}",
-                entry.path.as_str()
+                "immutable snapshot digest mismatch: {display}"
             )));
         }
+        verified_entries.push(SnapshotEntry {
+            path,
+            git_mode: entry.git_mode.clone(),
+            blob_object_id: entry.object_id.clone(),
+            bytes: bytes.clone(),
+            digest: digest.clone(),
+        });
     }
-    Ok(())
+    if verified_entries
+        .windows(2)
+        .any(|pair| pair[0].path >= pair[1].path)
+    {
+        return Err(invalid_inventory(
+            "CSSTree fixture paths are not strictly increasing",
+        ));
+    }
+    let verified_snapshot = VerifiedSourceSnapshot {
+        object_format: snapshot.object_format,
+        entries: verified_entries,
+    };
+    source.into_protected_source(verified_snapshot)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

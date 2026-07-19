@@ -228,6 +228,46 @@ impl ProtectedSource {
     }
 }
 
+#[cfg(feature = "css-corpus")]
+#[derive(Debug)]
+pub(crate) struct ProtectedSourceInventory {
+    verified: VerifiedSource,
+    snapshot: ProtectedTreeSnapshot,
+    protection: SourceProtection,
+}
+
+#[cfg(feature = "css-corpus")]
+impl ProtectedSourceInventory {
+    pub(crate) const fn verified(&self) -> &VerifiedSource {
+        &self.verified
+    }
+
+    pub(crate) const fn snapshot(&self) -> &ProtectedTreeSnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) fn into_protected_source(
+        self,
+        snapshot: VerifiedSourceSnapshot,
+    ) -> Result<ProtectedSource> {
+        for entry in &snapshot.entries {
+            let (bytes, executable) =
+                read_worktree_regular(self.verified.canonical_source_root(), &entry.path)?;
+            if bytes != entry.bytes || executable {
+                return Err(invalid_source(format!(
+                    "materialized protected source file differs from its snapshot blob or mode: {}",
+                    entry.path.as_str()
+                )));
+            }
+        }
+        Ok(ProtectedSource {
+            verified: self.verified,
+            snapshot,
+            protection: self.protection,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ObjectFormat {
     Sha1,
@@ -271,6 +311,91 @@ pub(crate) struct SnapshotEntry {
     pub(crate) blob_object_id: String,
     pub(crate) bytes: Vec<u8>,
     pub(crate) digest: Sha256Digest,
+}
+
+#[cfg(feature = "css-corpus")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProtectedTreeSnapshot {
+    pub(crate) object_format: ObjectFormat,
+    pub(crate) entries: Vec<ProtectedTreeEntry>,
+}
+
+#[cfg(feature = "css-corpus")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProtectedTreeEntry {
+    pub(crate) path: ProtectedTreePath,
+    pub(crate) kind: ProtectedTreeEntryKind,
+    pub(crate) git_mode: String,
+    pub(crate) object_id: String,
+    pub(crate) bytes: Option<Vec<u8>>,
+    pub(crate) digest: Option<Sha256Digest>,
+}
+
+#[cfg(feature = "css-corpus")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProtectedTreeEntryKind {
+    Blob,
+    Commit,
+}
+
+#[cfg(feature = "css-corpus")]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ProtectedTreePath(Vec<u8>);
+
+#[cfg(feature = "css-corpus")]
+impl ProtectedTreePath {
+    fn new(bytes: &[u8], label: &str) -> Result<Self> {
+        if bytes.is_empty()
+            || bytes.first() == Some(&b'/')
+            || bytes.last() == Some(&b'/')
+            || bytes
+                .split(|byte| *byte == b'/')
+                .any(|component| component.is_empty() || component == b"." || component == b"..")
+        {
+            return Err(invalid_source(format!(
+                "{label} contains a structurally invalid tree path"
+            )));
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+
+    pub(crate) fn to_relative_path(&self) -> Option<RelativePath> {
+        std::str::from_utf8(&self.0)
+            .ok()
+            .and_then(|path| RelativePath::new(path).ok())
+    }
+
+    pub(crate) fn display(&self) -> String {
+        String::from_utf8_lossy(&self.0).into_owned()
+    }
+
+    fn is_within(&self, root: &RelativePath) -> bool {
+        let root = root.as_str().as_bytes();
+        self.0 == root
+            || self
+                .0
+                .strip_prefix(root)
+                .is_some_and(|suffix| suffix.starts_with(b"/"))
+    }
+
+    fn strip_root(&self, root: &RelativePath, label: &str) -> Result<Self> {
+        let suffix = self
+            .0
+            .strip_prefix(root.as_str().as_bytes())
+            .and_then(|suffix| suffix.strip_prefix(b"/"))
+            .ok_or_else(|| {
+                invalid_source(format!(
+                    "{label} path lacks the exact declared component prefix"
+                ))
+            })?;
+        Self::new(suffix, label)
+    }
+}
+
+struct ProtectedSourceProof<S> {
+    verified: VerifiedSource,
+    snapshot: S,
+    protection: SourceProtection,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -451,6 +576,33 @@ pub(crate) fn verify_protected_git_source(
     verify_git_source_impl(checkout, pin, None)
 }
 
+#[cfg(feature = "css-corpus")]
+pub(crate) fn verify_protected_git_source_inventory(
+    checkout: &Path,
+    pin: &PinnedSource,
+) -> Result<ProtectedSourceInventory> {
+    let proof = verify_git_source_proof(
+        checkout,
+        pin,
+        None,
+        |runner, canonical_root, revision, object_format| {
+            verify_raw_cleanliness_for_protected_inventory(
+                runner,
+                canonical_root,
+                revision,
+                object_format,
+                pin.source_subdirectory(),
+            )
+        },
+        build_protected_snapshot,
+    )?;
+    Ok(ProtectedSourceInventory {
+        verified: proof.verified,
+        snapshot: proof.snapshot,
+        protection: proof.protection,
+    })
+}
+
 #[cfg(test)]
 fn verify_git_source_with_test_hook<F>(
     checkout: impl AsRef<Path>,
@@ -468,6 +620,27 @@ fn verify_git_source_impl(
     pin: &PinnedSource,
     closing_hook: Option<Box<dyn FnOnce()>>,
 ) -> Result<ProtectedSource> {
+    let proof = verify_git_source_proof(
+        checkout,
+        pin,
+        closing_hook,
+        verify_raw_cleanliness,
+        build_snapshot,
+    )?;
+    Ok(ProtectedSource {
+        verified: proof.verified,
+        snapshot: proof.snapshot,
+        protection: proof.protection,
+    })
+}
+
+fn verify_git_source_proof<S>(
+    checkout: &Path,
+    pin: &PinnedSource,
+    closing_hook: Option<Box<dyn FnOnce()>>,
+    verify_cleanliness: impl FnOnce(&GitRunner, &Path, &SourceRevision, ObjectFormat) -> Result<()>,
+    build_source_snapshot: impl FnOnce(&GitRunner, &PinnedSource, ObjectFormat) -> Result<S>,
+) -> Result<ProtectedSourceProof<S>> {
     let checkout = canonical_checkout_directory(checkout)?;
     let trust = TrustedGit::discover()?;
     let initial_runner = GitRunner::new(trust.clone(), checkout.clone());
@@ -538,7 +711,7 @@ fn verify_git_source_impl(
         "HEAD does not equal the exact pinned revision",
     )?;
 
-    verify_raw_cleanliness(&runner, &canonical_root, pin.revision(), object_format)?;
+    verify_cleanliness(&runner, &canonical_root, pin.revision(), object_format)?;
 
     let source_candidate = pin.source_subdirectory().join(&canonical_root);
     let canonical_source_root =
@@ -579,7 +752,7 @@ fn verify_git_source_impl(
         authorities,
         alternate_graph,
     };
-    let snapshot = build_snapshot(&runner, pin, object_format)?;
+    let snapshot = build_source_snapshot(&runner, pin, object_format)?;
 
     if let Some(hook) = closing_hook {
         hook();
@@ -599,7 +772,7 @@ fn verify_git_source_impl(
     }
     runner.trust.revalidate()?;
 
-    Ok(ProtectedSource {
+    Ok(ProtectedSourceProof {
         verified: VerifiedSource {
             canonical_root,
             canonical_source_root,
@@ -1463,6 +1636,21 @@ struct GitEntry {
     object_id: String,
 }
 
+#[cfg(feature = "css-corpus")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProtectedGitEntry {
+    kind: ProtectedTreeEntryKind,
+    mode: String,
+    object_id: String,
+}
+
+#[cfg(feature = "css-corpus")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProtectedIndexEntry {
+    mode: String,
+    object_id: String,
+}
+
 fn protected_directory_from_line(line: &str, operation: &str) -> Result<ProtectionEntry> {
     let path = Path::new(line);
     if !path.is_absolute() {
@@ -1726,6 +1914,116 @@ fn verify_raw_cleanliness(
     Ok(())
 }
 
+#[cfg(feature = "css-corpus")]
+fn verify_raw_cleanliness_for_protected_inventory(
+    runner: &GitRunner,
+    canonical_root: &Path,
+    revision: &SourceRevision,
+    object_format: ObjectFormat,
+    protected_root: &RelativePath,
+) -> Result<()> {
+    let tree_arguments = ["ls-tree", "-r", "-z", "--full-tree", revision.as_str()]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    let tree = parse_protected_tree_inventory(
+        &runner.run(&tree_arguments)?.stdout,
+        object_format,
+        "pinned commit tree",
+    )?;
+
+    let index_arguments = ["ls-files", "--stage", "-z"]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    let index =
+        parse_protected_index_inventory(&runner.run(&index_arguments)?.stdout, object_format)?;
+    if index.len() != tree.len()
+        || index.iter().any(|(path, index_entry)| {
+            tree.get(path).is_none_or(|tree_entry| {
+                index_entry.mode != tree_entry.mode || index_entry.object_id != tree_entry.object_id
+            })
+        })
+    {
+        return Err(invalid_source(
+            "stage-zero Git index inventory does not exactly match the pinned commit tree",
+        ));
+    }
+
+    let visibility_arguments = ["ls-files", "-v", "-z"]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    let visibility =
+        parse_protected_visibility_inventory(&runner.run(&visibility_arguments)?.stdout)?;
+    let expected_paths = index.keys().cloned().collect::<BTreeSet<_>>();
+    if visibility != expected_paths {
+        return Err(invalid_source(
+            "Git index visibility contains hidden, removed, or unknown entries",
+        ));
+    }
+
+    let untracked_arguments = ["ls-files", "--others", "--exclude-standard", "-z"]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    let untracked = runner.run(&untracked_arguments)?;
+    if !nul_records(&untracked.stdout, "nonignored untracked inventory")?.is_empty() {
+        return Err(invalid_source(
+            "Git worktree contains a nonignored untracked path",
+        ));
+    }
+
+    for (path, entry) in tree {
+        if path.is_within(protected_root) {
+            continue;
+        }
+        let path = path
+            .to_relative_path()
+            .ok_or_else(|| invalid_source("pinned commit tree contains a noncanonical path"))?;
+        if entry.kind != ProtectedTreeEntryKind::Blob {
+            return Err(invalid_source(format!(
+                "unsupported tracked Git mode {} for {}",
+                entry.mode,
+                path.as_str()
+            )));
+        }
+        validate_git_mode(&entry.mode, "pinned commit tree")?;
+
+        match (entry.kind, entry.mode.as_str()) {
+            (ProtectedTreeEntryKind::Blob, "100644" | "100755") => {
+                let blob = cat_file_blob(runner, &entry.object_id)?;
+                let (bytes, executable) = read_worktree_regular(canonical_root, &path)?;
+                let expected_executable = entry.mode == "100755";
+                if bytes != blob || executable != expected_executable {
+                    return Err(invalid_source(format!(
+                        "materialized tracked file differs from its index blob or mode: {}",
+                        path.as_str()
+                    )));
+                }
+            }
+            (ProtectedTreeEntryKind::Blob, "120000") => {
+                let blob = cat_file_blob(runner, &entry.object_id)?;
+                let target = read_worktree_symlink(canonical_root, &path)?;
+                if std::str::from_utf8(&target).is_err() || target != blob {
+                    return Err(invalid_source(format!(
+                        "materialized tracked symlink differs from its index blob: {}",
+                        path.as_str()
+                    )));
+                }
+            }
+            _ => {
+                return Err(invalid_source(format!(
+                    "pinned commit tree contains an inconsistent Git mode/object kind: {} {}",
+                    entry.mode,
+                    path.as_str()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn build_snapshot(
     runner: &GitRunner,
     pin: &PinnedSource,
@@ -1769,6 +2067,61 @@ fn build_snapshot(
         ));
     }
     Ok(VerifiedSourceSnapshot {
+        object_format,
+        entries,
+    })
+}
+
+#[cfg(feature = "css-corpus")]
+fn build_protected_snapshot(
+    runner: &GitRunner,
+    pin: &PinnedSource,
+    object_format: ObjectFormat,
+) -> Result<ProtectedTreeSnapshot> {
+    let arguments = [
+        OsString::from("ls-tree"),
+        OsString::from("-r"),
+        OsString::from("-z"),
+        OsString::from("--full-tree"),
+        OsString::from(pin.revision().as_str()),
+        OsString::from("--"),
+        OsString::from(pin.source_subdirectory().as_str()),
+    ];
+    let inventory = parse_protected_tree_inventory(
+        &runner.run(&arguments)?.stdout,
+        object_format,
+        "pinned protected source snapshot",
+    )?;
+    let mut entries = Vec::with_capacity(inventory.len());
+    for (full_path, entry) in inventory {
+        let path = full_path.strip_root(
+            pin.source_subdirectory(),
+            "pinned protected source snapshot",
+        )?;
+        let (bytes, digest) = match entry.kind {
+            ProtectedTreeEntryKind::Blob => {
+                let bytes = cat_file_blob(runner, &entry.object_id)?;
+                let digest = Sha256Digest::from_bytes(&bytes);
+                (Some(bytes), Some(digest))
+            }
+            ProtectedTreeEntryKind::Commit => (None, None),
+        };
+        entries.push(ProtectedTreeEntry {
+            path,
+            kind: entry.kind,
+            git_mode: entry.mode,
+            object_id: entry.object_id,
+            bytes,
+            digest,
+        });
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    if entries.windows(2).any(|pair| pair[0].path == pair[1].path) {
+        return Err(invalid_source(
+            "protected source snapshot contains duplicate tree paths",
+        ));
+    }
+    Ok(ProtectedTreeSnapshot {
         object_format,
         entries,
     })
@@ -1822,6 +2175,128 @@ fn parse_tree_inventory(
         }
     }
     Ok(entries)
+}
+
+#[cfg(feature = "css-corpus")]
+fn parse_protected_tree_inventory(
+    bytes: &[u8],
+    object_format: ObjectFormat,
+    label: &str,
+) -> Result<BTreeMap<ProtectedTreePath, ProtectedGitEntry>> {
+    let mut entries = BTreeMap::new();
+    for record in nul_records(bytes, label)? {
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| invalid_source(format!("{label} record has no path separator")))?;
+        let header = std::str::from_utf8(&record[..tab])
+            .map_err(|_| invalid_source(format!("{label} header is not UTF-8")))?;
+        let mut fields = header.split(' ');
+        let mode = fields
+            .next()
+            .ok_or_else(|| invalid_source(format!("{label} record omits its mode")))?;
+        let object_type = fields
+            .next()
+            .ok_or_else(|| invalid_source(format!("{label} record omits its object type")))?;
+        let object_id = fields
+            .next()
+            .ok_or_else(|| invalid_source(format!("{label} record omits its object ID")))?;
+        if fields.next().is_some() {
+            return Err(invalid_source(format!(
+                "{label} contains a malformed tree entry"
+            )));
+        }
+        let kind = match object_type {
+            "blob" => ProtectedTreeEntryKind::Blob,
+            "commit" => ProtectedTreeEntryKind::Commit,
+            _ => {
+                return Err(invalid_source(format!(
+                    "{label} contains an unsupported object kind"
+                )));
+            }
+        };
+        validate_protected_tree_entry_shape(mode, kind, label)?;
+        validate_object_id(object_id, object_format, label)?;
+        let path = ProtectedTreePath::new(&record[tab + 1..], label)?;
+        if entries
+            .insert(
+                path,
+                ProtectedGitEntry {
+                    kind,
+                    mode: mode.to_owned(),
+                    object_id: object_id.to_owned(),
+                },
+            )
+            .is_some()
+        {
+            return Err(invalid_source(format!("{label} contains a duplicate path")));
+        }
+    }
+    Ok(entries)
+}
+
+#[cfg(feature = "css-corpus")]
+fn parse_protected_index_inventory(
+    bytes: &[u8],
+    object_format: ObjectFormat,
+) -> Result<BTreeMap<ProtectedTreePath, ProtectedIndexEntry>> {
+    let mut entries = BTreeMap::new();
+    for record in nul_records(bytes, "Git index inventory")? {
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| invalid_source("Git index record has no path separator"))?;
+        let header = std::str::from_utf8(&record[..tab])
+            .map_err(|_| invalid_source("Git index header is not UTF-8"))?;
+        let mut fields = header.split(' ');
+        let mode = fields
+            .next()
+            .ok_or_else(|| invalid_source("Git index record omits its mode"))?;
+        let object_id = fields
+            .next()
+            .ok_or_else(|| invalid_source("Git index record omits its object ID"))?;
+        let stage = fields
+            .next()
+            .ok_or_else(|| invalid_source("Git index record omits its stage"))?;
+        if fields.next().is_some() || stage != "0" {
+            return Err(invalid_source(
+                "Git index contains an unmerged or malformed entry",
+            ));
+        }
+        validate_protected_git_mode(mode, "Git index inventory")?;
+        validate_object_id(object_id, object_format, "Git index inventory")?;
+        let path = ProtectedTreePath::new(&record[tab + 1..], "Git index inventory")?;
+        if entries
+            .insert(
+                path,
+                ProtectedIndexEntry {
+                    mode: mode.to_owned(),
+                    object_id: object_id.to_owned(),
+                },
+            )
+            .is_some()
+        {
+            return Err(invalid_source("Git index contains a duplicate path"));
+        }
+    }
+    Ok(entries)
+}
+
+#[cfg(feature = "css-corpus")]
+fn parse_protected_visibility_inventory(bytes: &[u8]) -> Result<BTreeSet<ProtectedTreePath>> {
+    let mut paths = BTreeSet::new();
+    for record in nul_records(bytes, "Git index visibility inventory")? {
+        let path = record
+            .strip_prefix(b"H ")
+            .ok_or_else(|| invalid_source("Git index entry has a nonordinary visibility tag"))?;
+        let path = ProtectedTreePath::new(path, "Git index visibility inventory")?;
+        if !paths.insert(path) {
+            return Err(invalid_source(
+                "Git index visibility contains a duplicate path",
+            ));
+        }
+    }
+    Ok(paths)
 }
 
 fn parse_index_inventory(
@@ -1896,6 +2371,35 @@ fn validate_git_mode(mode: &str, label: &str) -> Result<()> {
     if !matches!(mode, "100644" | "100755" | "120000") {
         return Err(invalid_source(format!(
             "{label} contains unsupported Git mode {mode}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "css-corpus")]
+fn validate_protected_git_mode(mode: &str, label: &str) -> Result<()> {
+    if !matches!(mode, "100644" | "100755" | "120000" | "160000") {
+        return Err(invalid_source(format!(
+            "{label} contains unsupported Git mode {mode}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "css-corpus")]
+fn validate_protected_tree_entry_shape(
+    mode: &str,
+    kind: ProtectedTreeEntryKind,
+    label: &str,
+) -> Result<()> {
+    validate_protected_git_mode(mode, label)?;
+    if !matches!(
+        (mode, kind),
+        ("100644" | "100755" | "120000", ProtectedTreeEntryKind::Blob)
+            | ("160000", ProtectedTreeEntryKind::Commit)
+    ) {
+        return Err(invalid_source(format!(
+            "{label} contains an inconsistent Git mode/object kind"
         )));
     }
     Ok(())

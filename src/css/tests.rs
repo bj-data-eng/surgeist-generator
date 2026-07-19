@@ -217,7 +217,7 @@ mod imports {
     use crate::css::{CssCommand, CssRequest};
     use crate::{
         ArtifactProvenance, CorpusLocation, GenerationCounts, GenerationReport, GeneratorErrorKind,
-        ManifestVersion, RelativePath, ReportArtifact, Sha256Digest, SourceRevision,
+        ManifestVersion, PinnedSource, RelativePath, ReportArtifact, Sha256Digest, SourceRevision,
     };
 
     use super::{CSSTREE_REPOSITORY, manifest_text};
@@ -325,6 +325,16 @@ mod imports {
             .expect("import request")
         }
 
+        fn pin(&self) -> PinnedSource {
+            PinnedSource::new(
+                "csstree",
+                CSSTREE_REPOSITORY,
+                SourceRevision::new(&self.revision).expect("source revision"),
+                RelativePath::new("fixtures/ast").expect("fixture root"),
+            )
+            .expect("CSSTree pin")
+        }
+
         fn import(&self) -> crate::Result<()> {
             crate::css::run(self.request())
         }
@@ -362,6 +372,56 @@ mod imports {
                     OsStr::new("--quiet"),
                     OsStr::new("-m"),
                     OsStr::new("replace fixture with symlink"),
+                ],
+            );
+            self.revision = run_git(&self.source, &[OsStr::new("rev-parse"), OsStr::new("HEAD")]);
+            fs::write(
+                self.corpus.join("corpus.toml"),
+                manifest_text(&self.revision, 1),
+            )
+            .expect("update manifest");
+        }
+
+        fn replace_commit_with_gitlink(&mut self, relative: &str) {
+            fs::remove_dir_all(self.source.join("fixtures/ast")).expect("remove old fixtures");
+            let gitlink = self.source.join("fixtures/ast").join(relative);
+            fs::create_dir_all(&gitlink).expect("create nested Git repository");
+            run_git(&gitlink, &[OsStr::new("init"), OsStr::new("--quiet")]);
+            run_git(
+                &gitlink,
+                &[
+                    OsStr::new("config"),
+                    OsStr::new("user.name"),
+                    OsStr::new("CSS Gitlink Test"),
+                ],
+            );
+            run_git(
+                &gitlink,
+                &[
+                    OsStr::new("config"),
+                    OsStr::new("user.email"),
+                    OsStr::new("css-gitlink@example.invalid"),
+                ],
+            );
+            fs::write(gitlink.join("fixture.json"), b"{}\n").expect("write nested Git fixture");
+            run_git(&gitlink, &[OsStr::new("add"), OsStr::new("fixture.json")]);
+            run_git(
+                &gitlink,
+                &[
+                    OsStr::new("commit"),
+                    OsStr::new("--quiet"),
+                    OsStr::new("-m"),
+                    OsStr::new("nested fixture"),
+                ],
+            );
+            run_git(&self.source, &[OsStr::new("add"), OsStr::new("--all")]);
+            run_git(
+                &self.source,
+                &[
+                    OsStr::new("commit"),
+                    OsStr::new("--quiet"),
+                    OsStr::new("-m"),
+                    OsStr::new("replace fixture with gitlink"),
                 ],
             );
             self.revision = run_git(&self.source, &[OsStr::new("rev-parse"), OsStr::new("HEAD")]);
@@ -515,15 +575,41 @@ mod imports {
         (metadata.dev(), metadata.ino())
     }
 
-    fn assert_no_import_transaction_or_stage(fixture: &Fixture) {
+    fn assert_no_import_intent_journal_or_stage(fixture: &Fixture) {
         let transactions = fixture.corpus.join(".surgeist-generator/transactions/css");
-        assert_eq!(
-            fs::read_dir(transactions)
-                .expect("inspect CSS transactions")
-                .count(),
-            0,
-            "reserved-path rejection created transaction intent or residue"
-        );
+        if transactions.exists() {
+            assert_eq!(
+                fs::read_dir(transactions)
+                    .expect("inspect CSS transactions")
+                    .count(),
+                0,
+                "rejection created transaction intent or residue"
+            );
+        }
+        fn assert_no_active_journal(path: &Path) {
+            for entry in fs::read_dir(path)
+                .expect("inspect coordination state")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("read coordination entries")
+            {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                assert!(
+                    !name.starts_with("active-")
+                        && !name.starts_with("recovering-")
+                        && name != "intent.json",
+                    "rejection retained an active journal or intent: {}",
+                    entry.path().display()
+                );
+                if entry.file_type().expect("coordination entry type").is_dir() {
+                    assert_no_active_journal(&entry.path());
+                }
+            }
+        }
+        let coordination = fixture.corpus.join(".surgeist-generator");
+        if coordination.exists() {
+            assert_no_active_journal(&coordination);
+        }
         assert!(
             fs::read_dir(&fixture.corpus)
                 .expect("inspect corpus root")
@@ -538,7 +624,7 @@ mod imports {
         );
     }
 
-    fn assert_reserved_fixture_descendant_rejected(path: &str) {
+    fn assert_fixture_path_rejected_before_transaction(path: &str) {
         let mut fixture =
             Fixture::new(&[("declaration/Declaration.json", b"{\"old\":true}\n", false)]);
         fixture.import().expect("initial import");
@@ -552,18 +638,14 @@ mod imports {
         let error = importer::run_with_pre_lease_hook(&request, || pre_lease_reached.set(true))
             .expect_err("reserved fixture descendant");
 
-        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
-        assert_eq!(
-            error.to_string(),
-            format!("validate CSS import sidecar: reserved CSSTree fixture path: {path}")
-        );
-        assert!(
-            !pre_lease_reached.get(),
-            "reserved path reached lease preflight"
-        );
         assert_eq!(snapshot_tree(&import_root), before_bytes);
         assert_eq!(path_identity(&import_root), before_identity);
-        assert_no_import_transaction_or_stage(&fixture);
+        assert_no_import_intent_journal_or_stage(&fixture);
+        assert!(
+            !pre_lease_reached.get(),
+            "invalid fixture path reached lease preflight: {path}"
+        );
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
     }
 
     #[test]
@@ -675,13 +757,99 @@ mod imports {
     }
 
     #[test]
-    fn css_import_rejects_sidecar_descendant_before_transaction_intent() {
-        assert_reserved_fixture_descendant_rejected(".surgeist-source.json/child.json");
+    fn css_import_reserved_path_relations_and_case_aliases_preserve_existing_import() {
+        let paths = [
+            ".surgeist-source.json",
+            ".surgeist-source.json/child.json",
+            "generation-reports",
+            "generation-reports/all",
+            "generation-reports/all.json",
+            "generation-reports/all.json/child.json",
+        ];
+        #[cfg(target_os = "macos")]
+        let paths = paths
+            .into_iter()
+            .chain([
+                ".Surgeist-Source.json",
+                ".Surgeist-Source.json/child.json",
+                "Generation-Reports",
+                "Generation-Reports/All",
+                "Generation-Reports/all.json",
+                "generation-reports/All.json",
+                "Generation-Reports/All.json",
+                "Generation-Reports/All.json/child.json",
+            ])
+            .collect::<Vec<_>>();
+        for path in paths {
+            assert_fixture_path_rejected_before_transaction(path);
+        }
     }
 
     #[test]
-    fn css_import_rejects_report_descendant_before_transaction_intent() {
-        assert_reserved_fixture_descendant_rejected("generation-reports/all.json/child.json");
+    fn css_import_gitlink_fixture_is_invalid_before_lease_or_intent() {
+        let mut fixture =
+            Fixture::new(&[("declaration/Declaration.json", b"{\"old\":true}\n", false)]);
+        fixture.import().expect("initial import");
+        let import_root = fixture.corpus.join("source");
+        let before_bytes = snapshot_tree(&import_root);
+        let before_identity = path_identity(&import_root);
+        fixture.replace_commit_with_gitlink("declaration/Gitlink.json");
+        assert_eq!(
+            crate::verify_git_source(&fixture.source, &fixture.pin())
+                .expect_err("generic source proof must reject a gitlink")
+                .kind(),
+            GeneratorErrorKind::SourceVerification
+        );
+
+        let pre_lease_reached = Cell::new(false);
+        let request = fixture.request();
+        let error = importer::run_with_pre_lease_hook(&request, || pre_lease_reached.set(true))
+            .expect_err("gitlink fixture");
+
+        assert!(!pre_lease_reached.get(), "gitlink reached lease preflight");
+        assert_eq!(snapshot_tree(&import_root), before_bytes);
+        assert_eq!(path_identity(&import_root), before_identity);
+        assert_no_import_intent_journal_or_stage(&fixture);
+        assert_eq!(
+            error.kind(),
+            GeneratorErrorKind::InvalidInventory,
+            "unexpected gitlink classification: {error}"
+        );
+    }
+
+    #[test]
+    fn css_import_noncanonical_fixture_path_is_invalid_before_lease_or_intent() {
+        let mut fixture =
+            Fixture::new(&[("declaration/Declaration.json", b"{\"old\":true}\n", false)]);
+        fixture.import().expect("initial import");
+        let import_root = fixture.corpus.join("source");
+        let before_bytes = snapshot_tree(&import_root);
+        let before_identity = path_identity(&import_root);
+        fixture.replace_commit(&[("declaration\\Rejected.json", b"{}\n", false)]);
+        assert_eq!(
+            crate::verify_git_source(&fixture.source, &fixture.pin())
+                .expect_err("generic source proof must reject a noncanonical path")
+                .kind(),
+            GeneratorErrorKind::SourceVerification
+        );
+
+        let pre_lease_reached = Cell::new(false);
+        let request = fixture.request();
+        let error = importer::run_with_pre_lease_hook(&request, || pre_lease_reached.set(true))
+            .expect_err("noncanonical fixture path");
+
+        assert!(
+            !pre_lease_reached.get(),
+            "noncanonical path reached lease preflight"
+        );
+        assert_eq!(snapshot_tree(&import_root), before_bytes);
+        assert_eq!(path_identity(&import_root), before_identity);
+        assert_no_import_intent_journal_or_stage(&fixture);
+        assert_eq!(
+            error.kind(),
+            GeneratorErrorKind::InvalidInventory,
+            "unexpected noncanonical-path classification: {error}"
+        );
     }
 
     #[test]
@@ -695,6 +863,36 @@ mod imports {
         let error = fixture.import().expect_err("source pin mismatch");
         assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
         assert!(!fixture.corpus.join("source").exists());
+    }
+
+    #[test]
+    fn css_import_materialization_drift_remains_source_verification() {
+        let fixture = Fixture::new(&[(
+            "declaration/Declaration.json",
+            b"{\"original\":true}\n",
+            false,
+        )]);
+        fs::write(
+            fixture
+                .source
+                .join("fixtures/ast/declaration/Declaration.json"),
+            b"{\"materialized-drift\":true}\n",
+        )
+        .expect("drift materialized source bytes");
+        let pre_lease_reached = Cell::new(false);
+
+        let error = importer::run_with_pre_lease_hook(&fixture.request(), || {
+            pre_lease_reached.set(true);
+        })
+        .expect_err("materialized source drift");
+
+        assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+        assert!(
+            !pre_lease_reached.get(),
+            "source drift reached lease preflight"
+        );
+        assert!(!fixture.corpus.join("source").exists());
+        assert_no_import_intent_journal_or_stage(&fixture);
     }
 
     #[test]
@@ -792,26 +990,65 @@ mod imports {
 
         assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
         assert_eq!(snapshot_tree(&fixture.corpus.join("source")), expected);
-        let transactions = fixture.corpus.join(".surgeist-generator/transactions/css");
-        assert_eq!(
-            fs::read_dir(transactions)
-                .expect("inspect CSS transactions")
-                .count(),
-            0,
-            "inter-scan rejection created transaction intent or residue"
-        );
-        assert!(
-            fs::read_dir(&fixture.corpus)
-                .expect("inspect corpus root")
-                .all(|entry| {
-                    !entry
-                        .expect("corpus entry")
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with("._surgeist-")
-                }),
-            "inter-scan rejection created an external stage"
-        );
+        assert_no_import_intent_journal_or_stage(&fixture);
+    }
+
+    #[test]
+    fn css_import_inter_scan_known_entry_changes_are_invalid_without_intent() {
+        for replace_identity in [false, true] {
+            let mut fixture =
+                Fixture::new(&[("declaration/Declaration.json", b"{\"old\":true}\n", false)]);
+            fixture.import().expect("initial import");
+            fixture.replace_commit(&[("declaration/Declaration.json", b"{\"new\":true}\n", false)]);
+            let request = fixture.request();
+            let import_root = fixture.corpus.join("source");
+            let imported = fixture.imported("declaration/Declaration.json");
+            let displaced = fixture.root.join("displaced-imported.json");
+            let root_identity = path_identity(&import_root);
+            let original_file_identity = path_identity(&imported);
+            let replacement_identity = Cell::new(None);
+            let replacement_bytes = if replace_identity {
+                b"{\"old\":true}\n".as_slice()
+            } else {
+                b"{\"changed-between-scans\":true}\n".as_slice()
+            };
+            let mut expected_tree = snapshot_tree(&import_root);
+            expected_tree.insert(
+                PathBuf::from("declaration/Declaration.json"),
+                replacement_bytes.to_vec(),
+            );
+
+            let error = importer::run_with_inter_scan_hook(&request, || {
+                if replace_identity {
+                    fs::rename(&imported, &displaced).expect("displace known imported fixture");
+                }
+                fs::write(&imported, replacement_bytes).expect("replace known imported fixture");
+                replacement_identity.set(Some(path_identity(&imported)));
+            })
+            .expect_err("known import entry changed between scans");
+
+            assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+            assert_eq!(
+                error.to_string(),
+                "revalidate current publication tree: publication inventory changed before transaction intent"
+            );
+            assert_eq!(path_identity(&import_root), root_identity);
+            assert_eq!(snapshot_tree(&import_root), expected_tree);
+            let retained_identity = path_identity(&imported);
+            assert_eq!(Some(retained_identity), replacement_identity.get());
+            if replace_identity {
+                assert_ne!(
+                    retained_identity, original_file_identity,
+                    "same-byte replacement retained the original identity"
+                );
+            } else {
+                assert_eq!(
+                    retained_identity, original_file_identity,
+                    "changed-byte rewrite unexpectedly replaced identity"
+                );
+            }
+            assert_no_import_intent_journal_or_stage(&fixture);
+        }
     }
 
     #[test]

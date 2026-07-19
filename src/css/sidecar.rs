@@ -213,10 +213,24 @@ fn paths_overlap(left: &str, right: &str) -> bool {
 }
 
 fn is_same_or_descendant(path: &str, ancestor: &str) -> bool {
-    path == ancestor
-        || path
-            .strip_prefix(ancestor)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+    let path = path.split('/').collect::<Vec<_>>();
+    let ancestor = ancestor.split('/').collect::<Vec<_>>();
+    path.len() >= ancestor.len()
+        && path
+            .iter()
+            .zip(ancestor)
+            .all(|(component, ancestor)| target_components_equal(component, ancestor))
+}
+
+fn target_components_equal(left: &str, right: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        left.eq_ignore_ascii_case(right)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        left == right
+    }
 }
 
 fn validate_object_id(value: &str, object_format: SidecarObjectFormat, label: &str) -> Result<()> {
