@@ -1394,7 +1394,7 @@ sidecar while preserving authored HTML. Sidecar-free import classification is
 defined in SR-06.2 and does not guess from file extension or bytes alone. A future
 layout-owned adoption must run, review, and commit that one corpus migration
 before switching its scripts. It also runs the named schema-2 compatibility
-fixtures against its owned manifest; if that manifest hits one of the three
+fixtures against its owned manifest; if that manifest hits one of the four
 declared tightenings, the layout-owned handoff must review and commit the
 corresponding normalization before adoption. This repository never performs
 either sibling migration.
