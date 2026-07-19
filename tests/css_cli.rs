@@ -225,7 +225,7 @@ fn css_cli_import_csstree_executes_real_public_path() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn css_cli_generate_filtered_and_check_execute_real_public_paths() {
+fn css_cli_filtered_update_leaves_stale_check_until_full_generation() {
     let root = TestRoot::new();
     let owner = root.0.join("owner");
     let corpus = owner.join("corpus");
@@ -331,10 +331,19 @@ fn css_cli_generate_filtered_and_check_execute_real_public_paths() {
     let unselected = corpus.join("expectations/value/Value.json");
     let report = corpus.join("expectations/generation-reports/all.json");
     let selected_bytes = fs::read(&selected).expect("read selected expectation");
+    let unselected_bytes =
+        String::from_utf8(fs::read(&unselected).expect("read unselected output"))
+            .expect("UTF-8 unselected expectation");
     let report_bytes = fs::read(&report).expect("read full report");
     fs::write(&selected, b"stale selected expectation\n").expect("stale selected expectation");
-    fs::write(&unselected, b"preserve unselected expectation\n")
-        .expect("stale unselected expectation");
+    let stale_revision = if revision.starts_with('0') {
+        "1".repeat(revision.len())
+    } else {
+        "0".repeat(revision.len())
+    };
+    let stale_unselected = unselected_bytes.replace(&revision, &stale_revision);
+    assert_ne!(stale_unselected, unselected_bytes);
+    fs::write(&unselected, stale_unselected.as_bytes()).expect("stale unselected expectation");
 
     let filtered = Command::new(env!("CARGO_BIN_EXE_surgeist-css-generate"))
         .arg("--owner-root")
@@ -359,11 +368,26 @@ fn css_cli_generate_filtered_and_check_execute_real_public_paths() {
     );
     assert_eq!(
         fs::read(unselected).expect("read unselected output"),
-        b"preserve unselected expectation\n"
+        stale_unselected.as_bytes()
     );
     assert_eq!(
         fs::read(report).expect("read preserved report"),
         report_bytes
+    );
+
+    let stale_check = Command::new(env!("CARGO_BIN_EXE_surgeist-css-generate"))
+        .arg("--owner-root")
+        .arg(&owner)
+        .arg("--corpus-root")
+        .arg(&corpus)
+        .arg("check-corpus")
+        .output()
+        .expect("check filtered CSS generation");
+    assert_eq!(stale_check.status.code(), Some(1));
+    assert!(stale_check.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(stale_check.stderr).expect("UTF-8 stale-check diagnostic"),
+        "surgeist-css-generate: check current CSS corpus: CSS expectation is stale: value/Value.json\n"
     );
 
     let repair = Command::new(env!("CARGO_BIN_EXE_surgeist-css-generate"))

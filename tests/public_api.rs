@@ -382,7 +382,7 @@ fn portable_count_bounds_and_structural_report_counts_are_enforced() {
 
 #[cfg(feature = "css-corpus")]
 #[test]
-fn css_public_request_constructs_import_generate_and_check_payloads() {
+fn css_public_request_matrix_is_io_free_and_accessors_are_exact() {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -405,10 +405,15 @@ fn css_public_request_constructs_import_generate_and_check_payloads() {
     let corpus = owner.join("corpus");
     fs::create_dir_all(&corpus).expect("create public API roots");
     let location = CorpusLocation::new(&owner, &corpus).expect("location");
+    fs::rename(&owner, root.0.join("detached-owner"))
+        .expect("detach roots before request construction");
     let source = PathBuf::from("a-source-that-need-not-exist");
+    let filter = RelativePath::new("declaration").expect("filter");
 
     assert_copy_debug_eq::<CssCommand>();
     assert_clone_debug_eq::<CssRequest>();
+    let _: fn(CssRequest) -> surgeist_generator::Result<()> = surgeist_generator::css::run;
+    let _: fn() -> surgeist_generator::Result<()> = surgeist_generator::css::run_from_env;
     let request = CssRequest::new(
         location.clone(),
         CssCommand::ImportCsstree,
@@ -428,7 +433,6 @@ fn css_public_request_constructs_import_generate_and_check_payloads() {
     assert_eq!(generate.source_root(), None);
     assert_eq!(generate.filter(), None);
 
-    let filter = RelativePath::new("declaration").expect("filter");
     let filtered = CssRequest::new(
         location.clone(),
         CssCommand::Generate,
@@ -450,11 +454,10 @@ fn css_public_request_constructs_import_generate_and_check_payloads() {
 
     for (source_root, filter) in [
         (None, None),
+        (None, Some(filter.clone())),
         (Some(PathBuf::new()), None),
-        (
-            Some(source.clone()),
-            Some(RelativePath::new("declaration").expect("filter")),
-        ),
+        (Some(PathBuf::new()), Some(filter.clone())),
+        (Some(source.clone()), Some(filter.clone())),
     ] {
         let error = CssRequest::new(
             location.clone(),
@@ -468,6 +471,7 @@ fn css_public_request_constructs_import_generate_and_check_payloads() {
 
     for (source_root, filter) in [
         (Some(source.clone()), None),
+        (Some(source.clone()), Some(filter.clone())),
         (
             None,
             Some(RelativePath::new("generation-reports/all.json").expect("reserved filter")),
@@ -479,11 +483,9 @@ fn css_public_request_constructs_import_generate_and_check_payloads() {
     }
 
     for (source_root, filter) in [
-        (Some(source), None),
-        (
-            None,
-            Some(RelativePath::new("declaration").expect("filter")),
-        ),
+        (Some(source.clone()), None),
+        (None, Some(filter.clone())),
+        (Some(source), Some(filter)),
     ] {
         let error = CssRequest::new(
             location.clone(),

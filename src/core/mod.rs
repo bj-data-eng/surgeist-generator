@@ -54,23 +54,28 @@ pub(crate) fn validate_identifier(value: &str) -> bool {
 
 #[inline(always)]
 fn private_front_doors_are_linked() {
-    let _ = artifact::ArtifactPlan::new;
+    #[cfg(not(feature = "css-corpus"))]
+    {
+        let _ = artifact::ArtifactPlan::new;
+        let _ = artifact::PublicationInventory::new;
+        let _ = lease::GenerationLease::acquire_with_protected_source;
+        let _ = lease::GenerationCheck::acquire;
+        let _ = lease::GenerationCheck::finish;
+        let _ = inventory::InventoryEntry::digest;
+        let _ = inventory::Inventory::find;
+        let _ = protection::ProtectedSourceDisjointness::for_mutation;
+        let _ = source::ProtectedSource::snapshot;
+    }
     let _ = artifact::ArtifactPlan::install;
     let _ = artifact::ArtifactPlan::artifact_digest;
-    let _ = artifact::PublicationInventory::new;
     let _ = artifact::PublicationPolicy::DiagnosticFull;
     let _ = lease::GenerationLease::acquire;
-    let _ = lease::GenerationLease::acquire_with_protected_source;
     let _ = inventory::InventoryEntry::symlink;
     let _ = inventory::InventoryEntry::length;
-    let _ = inventory::InventoryEntry::digest;
     let _ = inventory::InventoryEntry::link_target;
     let _ = inventory::InventoryEntry::link_count;
-    let _ = inventory::Inventory::find;
     let _ = inventory::InventoryPolicy::Private;
-    let _ = protection::ProtectedSourceDisjointness::for_mutation;
     let _ = source::ProtectedSource::verified;
-    let _ = source::ProtectedSource::snapshot;
 }
 
 pub(crate) fn validate_repository_url(value: &str) -> bool {

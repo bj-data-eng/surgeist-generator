@@ -1386,6 +1386,50 @@ mod imports {
         );
     }
 
+    #[test]
+    fn css_changed_import_then_filtered_repair_stays_stale_until_full_generation() {
+        const OLD: &[u8] = b"{\"case\":{\"source\":\"old\",\"ast\":{},\"generate\":\"old{}\"}}\n";
+        const NEW: &[u8] = b"{\"case\":{\"source\":\"new\",\"ast\":{},\"generate\":\"new{}\"}}\n";
+
+        let mut fixture = Fixture::new(&[("declaration/Declaration.json", OLD, false)]);
+        fixture.set_manifest(1, 1, &[]);
+        fixture.import().expect("import initial source");
+        fixture.generate().expect("publish initial generation");
+        fixture.check().expect("initial generation is current");
+
+        fixture.import().expect("repeat unchanged import");
+        fixture
+            .check()
+            .expect("unchanged import preserves downstream freshness");
+
+        fixture.replace_commit(&[("declaration/Declaration.json", NEW, false)]);
+        fixture.set_manifest(1, 1, &[]);
+        fixture.import().expect("import changed source");
+        let error = fixture
+            .check()
+            .expect_err("changed import makes the expectation stale");
+        assert_eq!(error.kind(), GeneratorErrorKind::Verification);
+        assert_eq!(
+            error.to_string(),
+            "check current CSS corpus: CSS expectation is stale: declaration/Declaration.json"
+        );
+
+        fixture
+            .generate_filtered("declaration/Declaration.json")
+            .expect("repair the historically owned expectation");
+        let error = fixture
+            .check()
+            .expect_err("filtered repair preserves the stale full report");
+        assert_eq!(error.kind(), GeneratorErrorKind::Verification);
+        assert_eq!(
+            error.to_string(),
+            "check current CSS corpus: CSS generation report is stale"
+        );
+
+        fixture.generate().expect("publish a new full generation");
+        fixture.check().expect("full generation restores freshness");
+    }
+
     fn imported_generation_fixture(
         relative: &str,
         bytes: &'static [u8],
@@ -2090,6 +2134,9 @@ mod imports {
         fixture
             .generate()
             .expect("publish complete renamed generation");
+        fixture
+            .check()
+            .expect("renamed full generation has current membership authority");
         assert!(fixture.corpus.join("expectations/base/A.json").is_file());
         assert!(fixture.corpus.join("expectations/renamed/C.json").is_file());
         assert!(!fixture.corpus.join("expectations/added/B.json").exists());
@@ -2956,6 +3003,10 @@ mod imports {
             .generate()
             .expect_err("persisted report path collision");
         assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert_eq!(
+            error.to_string(),
+            "validate CSS import sidecar: reserved CSSTree fixture path: generation-reports/all.json"
+        );
         assert!(!fixture.corpus.join("expectations").exists());
     }
 

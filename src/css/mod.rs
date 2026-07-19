@@ -1,6 +1,7 @@
-//! Synchronous, acquisition-free CSSTree corpus operations.
+//! Synchronous CSSTree corpus operations over caller-supplied roots.
 //!
-//! The caller supplies an existing, clean checkout at the manifest's exact pin:
+//! Import uses an existing, clean checkout at the manifest's exact pin; this
+//! interface never downloads or installs the source:
 //!
 //! ```no_run
 //! # use std::path::PathBuf;
@@ -41,7 +42,7 @@ mod sidecar;
 #[cfg(test)]
 mod tests;
 
-/// Complete CSS operation available in this feature increment.
+/// CSS corpus operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum CssCommand {
@@ -56,7 +57,7 @@ pub enum CssCommand {
     CheckCorpus,
 }
 
-/// Checked request for one CSS corpus operation.
+/// Checked request for one CSS corpus operation, containing only that command's payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CssRequest {
     location: CorpusLocation,
@@ -67,6 +68,11 @@ pub struct CssRequest {
 
 impl CssRequest {
     /// Constructs a request without filesystem access.
+    ///
+    /// Import requires a nonempty source root and forbids a filter. Generation
+    /// forbids a source root and accepts an optional non-reserved filter. Checking
+    /// forbids both optional values. Every mismatch is a [`GeneratorErrorKind::Cli`]
+    /// error.
     pub fn new(
         location: CorpusLocation,
         command: CssCommand,
@@ -159,7 +165,9 @@ pub fn run(request: CssRequest) -> Result<()> {
     }
 }
 
-/// Parses `args_os` and synchronously executes one CSS operation.
+/// Reads only `args_os` and synchronously executes one CSS operation.
+///
+/// No operator configuration environment variable participates in parsing.
 pub fn run_from_env() -> Result<()> {
     cli::run_from_env()
 }
