@@ -20,10 +20,10 @@
   and process-prefix enumerators are explicit opt-in diagnostics; ordinary Cargo
   test matrices compile but never execute them. C01 through C04 compare the exact
   cumulative ignored inventory; only C04, after every initiative implementation
-  task is complete, runs that inventory once in this exact sequential invocation:
-  `cargo test --locked --offline -p surgeist-generator --all-features --lib -- --ignored --test-threads=1`.
-  A failure stops C04 publication; no automatic rerun is assumed, and any rerun
-  requires fresh user authority under the canonical workflow.
+  task is complete, runs that inventory once through the exact sequential
+  invocation reviewed in the just-in-time C04 cycle plan. A failure stops C04
+  publication; no automatic rerun is assumed, and any rerun requires fresh user
+  authority under the canonical workflow.
 
 ## Ordered Cycles
 
@@ -170,8 +170,8 @@
   complete supported offline feature, quality, provenance, dependency, and
   unsafe-absence matrix is clean. After every C01–C04 implementation task is
   complete, the exact cumulative ignored diagnostic inventory runs once through
-  the Authority section's sequential all-features Cargo command; any failure
-  stops publication and is not rerun without new user authority.
+  the reviewed C04 cycle plan's exact sequential invocation; any failure stops
+  publication and is not rerun without new user authority.
 - Handoff: publish and remotely verify the immutable C04 leaf candidate and
   produce the canonical leaf completion record for the user's independent
   review. Any root gitlink, root API artifact, or sibling corpus adoption starts
