@@ -203,7 +203,7 @@
   - `cargo test --locked --offline -p surgeist-generator --features layout-browser --test layout_cli`
   - `cargo test --locked --offline -p surgeist-generator --features layout-browser`
   - `cargo test --locked --offline -p surgeist-generator --no-default-features`
-  - `cargo test --locked --offline -p surgeist-generator --all-features --lib -- --ignored --list`
+  - `cargo test --locked --offline -p surgeist-generator --all-features -- --ignored --list`
   - `cargo metadata --locked --offline --no-deps --format-version 1`
   - `cargo clippy --locked --offline -p surgeist-generator --features layout-browser --all-targets -- -F unsafe-code -D warnings`
   - `cargo fmt --check`
@@ -238,7 +238,7 @@
   - `cargo test --locked --offline -p surgeist-generator --features layout-browser --test public_api`
   - `cargo test --locked --offline -p surgeist-generator --features layout-browser --test layout_cli`
   - `cargo test --locked --offline -p surgeist-generator --features layout-browser`
-  - `cargo test --locked --offline -p surgeist-generator --all-features --lib -- --ignored --list`
+  - `cargo test --locked --offline -p surgeist-generator --all-features -- --ignored --list`
   - `cargo clippy --locked --offline -p surgeist-generator --features layout-browser --all-targets -- -F unsafe-code -D warnings`
   - `cargo fmt --check`
 - Dependencies: C03-T01 is task-clean.
@@ -284,7 +284,7 @@
   - `cargo test --locked --offline -p surgeist-generator --features layout-browser --test layout_cli`
   - `cargo test --locked --offline -p surgeist-generator --features layout-browser`
   - `cargo test --locked --offline -p surgeist-generator --all-features`
-  - `cargo test --locked --offline -p surgeist-generator --all-features --lib -- --ignored --list`
+  - `cargo test --locked --offline -p surgeist-generator --all-features -- --ignored --list`
   - `cargo clippy --locked --offline -p surgeist-generator --features layout-browser --all-targets -- -F unsafe-code -D warnings`
   - `cargo fmt --check`
 - Dependencies: C03-T02 is task-clean.
@@ -326,7 +326,7 @@
   - `cargo test --locked --offline -p surgeist-generator --features layout-browser`
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus`
   - `cargo test --locked --offline -p surgeist-generator --all-features`
-  - `cargo test --locked --offline -p surgeist-generator --all-features --lib -- --ignored --list`
+  - `cargo test --locked --offline -p surgeist-generator --all-features -- --ignored --list`
   - `cargo metadata --locked --offline --no-deps --format-version 1`
   - `cargo clippy --locked --offline -p surgeist-generator --all-features --all-targets -- -F unsafe-code -D warnings`
   - `cargo fmt --check`
@@ -353,7 +353,7 @@
   - `cargo test --locked --offline -p surgeist-generator --features layout-browser`
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus`
   - `cargo test --locked --offline -p surgeist-generator --all-features`
-  - `cargo test --locked --offline -p surgeist-generator --all-features --lib -- --ignored --list`
+  - `cargo test --locked --offline -p surgeist-generator --all-features -- --ignored --list`
   - `cargo clippy --locked --offline -p surgeist-generator --no-default-features --all-targets -- -F unsafe-code -D warnings`
   - `cargo clippy --locked --offline -p surgeist-generator --features layout-browser --all-targets -- -F unsafe-code -D warnings`
   - `cargo clippy --locked --offline -p surgeist-generator --features css-corpus --all-targets -- -F unsafe-code -D warnings`
