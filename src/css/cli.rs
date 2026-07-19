@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, Result};
+use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, RelativePath, Result};
 
 use super::{CssCommand, CssRequest};
 
@@ -41,11 +41,8 @@ fn run_from_args(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
                 )?;
             }
             Some("--filter") => {
-                set_once(
-                    &mut filter,
-                    next_value(&mut arguments, "--filter")?,
-                    "--filter",
-                )?;
+                let value = next_value(&mut arguments, "--filter")?;
+                set_once(&mut filter, parse_filter(value)?, "--filter")?;
             }
             Some(value) if value.starts_with("--") => {
                 return Err(cli_error(format!("unknown flag: {value}")));
@@ -74,11 +71,6 @@ fn run_from_args(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
             }
         }
         CssCommand::Generate => {
-            if filter.is_some() {
-                return Err(cli_error(
-                    "generate forbids --filter until filtered generation is available",
-                ));
-            }
             if source_root.is_some() {
                 return Err(cli_error("generate forbids --source-root"));
             }
@@ -86,8 +78,18 @@ fn run_from_args(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
     }
 
     let location = CorpusLocation::new(owner_root, corpus_root)?;
-    let request = CssRequest::new(location, command, source_root.map(PathBuf::from), None)?;
+    let request = CssRequest::new(location, command, source_root.map(PathBuf::from), filter)?;
     super::run(request)
+}
+
+fn parse_filter(value: OsString) -> Result<RelativePath> {
+    let value = value
+        .into_string()
+        .map_err(|_| cli_error("--filter must be UTF-8"))?;
+    let filter =
+        RelativePath::new(&value).map_err(|_| cli_error(format!("invalid --filter: {value}")))?;
+    super::filter::validate_request_filter(&filter)?;
+    Ok(filter)
 }
 
 fn next_value(arguments: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<OsString> {

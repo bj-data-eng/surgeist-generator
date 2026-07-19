@@ -33,6 +33,32 @@ impl HistoricalInventory {
             .collect::<BTreeSet<_>>();
         validate_visible_inventory(inventory, &admitted, "CSS expectation root")
     }
+
+    pub(super) fn require_filtered_ownership(
+        &self,
+        selected: &BTreeSet<RelativePath>,
+    ) -> Result<()> {
+        if self.inventory.is_none() {
+            return Err(verification(
+                "CSS expectation root is absent; run full generation first",
+            ));
+        }
+        if self.report.is_none() {
+            return Err(verification(
+                "CSS expectation root has no historical full-report ownership",
+            ));
+        }
+        if let Some(unowned) = selected
+            .iter()
+            .find(|path| !self.classified_paths.contains(*path))
+        {
+            return Err(verification(format!(
+                "CSS expectation is not historically owned: {}",
+                unowned.as_str()
+            )));
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn inspect(rooted: &RootedFs, manifest: &CssManifest) -> Result<HistoricalInventory> {
@@ -261,6 +287,14 @@ fn invalid_inventory_with_source(operation: &str, source: GeneratorError) -> Gen
         operation,
         source.to_string(),
         source,
+    )
+}
+
+fn verification(detail: impl Into<String>) -> GeneratorError {
+    GeneratorError::new(
+        GeneratorErrorKind::Verification,
+        "validate CSS filtered ownership",
+        detail,
     )
 }
 

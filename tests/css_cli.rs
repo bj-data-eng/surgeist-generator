@@ -62,15 +62,27 @@ fn css_cli_invalid_syntax_prints_exact_prefix_and_exits_64() {
 }
 
 #[test]
-fn css_cli_generate_rejects_filter_and_source_root_before_io() {
-    for (extra, expected) in [
+fn css_cli_filter_syntax_and_option_matrix_precede_io() {
+    for (command, extra, expected) in [
         (
-            ["--filter", "declaration"],
-            "surgeist-css-generate: parse CSS command line: generate forbids --filter until filtered generation is available\n",
+            "generate",
+            ["--filter", "."],
+            "surgeist-css-generate: parse CSS command line: invalid --filter: .\n",
         ),
         (
+            "generate",
+            ["--filter", "generation-reports/all.json"],
+            "surgeist-css-generate: construct CSS request: generate reserves generation-reports/all.json for the full report\n",
+        ),
+        (
+            "generate",
             ["--source-root", "checkout"],
             "surgeist-css-generate: parse CSS command line: generate forbids --source-root\n",
+        ),
+        (
+            "import-csstree",
+            ["--filter", "declaration"],
+            "surgeist-css-generate: parse CSS command line: import-csstree forbids --filter\n",
         ),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_surgeist-css-generate"))
@@ -79,7 +91,7 @@ fn css_cli_generate_rejects_filter_and_source_root_before_io() {
                 "does-not-exist",
                 "--corpus-root",
                 "does-not-exist",
-                "generate",
+                command,
             ])
             .args(extra)
             .output()
@@ -92,6 +104,23 @@ fn css_cli_generate_rejects_filter_and_source_root_before_io() {
             expected
         );
     }
+
+    let accepted = Command::new(env!("CARGO_BIN_EXE_surgeist-css-generate"))
+        .args([
+            "--owner-root",
+            "does-not-exist",
+            "--corpus-root",
+            "does-not-exist",
+            "generate",
+            "--filter",
+            "declaration",
+        ])
+        .output()
+        .expect("run packaged CSS binary");
+    assert_eq!(accepted.status.code(), Some(1));
+    assert!(accepted.stdout.is_empty());
+    let diagnostic = String::from_utf8(accepted.stderr).expect("UTF-8 diagnostic");
+    assert!(diagnostic.starts_with("surgeist-css-generate: canonicalize owner root:"));
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -171,7 +200,7 @@ fn css_cli_import_csstree_executes_real_public_path() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn css_cli_generate_executes_real_unfiltered_public_path() {
+fn css_cli_generate_executes_real_full_and_filtered_public_paths() {
     let root = TestRoot::new();
     let owner = root.0.join("owner");
     let corpus = owner.join("corpus");
@@ -204,6 +233,14 @@ fn css_cli_generate_executes_real_unfiltered_public_path() {
         b"{\"case\":{\"source\":\"a { color: red }\",\"ast\":{},\"generate\":\"a{color:red}\"}}\n",
     )
     .expect("write fixture");
+    let other_fixture = checkout.join("fixtures/ast/value/Value.json");
+    fs::create_dir_all(other_fixture.parent().expect("other fixture parent"))
+        .expect("create other fixture parent");
+    fs::write(
+        &other_fixture,
+        b"{\"case\":{\"source\":\"b {}\",\"ast\":{},\"generate\":\"b{}\"}}\n",
+    )
+    .expect("write other fixture");
     run_git(&checkout, &[OsStr::new("add"), OsStr::new("fixtures/ast")]);
     run_git(
         &checkout,
@@ -218,7 +255,7 @@ fn css_cli_generate_executes_real_unfiltered_public_path() {
     fs::write(
         corpus.join("corpus.toml"),
         format!(
-            "schema_version = 1\n\n[source]\nkind = \"csstree\"\nrepository = \"{CSSTREE_REPOSITORY}\"\nrevision = \"{revision}\"\nfixture_root = \"fixtures/ast\"\nimport_root = \"source\"\nexpected_files = 1\nexpected_cases = 1\n\n[artifacts]\nexpectation_root = \"expectations\"\nreport_file = \"expectations/generation-reports/all.json\"\n"
+            "schema_version = 1\n\n[source]\nkind = \"csstree\"\nrepository = \"{CSSTREE_REPOSITORY}\"\nrevision = \"{revision}\"\nfixture_root = \"fixtures/ast\"\nimport_root = \"source\"\nexpected_files = 2\nexpected_cases = 2\n\n[artifacts]\nexpectation_root = \"expectations\"\nreport_file = \"expectations/generation-reports/all.json\"\n"
         ),
     )
     .expect("write manifest");
@@ -263,5 +300,44 @@ fn css_cli_generate_executes_real_unfiltered_public_path() {
         corpus
             .join("expectations/generation-reports/all.json")
             .is_file()
+    );
+
+    let selected = corpus.join("expectations/declaration/Declaration.json");
+    let unselected = corpus.join("expectations/value/Value.json");
+    let report = corpus.join("expectations/generation-reports/all.json");
+    let selected_bytes = fs::read(&selected).expect("read selected expectation");
+    let report_bytes = fs::read(&report).expect("read full report");
+    fs::write(&selected, b"stale selected expectation\n").expect("stale selected expectation");
+    fs::write(&unselected, b"preserve unselected expectation\n")
+        .expect("stale unselected expectation");
+
+    let filtered = Command::new(env!("CARGO_BIN_EXE_surgeist-css-generate"))
+        .arg("--owner-root")
+        .arg(&owner)
+        .arg("--corpus-root")
+        .arg(&corpus)
+        .arg("generate")
+        .arg("--filter")
+        .arg("declaration/Declaration.json")
+        .output()
+        .expect("run packaged filtered CSS generation");
+    assert!(
+        filtered.status.success(),
+        "filtered CSS generation failed: {}",
+        String::from_utf8_lossy(&filtered.stderr)
+    );
+    assert!(filtered.stdout.is_empty());
+    assert!(filtered.stderr.is_empty());
+    assert_eq!(
+        fs::read(selected).expect("read selected output"),
+        selected_bytes
+    );
+    assert_eq!(
+        fs::read(unselected).expect("read unselected output"),
+        b"preserve unselected expectation\n"
+    );
+    assert_eq!(
+        fs::read(report).expect("read preserved report"),
+        report_bytes
     );
 }

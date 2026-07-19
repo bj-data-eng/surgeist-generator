@@ -26,6 +26,7 @@ use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, RelativePath, Re
 mod case;
 mod cli;
 mod expectation;
+mod filter;
 mod fixture;
 mod full_generation;
 mod historical;
@@ -43,7 +44,10 @@ mod tests;
 pub enum CssCommand {
     /// Import the manifest-pinned `fixtures/ast` tree from an existing checkout.
     ImportCsstree,
-    /// Generate the complete neutral expectation set from the current import.
+    /// Generate neutral expectations from the current import, optionally filtered.
+    ///
+    /// Filtered generation updates only matching expectations already owned by the
+    /// historical full report and preserves every other expectation and report.
     Generate,
 }
 
@@ -83,11 +87,8 @@ impl CssRequest {
                 }
             }
             CssCommand::Generate => {
-                if filter.is_some() {
-                    return Err(cli_error(
-                        "construct CSS request",
-                        "generate forbids a filter until filtered generation is available",
-                    ));
+                if let Some(filter) = &filter {
+                    self::filter::validate_request_filter(filter)?;
                 }
                 if source_root.is_some() {
                     return Err(cli_error(

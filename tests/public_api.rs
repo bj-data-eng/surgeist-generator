@@ -382,7 +382,7 @@ fn portable_count_bounds_and_structural_report_counts_are_enforced() {
 
 #[cfg(feature = "css-corpus")]
 #[test]
-fn css_public_request_constructs_import_and_unfiltered_generate_payloads() {
+fn css_public_request_constructs_import_full_and_filtered_generate_payloads() {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -428,6 +428,19 @@ fn css_public_request_constructs_import_and_unfiltered_generate_payloads() {
     assert_eq!(generate.source_root(), None);
     assert_eq!(generate.filter(), None);
 
+    let filter = RelativePath::new("declaration").expect("filter");
+    let filtered = CssRequest::new(
+        location.clone(),
+        CssCommand::Generate,
+        None,
+        Some(filter.clone()),
+    )
+    .expect("I/O-free filtered generation request");
+    assert_eq!(filtered.location(), &location);
+    assert_eq!(filtered.command(), CssCommand::Generate);
+    assert_eq!(filtered.source_root(), None);
+    assert_eq!(filtered.filter(), Some(&filter));
+
     for (source_root, filter) in [
         (None, None),
         (Some(PathBuf::new()), None),
@@ -450,7 +463,7 @@ fn css_public_request_constructs_import_and_unfiltered_generate_payloads() {
         (Some(source.clone()), None),
         (
             None,
-            Some(RelativePath::new("declaration").expect("filter")),
+            Some(RelativePath::new("generation-reports/all.json").expect("reserved filter")),
         ),
     ] {
         let error = CssRequest::new(location.clone(), CssCommand::Generate, source_root, filter)

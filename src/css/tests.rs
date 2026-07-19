@@ -388,6 +388,16 @@ mod imports {
                 .expect("full generation request")
         }
 
+        fn filtered_generate_request(&self, filter: &str) -> CssRequest {
+            CssRequest::new(
+                self.location.clone(),
+                CssCommand::Generate,
+                None,
+                Some(RelativePath::new(filter).expect("strict CSS filter")),
+            )
+            .expect("filtered generation request")
+        }
+
         fn pin(&self) -> PinnedSource {
             PinnedSource::new(
                 "csstree",
@@ -404,6 +414,10 @@ mod imports {
 
         fn generate(&self) -> crate::Result<()> {
             crate::css::run(self.generate_request())
+        }
+
+        fn generate_filtered(&self, filter: &str) -> crate::Result<()> {
+            crate::css::run(self.filtered_generate_request(filter))
         }
 
         fn set_manifest(
@@ -1848,6 +1862,310 @@ mod imports {
         assert_eq!(snapshot_tree(&fixture.corpus.join("expectations")), before);
     }
 
+    #[test]
+    fn css_filter_exact_file() {
+        let fixture = Fixture::new(&[
+            (
+                "group/A.json",
+                b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+                false,
+            ),
+            (
+                "group/B.json",
+                b"{\"case\":{\"source\":\"b\",\"ast\":{}}}\n",
+                false,
+            ),
+        ]);
+        fixture.set_manifest(2, 2, &[]);
+        fixture.import().expect("import exact-filter fixtures");
+        fixture.generate().expect("publish full expectations");
+        let selected = fixture.expectation("group/A.json");
+        let report = fixture.report();
+        fs::remove_file(fixture.corpus.join("expectations/group/A.json"))
+            .expect("remove historically owned selected output");
+        fs::write(
+            fixture.corpus.join("expectations/group/B.json"),
+            b"preserve exact-file sibling\n",
+        )
+        .expect("stale unselected sibling");
+
+        fixture
+            .generate_filtered("group/A.json")
+            .expect("generate exact filtered fixture");
+
+        assert_eq!(fixture.expectation("group/A.json"), selected);
+        assert_eq!(
+            fixture.expectation("group/B.json"),
+            b"preserve exact-file sibling\n"
+        );
+        assert_eq!(fixture.report(), report);
+    }
+
+    #[test]
+    fn css_filter_component_prefix() {
+        let fixture = Fixture::new(&[
+            (
+                "grid/a/One.json",
+                b"{\"case\":{\"source\":\"one\",\"ast\":{}}}\n",
+                false,
+            ),
+            (
+                "grid/a/nested/Two.json",
+                b"{\"case\":{\"source\":\"two\",\"ast\":{}}}\n",
+                false,
+            ),
+            (
+                "grid/ab/Other.json",
+                b"{\"case\":{\"source\":\"other\",\"ast\":{}}}\n",
+                false,
+            ),
+        ]);
+        fixture.set_manifest(3, 3, &[]);
+        fixture.import().expect("import prefix fixtures");
+        fixture.generate().expect("publish full expectations");
+        let one = fixture.expectation("grid/a/One.json");
+        let two = fixture.expectation("grid/a/nested/Two.json");
+        let report = fixture.report();
+        fs::write(
+            fixture.corpus.join("expectations/grid/a/One.json"),
+            b"stale selected one\n",
+        )
+        .expect("stale first selected output");
+        fs::write(
+            fixture.corpus.join("expectations/grid/a/nested/Two.json"),
+            b"stale selected two\n",
+        )
+        .expect("stale second selected output");
+        fs::write(
+            fixture.corpus.join("expectations/grid/ab/Other.json"),
+            b"preserve partial component\n",
+        )
+        .expect("stale partial-component output");
+
+        fixture
+            .generate_filtered("grid/a")
+            .expect("generate component-prefix fixtures");
+
+        assert_eq!(fixture.expectation("grid/a/One.json"), one);
+        assert_eq!(fixture.expectation("grid/a/nested/Two.json"), two);
+        assert_eq!(
+            fixture.expectation("grid/ab/Other.json"),
+            b"preserve partial component\n"
+        );
+        assert_eq!(fixture.report(), report);
+    }
+
+    #[test]
+    fn css_filter_rejects_partial_component() {
+        let fixture = imported_generation_fixture(
+            "grid/ab/Case.json",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+            1,
+            &[],
+        );
+        fixture.generate().expect("publish full expectation");
+        let before = snapshot_tree(&fixture.corpus.join("expectations"));
+        let pre_lease_reached = Cell::new(false);
+
+        let error = full_generation::run_with_pre_lease_hook(
+            &fixture.filtered_generate_request("grid/a"),
+            || pre_lease_reached.set(true),
+        )
+        .expect_err("partial component must not match");
+
+        assert_eq!(error.kind(), GeneratorErrorKind::Verification);
+        assert!(!pre_lease_reached.get());
+        assert_eq!(snapshot_tree(&fixture.corpus.join("expectations")), before);
+        assert_no_import_intent_journal_or_stage(&fixture);
+    }
+
+    #[test]
+    fn css_filter_rejects_reserved() {
+        let fixture = Fixture::new(&[(
+            "declaration/Case.json",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+            false,
+        )]);
+        let error = CssRequest::new(
+            fixture.location.clone(),
+            CssCommand::Generate,
+            None,
+            Some(RelativePath::new("generation-reports/all.json").expect("strict reserved filter")),
+        )
+        .expect_err("reserved report filter");
+
+        assert_eq!(error.kind(), GeneratorErrorKind::Cli);
+        assert_eq!(
+            error.to_string(),
+            "construct CSS request: generate reserves generation-reports/all.json for the full report"
+        );
+    }
+
+    #[test]
+    fn css_filter_absent_is_verification() {
+        let fixture = imported_generation_fixture(
+            "declaration/Case.json",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+            1,
+            &[],
+        );
+        fixture.generate().expect("publish full expectation");
+        let before = snapshot_tree(&fixture.corpus.join("expectations"));
+        let pre_lease_reached = Cell::new(false);
+
+        let error = full_generation::run_with_pre_lease_hook(
+            &fixture.filtered_generate_request("declaration/Absent.json"),
+            || pre_lease_reached.set(true),
+        )
+        .expect_err("absent exact filter");
+
+        assert_eq!(error.kind(), GeneratorErrorKind::Verification);
+        assert!(!pre_lease_reached.get());
+        assert_eq!(snapshot_tree(&fixture.corpus.join("expectations")), before);
+        assert_no_import_intent_journal_or_stage(&fixture);
+    }
+
+    #[test]
+    fn css_filtered_generate_absent_root_is_verification_before_lease() {
+        let fixture = imported_generation_fixture(
+            "declaration/Case.json",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+            1,
+            &[],
+        );
+        let pre_lease_reached = Cell::new(false);
+
+        let error = full_generation::run_with_pre_lease_hook(
+            &fixture.filtered_generate_request("declaration/Case.json"),
+            || pre_lease_reached.set(true),
+        )
+        .expect_err("filtered generation cannot establish an expectation root");
+
+        assert_eq!(error.kind(), GeneratorErrorKind::Verification);
+        assert!(!pre_lease_reached.get());
+        assert!(!fixture.corpus.join("expectations").exists());
+        assert_no_import_intent_journal_or_stage(&fixture);
+    }
+
+    #[test]
+    fn css_filtered_add_then_rename_requires_full_before_creation() {
+        const A: &[u8] = b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n";
+        const B: &[u8] = b"{\"case\":{\"source\":\"b\",\"ast\":{}}}\n";
+        const C: &[u8] = b"{\"case\":{\"source\":\"c\",\"ast\":{}}}\n";
+
+        let mut fixture = Fixture::new(&[("base/A.json", A, false)]);
+        fixture.set_manifest(1, 1, &[]);
+        fixture.import().expect("import initial fixture");
+        fixture.generate().expect("publish initial full generation");
+
+        fixture.replace_commit(&[("base/A.json", A, false), ("added/B.json", B, false)]);
+        fixture.set_manifest(2, 2, &[]);
+        fixture.import().expect("import added fixture");
+        let before = snapshot_tree(&fixture.corpus.join("expectations"));
+        let pre_lease_reached = Cell::new(false);
+        let error = full_generation::run_with_pre_lease_hook(
+            &fixture.filtered_generate_request("added/B.json"),
+            || pre_lease_reached.set(true),
+        )
+        .expect_err("historically unowned addition");
+        assert_eq!(error.kind(), GeneratorErrorKind::Verification);
+        assert!(!pre_lease_reached.get());
+        assert_eq!(snapshot_tree(&fixture.corpus.join("expectations")), before);
+        assert!(!fixture.corpus.join("expectations/added/B.json").exists());
+
+        fixture.replace_commit(&[("base/A.json", A, false), ("renamed/C.json", C, false)]);
+        fixture.set_manifest(2, 2, &[]);
+        fixture.import().expect("import renamed fixture");
+        fixture
+            .generate()
+            .expect("publish complete renamed generation");
+        assert!(fixture.corpus.join("expectations/base/A.json").is_file());
+        assert!(fixture.corpus.join("expectations/renamed/C.json").is_file());
+        assert!(!fixture.corpus.join("expectations/added/B.json").exists());
+        let report: GenerationReport =
+            serde_json::from_slice(&fixture.report()).expect("renamed full report");
+        assert_eq!(report.artifacts().len(), 2);
+    }
+
+    #[test]
+    fn css_filtered_generate_selected_fixtures_publish_atomically() {
+        let mut fixture = Fixture::new(&[
+            (
+                "group/A.json",
+                b"{\"case\":{\"source\":\"old a\",\"ast\":{}}}\n",
+                false,
+            ),
+            (
+                "group/B.json",
+                b"{\"case\":{\"source\":\"old b\",\"ast\":{}}}\n",
+                false,
+            ),
+        ]);
+        fixture.set_manifest(2, 2, &[]);
+        fixture.import().expect("import initial selected fixtures");
+        fixture
+            .generate()
+            .expect("publish initial selected fixtures");
+        let before = snapshot_tree(&fixture.corpus.join("expectations"));
+
+        fixture.replace_commit(&[
+            (
+                "group/A.json",
+                b"{\"case\":{\"source\":\"new a\",\"ast\":{}}}\n",
+                false,
+            ),
+            ("group/B.json", b"not JSON\n", false),
+        ]);
+        fixture.set_manifest(2, 2, &[]);
+        fixture.import().expect("import changed selected fixtures");
+        let error = fixture
+            .generate_filtered("group")
+            .expect_err("one invalid selected fixture aborts the whole selection");
+
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert_eq!(snapshot_tree(&fixture.corpus.join("expectations")), before);
+        assert_no_import_intent_journal_or_stage(&fixture);
+    }
+
+    #[test]
+    fn css_filtered_generation_preserves_unselected_report_and_stale_outputs() {
+        const OLD_A: &[u8] = b"{\"case\":{\"source\":\"old a\",\"ast\":{}}}\n";
+        const NEW_A: &[u8] = b"{\"case\":{\"source\":\"new a\",\"ast\":{}}}\n";
+        const B: &[u8] = b"{\"case\":{\"source\":\"b\",\"ast\":{}}}\n";
+        const REMOVED: &[u8] = b"{\"case\":{\"source\":\"removed\",\"ast\":{}}}\n";
+
+        let mut fixture = Fixture::new(&[
+            ("group/A.json", OLD_A, false),
+            ("other/B.json", B, false),
+            ("removed/C.json", REMOVED, false),
+        ]);
+        fixture.set_manifest(3, 3, &[]);
+        fixture
+            .import()
+            .expect("import initial preservation fixtures");
+        fixture
+            .generate()
+            .expect("publish initial preservation generation");
+        let unselected = fixture.expectation("other/B.json");
+        let removed = fixture.expectation("removed/C.json");
+        let report = fixture.report();
+
+        fixture.replace_commit(&[("group/A.json", NEW_A, false), ("other/B.json", B, false)]);
+        fixture.set_manifest(2, 2, &[]);
+        fixture.import().expect("import changed membership");
+        fixture
+            .generate_filtered("group/A.json")
+            .expect("update historically owned selected fixture");
+
+        let selected: serde_json::Value =
+            serde_json::from_slice(&fixture.expectation("group/A.json"))
+                .expect("selected expectation JSON");
+        assert_eq!(selected["cases"][0]["input"], "new a");
+        assert_eq!(fixture.expectation("other/B.json"), unselected);
+        assert_eq!(fixture.expectation("removed/C.json"), removed);
+        assert_eq!(fixture.report(), report);
+    }
+
     struct PublishedGenerationProof {
         tree: BTreeMap<PathBuf, Vec<u8>>,
         root_identity: (u64, u64),
@@ -2628,5 +2946,42 @@ mod imports {
             .expect_err("persisted report path collision");
         assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
         assert!(!fixture.corpus.join("expectations").exists());
+    }
+
+    #[test]
+    fn css_filtered_generate_rejects_persisted_report_path_collision() {
+        let fixture = imported_generation_fixture(
+            "declaration/Case.json",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+            1,
+            &[],
+        );
+        fixture.generate().expect("publish historical authority");
+        let expectation_root = fixture.corpus.join("expectations");
+        let before = snapshot_tree(&expectation_root);
+        let sidecar_path = fixture.imported(".surgeist-source.json");
+        let sidecar = String::from_utf8(fs::read(&sidecar_path).expect("sidecar"))
+            .expect("UTF-8 sidecar")
+            .replace("declaration/Case.json", "generation-reports/all.json");
+        fs::write(&sidecar_path, sidecar).expect("persist colliding sidecar");
+        fs::remove_dir_all(fixture.corpus.join("source/declaration"))
+            .expect("remove original source fixture");
+        let colliding = fixture.imported("generation-reports/all.json");
+        fs::create_dir_all(colliding.parent().expect("collision parent"))
+            .expect("create collision parent");
+        fs::write(colliding, b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n")
+            .expect("write colliding fixture");
+        let pre_lease_reached = Cell::new(false);
+
+        let error = full_generation::run_with_pre_lease_hook(
+            &fixture.filtered_generate_request("generation-reports"),
+            || pre_lease_reached.set(true),
+        )
+        .expect_err("persisted filtered report collision");
+
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert!(!pre_lease_reached.get());
+        assert_eq!(snapshot_tree(&expectation_root), before);
+        assert_no_import_intent_journal_or_stage(&fixture);
     }
 }

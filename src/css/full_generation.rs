@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
 
+use crate::Result;
 use crate::core::{
     ArtifactPlan, ArtifactReservation, Domain, GenerationLease, NamespaceDisjointness,
     PublicationInventory, PublicationPolicy, RootedFs,
 };
-use crate::{RelativePath, Result, RunScope};
 
 use super::CssRequest;
 
@@ -55,7 +55,6 @@ fn run_impl(
         ],
     )?;
     let preflight_rooted = RootedFs::open_corpus(location)?;
-    let historical = super::historical::inspect(&preflight_rooted, &manifest)?;
     let preflight_imported = super::fixture::inspect(&preflight_rooted, &manifest)?;
     let report_relative = super::report::relative_path(&manifest)?;
     let desired = preflight_imported
@@ -64,14 +63,19 @@ fn run_impl(
         .map(|fixture| fixture.path.clone())
         .chain(std::iter::once(report_relative.clone()))
         .collect::<BTreeSet<_>>();
+    let historical = super::historical::inspect(&preflight_rooted, &manifest)?;
     historical.validate_union(&desired)?;
+    let selection = super::filter::SelectionLedger::new(&preflight_imported, request.filter())?;
+    if selection.is_filtered() {
+        historical.require_filtered_ownership(selection.selected_expectations())?;
+    }
     drop(preflight_rooted);
     pre_lease_hook();
     let lease = GenerationLease::acquire_with_revalidation(
         location,
         Domain::Css,
         GENERATOR,
-        &RunScope::Full,
+        selection.scope(),
         COMMAND,
         |rooted| {
             protection.revalidate(rooted)?;
@@ -87,6 +91,9 @@ fn run_impl(
                 return Err(super::invalid_inventory(
                     "CSS historical inventory changed before lease owner installation",
                 ));
+            }
+            if selection.is_filtered() {
+                current_historical.require_filtered_ownership(selection.selected_expectations())?;
             }
             Ok(())
         },
@@ -111,25 +118,28 @@ fn run_impl(
         ));
     }
     let expectations = super::expectation::derive(&imported, &manifest)?;
-    let report_bytes = super::report::build(
-        &manifest,
-        &manifest_bytes,
-        imported.sidecar_digest(),
-        &expectations,
-    )?;
-    if desired != desired_paths(&expectations, &report_relative) {
-        return Err(super::invalid_inventory(
-            "derived CSS expectation membership differs from the current import",
-        ));
-    }
+    selection.validate_derived(&expectations)?;
+    let report_bytes = if selection.is_filtered() {
+        None
+    } else {
+        Some(super::report::build(
+            &manifest,
+            &manifest_bytes,
+            imported.sidecar_digest(),
+            &expectations,
+        )?)
+    };
     drop(operation);
 
     let mut artifacts = expectations
         .artifacts
         .into_iter()
+        .filter(|artifact| selection.includes(&artifact.path))
         .map(|artifact| (artifact.path, artifact.bytes))
         .collect::<Vec<_>>();
-    artifacts.push((report_relative.clone(), report_bytes));
+    if let Some(report_bytes) = report_bytes {
+        artifacts.push((report_relative.clone(), report_bytes));
+    }
     let classified = historical
         .classified_paths()
         .union(&desired)
@@ -145,7 +155,11 @@ fn run_impl(
         Domain::Css,
         &lease,
         manifest.expectation_root.clone(),
-        PublicationPolicy::CleanFull,
+        if selection.is_filtered() {
+            PublicationPolicy::Filtered
+        } else {
+            PublicationPolicy::CleanFull
+        },
         artifacts,
         inventory,
     )?
@@ -165,22 +179,13 @@ fn run_impl(
                 "CSS historical inventory changed after held validation",
             ));
         }
+        if selection.is_filtered() {
+            current_historical.require_filtered_ownership(selection.selected_expectations())?;
+        }
         Ok(())
     };
     #[cfg(test)]
     return plan.install_with_revalidation_and_inter_scan_hook(revalidate, inter_scan_hook);
     #[cfg(not(test))]
     plan.install_with_revalidation(revalidate)
-}
-
-fn desired_paths(
-    expectations: &super::expectation::DerivedExpectations,
-    report: &RelativePath,
-) -> BTreeSet<RelativePath> {
-    expectations
-        .artifacts
-        .iter()
-        .map(|artifact| artifact.path.clone())
-        .chain(std::iter::once(report.clone()))
-        .collect()
 }
