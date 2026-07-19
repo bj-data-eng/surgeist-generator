@@ -1241,10 +1241,6 @@ impl RootedFs {
         self.remove_file_exact(temporary, &identity)
     }
 
-    pub(crate) fn rename_exclusive(&self, from: &str, to: &str) -> Result<()> {
-        self.rename_with(from, to, RenameMode::Exclusive, None, None)
-    }
-
     pub(crate) fn rename_exclusive_bound(
         &self,
         from: &str,
@@ -1252,10 +1248,6 @@ impl RootedFs {
         expected_from: &HeldIdentity,
     ) -> Result<()> {
         self.rename_with(from, to, RenameMode::Exclusive, Some(expected_from), None)
-    }
-
-    pub(crate) fn rename_swap(&self, from: &str, to: &str) -> Result<()> {
-        self.rename_with(from, to, RenameMode::Swap, None, None)
     }
 
     pub(crate) fn rename_swap_bound(
@@ -1522,60 +1514,6 @@ impl RootedFs {
             let _ = relative;
             MutationTarget::Unsupported.require_supported("sync rooted directory")
         }
-    }
-
-    pub(crate) fn probe_rename_flags(&self, journal_dir: &str, token: &str) -> Result<()> {
-        #[cfg(test)]
-        let _phase = self.begin_default_observation_phase(DurabilityPhase::ProbeInstall);
-        let left = joined(journal_dir, &format!("probe-left-{token}"));
-        let right = joined(journal_dir, &format!("probe-right-{token}"));
-        let moved = joined(journal_dir, &format!("probe-moved-{token}"));
-        let left_identity = self.ensure_dir(&left, PRIVATE_DIRECTORY_MODE)?;
-        let right_identity = self.ensure_dir(&right, PRIVATE_DIRECTORY_MODE)?;
-        if let Err(error) = self.rename_exclusive(&left, &moved) {
-            let cleanup = self
-                .remove_dir_exact(&left, &left_identity)
-                .and_then(|_| self.remove_dir_exact(&right, &right_identity));
-            return match cleanup {
-                Ok(()) => Err(GeneratorError::new(
-                    GeneratorErrorKind::UnsupportedPlatform,
-                    "probe rooted exclusive rename",
-                    error.to_string(),
-                )),
-                Err(cleanup_error) => Err(transaction_error(
-                    "clean rooted exclusive-rename probe",
-                    cleanup_error.to_string(),
-                )),
-            };
-        }
-        let moved_identity = self
-            .identity_at(&moved)?
-            .ok_or_else(|| transaction_error("probe rooted rename", "moved probe disappeared"))?;
-        if let Err(error) = self.rename_swap(&moved, &right) {
-            let cleanup = self
-                .remove_dir_exact(&moved, &moved_identity)
-                .and_then(|_| self.remove_dir_exact(&right, &right_identity));
-            return match cleanup {
-                Ok(()) => Err(GeneratorError::new(
-                    GeneratorErrorKind::UnsupportedPlatform,
-                    "probe rooted swap rename",
-                    error.to_string(),
-                )),
-                Err(cleanup_error) => Err(transaction_error(
-                    "clean rooted swap-rename probe",
-                    cleanup_error.to_string(),
-                )),
-            };
-        }
-        let right_after = self.identity_at(&right)?.ok_or_else(|| {
-            transaction_error("probe rooted swap rename", "right probe disappeared")
-        })?;
-        let moved_after = self.identity_at(&moved)?.ok_or_else(|| {
-            transaction_error("probe rooted swap rename", "moved probe disappeared")
-        })?;
-        self.remove_dir_exact(&right, &right_after)?;
-        self.remove_dir_exact(&moved, &moved_after)?;
-        self.sync_dir(journal_dir)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

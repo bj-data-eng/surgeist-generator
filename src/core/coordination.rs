@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, Result, RunScope, Sha256Digest};
 
 #[cfg(test)]
-use super::fs::DurabilityPhase;
+use super::fs::{DurabilityPhase, RootedObserver};
 use super::fs::{
     HeldIdentity, MutationTarget, NodeKind, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, RootedFs,
 };
@@ -254,13 +254,121 @@ impl LeaseMetadata {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProbeCapabilityFault {
+    FailExclusiveRename,
+    FailSwapRename,
+}
+
+#[cfg(test)]
+pub(crate) struct ProbeInstallControl {
+    fault: ProbeCapabilityFault,
+    fail_cleanup_at: Option<usize>,
+    cleanup_trace: Vec<String>,
+}
+
+#[cfg(test)]
+impl ProbeInstallControl {
+    pub(crate) fn new(fault: ProbeCapabilityFault) -> Self {
+        Self {
+            fault,
+            fail_cleanup_at: None,
+            cleanup_trace: Vec::new(),
+        }
+    }
+
+    pub(crate) fn failing_cleanup(fault: ProbeCapabilityFault, cleanup_index: usize) -> Self {
+        Self {
+            fault,
+            fail_cleanup_at: Some(cleanup_index),
+            cleanup_trace: Vec::new(),
+        }
+    }
+
+    pub(crate) fn cleanup_trace(&self) -> &[String] {
+        &self.cleanup_trace
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct ProbeRecoveryControl<'a> {
+    before_mutation: &'a mut dyn FnMut(&str) -> Result<()>,
+}
+
+#[cfg(test)]
+impl<'a> ProbeRecoveryControl<'a> {
+    pub(crate) fn new(before_mutation: &'a mut dyn FnMut(&str) -> Result<()>) -> Self {
+        Self { before_mutation }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct ExclusiveAcquisitionControl {
+    token: String,
+    observer: RootedObserver,
+    fault: Option<ProbeCapabilityFault>,
+    probe_cleanup_failure_at: Option<usize>,
+}
+
+#[cfg(test)]
+impl ExclusiveAcquisitionControl {
+    pub(crate) fn new(
+        token: &str,
+        observer: RootedObserver,
+        fault: Option<ProbeCapabilityFault>,
+    ) -> Self {
+        Self {
+            token: token.to_owned(),
+            observer,
+            fault,
+            probe_cleanup_failure_at: None,
+        }
+    }
+
+    pub(crate) fn failing_probe_cleanup(
+        token: &str,
+        observer: RootedObserver,
+        fault: ProbeCapabilityFault,
+        cleanup_index: usize,
+    ) -> Self {
+        Self {
+            token: token.to_owned(),
+            observer,
+            fault: Some(fault),
+            probe_cleanup_failure_at: Some(cleanup_index),
+        }
+    }
+}
+
 pub(crate) fn acquire_exclusive(
     location: &CorpusLocation,
     domain: Domain,
     metadata: LeaseMetadata,
     protected_revalidation: impl FnOnce(&RootedFs) -> Result<()>,
 ) -> Result<CoordinationGuard> {
+    #[cfg(test)]
+    let result = acquire_exclusive_inner(location, domain, metadata, protected_revalidation, None);
+    #[cfg(not(test))]
+    let result = acquire_exclusive_inner(location, domain, metadata, protected_revalidation);
+    result
+}
+
+fn acquire_exclusive_inner(
+    location: &CorpusLocation,
+    domain: Domain,
+    metadata: LeaseMetadata,
+    protected_revalidation: impl FnOnce(&RootedFs) -> Result<()>,
+    #[cfg(test)] control: Option<&mut ExclusiveAcquisitionControl>,
+) -> Result<CoordinationGuard> {
     MutationTarget::current().require_supported("acquire generation mutation lease")?;
+    #[cfg(test)]
+    let rooted = if let Some(control) = control.as_ref() {
+        RootedFs::open_corpus_observed(location, control.observer.clone())?
+    } else {
+        RootedFs::open_corpus(location)?
+    };
+    #[cfg(not(test))]
     let rooted = RootedFs::open_corpus(location)?;
     if rooted.exists(COORDINATION_ROOT)? {
         validate_coordination_tree(&rooted, domain, false)?;
@@ -270,6 +378,14 @@ pub(crate) fn acquire_exclusive(
     rooted.ensure_dir(BOOTSTRAP_LOCKS, PRIVATE_DIRECTORY_MODE)?;
     validate_coordination_tree(&rooted, domain, false)?;
     recover_bootstrap(&rooted)?;
+    #[cfg(test)]
+    let token = if let Some(control) = control.as_ref() {
+        validate_token(&control.token)?;
+        control.token.clone()
+    } else {
+        new_token()?
+    };
+    #[cfg(not(test))]
     let token = new_token()?;
     let gate = open_or_bootstrap_lock(
         &rooted,
@@ -326,6 +442,20 @@ pub(crate) fn acquire_exclusive(
     engine.recover_all()?;
     recover_owner_transactions(&rooted, domain, &authority_key)?;
     recover_probe_journals(&rooted, domain)?;
+    #[cfg(test)]
+    if let Some(fault) = control.as_ref().and_then(|control| control.fault) {
+        let mut probe_control = control
+            .as_ref()
+            .and_then(|control| control.probe_cleanup_failure_at)
+            .map_or_else(
+                || ProbeInstallControl::new(fault),
+                |cleanup_index| ProbeInstallControl::failing_cleanup(fault, cleanup_index),
+            );
+        run_rename_probe_controlled(&rooted, domain, &token, &mut probe_control)?;
+    } else {
+        run_rename_probe(&rooted, domain, &token)?;
+    }
+    #[cfg(not(test))]
     run_rename_probe(&rooted, domain, &token)?;
     protected_revalidation(&rooted)?;
     install_owner_record(&rooted, location, domain, &metadata, &token, &authority_key)?;
@@ -349,6 +479,23 @@ pub(crate) fn acquire_exclusive(
         access: CoordinationAccess::Exclusive,
         absent_coordination: false,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn acquire_exclusive_controlled(
+    location: &CorpusLocation,
+    domain: Domain,
+    metadata: LeaseMetadata,
+    protected_revalidation: impl FnOnce(&RootedFs) -> Result<()>,
+    control: &mut ExclusiveAcquisitionControl,
+) -> Result<CoordinationGuard> {
+    acquire_exclusive_inner(
+        location,
+        domain,
+        metadata,
+        protected_revalidation,
+        Some(control),
+    )
 }
 
 pub(crate) fn acquire_shared_check(
@@ -1606,34 +1753,118 @@ fn validate_owner_record_bytes(
 
 fn run_rename_probe(rooted: &RootedFs, domain: Domain, token: &str) -> Result<()> {
     #[cfg(test)]
+    let result = run_rename_probe_inner(rooted, domain, token, None);
+    #[cfg(not(test))]
+    let result = run_rename_probe_inner(rooted, domain, token);
+    result
+}
+
+fn run_rename_probe_inner(
+    rooted: &RootedFs,
+    domain: Domain,
+    token: &str,
+    #[cfg(test)] mut control: Option<&mut ProbeInstallControl>,
+) -> Result<()> {
+    #[cfg(test)]
     let _observation_phase = rooted.begin_observation_phase(DurabilityPhase::ProbeInstall);
     let parent = format!(".surgeist-generator/probes/{}", domain.as_str());
     let active = format!("{parent}/active-{token}");
     let active_identity = rooted.create_dir_exclusive(&active, PRIVATE_DIRECTORY_MODE)?;
-    let intent = canonical_json(&domain, "serialize rename probe intent")?;
+    let intent = ProbeIntent {
+        schema_version: 1,
+        domain,
+        token: token.to_owned(),
+        journal_path: active.clone(),
+        journal_identity: active_identity.clone(),
+    };
+    let intent_bytes = canonical_json(&intent, "serialize rename probe intent")?;
     rooted.publish_file_exclusive(
         &active,
         "intent.json",
         &format!("intent-{token}.tmp"),
-        &intent,
+        &intent_bytes,
         PRIVATE_FILE_MODE,
     )?;
-    let result = rooted.probe_rename_flags(&active, token);
-    if result.is_ok()
-        || result
-            .as_ref()
-            .is_err_and(|error| error.kind() == GeneratorErrorKind::UnsupportedPlatform)
-    {
-        let intent_path = format!("{active}/intent.json");
-        if let Some(identity) = rooted.identity_at(&intent_path)? {
-            rooted.remove_file_exact(&intent_path, &identity)?;
+    #[cfg(test)]
+    let probe_result =
+        probe_rename_flags_journaled(rooted, &intent, &intent_bytes, control.as_deref_mut());
+    #[cfg(not(test))]
+    let probe_result = probe_rename_flags_journaled(rooted, &intent, &intent_bytes);
+
+    let probe_result = probe_result.map_err(|error| {
+        if error.kind() == GeneratorErrorKind::UnsupportedPlatform {
+            GeneratorError::with_source(
+                GeneratorErrorKind::UnsupportedPlatform,
+                "probe rooted rename capability",
+                error.to_string(),
+                error,
+            )
+        } else {
+            error
         }
-        rooted.remove_dir_exact(&active, &active_identity)?;
+    });
+    match probe_result {
+        Ok(()) => cleanup_probe_install_journal(
+            rooted,
+            &intent,
+            &intent_bytes,
+            #[cfg(test)]
+            control,
+        )
+        .map_err(|cleanup| {
+            probe_artifact_error(
+                "clean successful rename capability probe",
+                "the capability probe completed but journal cleanup failed",
+                cleanup,
+            )
+        }),
+        Err(capability) if capability.kind() == GeneratorErrorKind::UnsupportedPlatform => {
+            match cleanup_probe_install_journal(
+                rooted,
+                &intent,
+                &intent_bytes,
+                #[cfg(test)]
+                control,
+            ) {
+                Ok(()) => Err(capability),
+                Err(cleanup) => Err(probe_cleanup_failure(capability, cleanup)),
+            }
+        }
+        Err(error) => Err(if error.kind() == GeneratorErrorKind::ArtifactTransaction {
+            error
+        } else {
+            probe_artifact_error(
+                "run rename capability probe",
+                "rename capability probing left resumable evidence",
+                error,
+            )
+        }),
     }
-    result
+}
+
+#[cfg(test)]
+fn run_rename_probe_controlled(
+    rooted: &RootedFs,
+    domain: Domain,
+    token: &str,
+    control: &mut ProbeInstallControl,
+) -> Result<()> {
+    run_rename_probe_inner(rooted, domain, token, Some(control))
 }
 
 fn recover_probe_journals(rooted: &RootedFs, domain: Domain) -> Result<()> {
+    #[cfg(test)]
+    let result = recover_probe_journals_inner(rooted, domain, None);
+    #[cfg(not(test))]
+    let result = recover_probe_journals_inner(rooted, domain);
+    result.map_err(normalize_probe_recovery_error)
+}
+
+fn recover_probe_journals_inner(
+    rooted: &RootedFs,
+    domain: Domain,
+    #[cfg(test)] mut control: Option<&mut ProbeRecoveryControl<'_>>,
+) -> Result<()> {
     #[cfg(test)]
     let _observation_phase = rooted.begin_observation_phase(DurabilityPhase::ProbeRecovery);
     let parent = format!(".surgeist-generator/probes/{}", domain.as_str());
@@ -1652,28 +1883,777 @@ fn recover_probe_journals(rooted: &RootedFs, domain: Domain) -> Result<()> {
                 "probe journal disappeared",
             )
         })?;
-        for member in rooted.list_dir(&active)? {
-            let member_path = format!("{active}/{member}");
-            let identity = rooted.identity_at(&member_path)?.ok_or_else(|| {
-                transaction_error(
-                    "recover rename capability probe",
-                    "probe member disappeared",
-                )
-            })?;
-            if member == "intent.json" || member.ends_with(".tmp") {
-                rooted.remove_file_exact(&member_path, &identity)?;
-            } else if member.starts_with("probe-") && identity.kind() == NodeKind::Directory {
-                rooted.remove_dir_exact(&member_path, &identity)?;
-            } else {
-                return Err(transaction_error(
-                    "recover rename capability probe",
-                    format!("unknown or replaced probe member: {member}"),
-                ));
+        let mut plan =
+            ProbeRecoveryPlan::capture(rooted, domain, token, &active, &active_identity)?;
+        while let Some(member) = plan.members.first().cloned() {
+            #[cfg(test)]
+            if let Some(control) = control.as_deref_mut() {
+                (control.before_mutation)(&member.name)?;
             }
+            plan.revalidate(rooted, &active)?;
+            let member_path = format!("{active}/{}", member.name);
+            match member.kind {
+                ProbeMemberKind::File => {
+                    rooted.remove_file_exact(&member_path, &member.identity)?;
+                }
+                ProbeMemberKind::Directory => {
+                    rooted.remove_dir_exact(&member_path, &member.identity)?;
+                }
+            }
+            plan.members.remove(0);
         }
+        #[cfg(test)]
+        if let Some(control) = control.as_deref_mut() {
+            (control.before_mutation)("journal-directory")?;
+        }
+        plan.revalidate(rooted, &active)?;
         rooted.remove_dir_exact(&active, &active_identity)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn recover_probe_journals_controlled(
+    rooted: &RootedFs,
+    domain: Domain,
+    control: &mut ProbeRecoveryControl<'_>,
+) -> Result<()> {
+    recover_probe_journals_inner(rooted, domain, Some(control))
+        .map_err(normalize_probe_recovery_error)
+}
+
+fn normalize_probe_recovery_error(error: GeneratorError) -> GeneratorError {
+    if error.kind() == GeneratorErrorKind::ArtifactTransaction {
+        error
+    } else {
+        probe_artifact_error(
+            "recover rename capability probe",
+            "probe recovery stopped with retained evidence",
+            error,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeIntent {
+    schema_version: u8,
+    domain: Domain,
+    token: String,
+    journal_path: String,
+    journal_identity: HeldIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeMemberKind {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Debug)]
+struct ProbeRecoveryMember {
+    name: String,
+    identity: HeldIdentity,
+    kind: ProbeMemberKind,
+    bytes: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+struct ProbeRecoveryPlan {
+    journal_identity: HeldIdentity,
+    members: Vec<ProbeRecoveryMember>,
+}
+
+impl ProbeRecoveryPlan {
+    fn capture(
+        rooted: &RootedFs,
+        domain: Domain,
+        token: &str,
+        active: &str,
+        active_identity: &HeldIdentity,
+    ) -> Result<Self> {
+        validate_probe_journal_identity(rooted, active_identity)?;
+        let expected_active = format!(
+            ".surgeist-generator/probes/{}/active-{token}",
+            domain.as_str()
+        );
+        if active != expected_active {
+            return Err(transaction_error(
+                "recover rename capability probe",
+                "active probe journal path differs from its domain and token",
+            ));
+        }
+        let names = rooted.list_dir(active)?;
+        let intent_name = "intent.json";
+        let temporary_name = format!("intent-{token}.tmp");
+        let left_name = format!("probe-left-{token}");
+        let right_name = format!("probe-right-{token}");
+        let moved_name = format!("probe-moved-{token}");
+        let allowed = [
+            intent_name.to_owned(),
+            temporary_name.clone(),
+            left_name.clone(),
+            right_name.clone(),
+            moved_name.clone(),
+        ];
+        if names.iter().any(|name| !allowed.contains(name)) {
+            return Err(transaction_error(
+                "recover rename capability probe",
+                "probe journal contains an unknown member",
+            ));
+        }
+        let has_intent = names.iter().any(|name| name == intent_name);
+        let has_temporary = names.iter().any(|name| name == &temporary_name);
+        let has_left = names.iter().any(|name| name == &left_name);
+        let has_right = names.iter().any(|name| name == &right_name);
+        let has_moved = names.iter().any(|name| name == &moved_name);
+        if has_intent && has_temporary {
+            return Err(transaction_error(
+                "recover rename capability probe",
+                "probe intent and its publication temporary coexist",
+            ));
+        }
+        if (has_left || has_right || has_moved) && !has_intent {
+            return Err(transaction_error(
+                "recover rename capability probe",
+                "probe directories have no durable intent",
+            ));
+        }
+        if has_left && has_moved {
+            return Err(transaction_error(
+                "recover rename capability probe",
+                "probe journal contains mutually exclusive left and moved names",
+            ));
+        }
+
+        let expected_intent = ProbeIntent {
+            schema_version: 1,
+            domain,
+            token: token.to_owned(),
+            journal_path: active.to_owned(),
+            journal_identity: active_identity.clone(),
+        };
+        let expected_intent_bytes =
+            canonical_json(&expected_intent, "serialize recovered probe intent")?;
+        let mut members = Vec::with_capacity(names.len());
+        for name in names {
+            let path = format!("{active}/{name}");
+            let identity = rooted.identity_at(&path)?.ok_or_else(|| {
+                transaction_error(
+                    "recover rename capability probe",
+                    format!("probe member disappeared: {name}"),
+                )
+            })?;
+            if name == intent_name || name == temporary_name {
+                validate_probe_file_identity(rooted, &identity)?;
+                let bytes = rooted.read_file(&path, PRIVATE_FILE_MODE)?;
+                if name == intent_name {
+                    let intent: ProbeIntent = serde_json::from_slice(&bytes).map_err(|error| {
+                        transaction_error(
+                            "recover rename capability probe",
+                            format!("invalid probe intent: {error}"),
+                        )
+                    })?;
+                    validate_canonical_owner_json(
+                        &bytes,
+                        &intent,
+                        "recover rename capability probe",
+                        "probe intent",
+                    )?;
+                    if intent != expected_intent {
+                        return Err(transaction_error(
+                            "recover rename capability probe",
+                            "probe intent differs from its journal identity, domain, or token",
+                        ));
+                    }
+                } else if !expected_intent_bytes.starts_with(&bytes) {
+                    return Err(transaction_error(
+                        "recover rename capability probe",
+                        "probe intent temporary is not a canonical publication prefix",
+                    ));
+                }
+                members.push(ProbeRecoveryMember {
+                    name,
+                    identity,
+                    kind: ProbeMemberKind::File,
+                    bytes: Some(bytes),
+                });
+            } else {
+                validate_probe_directory_identity(rooted, &identity)?;
+                members.push(ProbeRecoveryMember {
+                    name,
+                    identity,
+                    kind: ProbeMemberKind::Directory,
+                    bytes: None,
+                });
+            }
+        }
+        members.sort_by_key(|member| probe_recovery_order(&member.name, token));
+        let plan = Self {
+            journal_identity: active_identity.clone(),
+            members,
+        };
+        plan.revalidate(rooted, active)?;
+        Ok(plan)
+    }
+
+    fn revalidate(&self, rooted: &RootedFs, active: &str) -> Result<()> {
+        let actual_journal = rooted.identity_at(active)?.ok_or_else(|| {
+            transaction_error(
+                "recover rename capability probe",
+                "probe journal disappeared after validation",
+            )
+        })?;
+        validate_probe_journal_identity(rooted, &actual_journal)?;
+        if !self.journal_identity.matches_recovery(&actual_journal) {
+            return Err(transaction_error(
+                "recover rename capability probe",
+                "probe journal identity changed after validation",
+            ));
+        }
+        let mut expected_names = self
+            .members
+            .iter()
+            .map(|member| member.name.clone())
+            .collect::<Vec<_>>();
+        expected_names.sort();
+        if rooted.list_dir(active)? != expected_names {
+            return Err(transaction_error(
+                "recover rename capability probe",
+                "probe inventory changed after validation",
+            ));
+        }
+        for member in &self.members {
+            let path = format!("{active}/{}", member.name);
+            let actual = rooted.identity_at(&path)?.ok_or_else(|| {
+                transaction_error(
+                    "recover rename capability probe",
+                    format!("probe member disappeared after validation: {}", member.name),
+                )
+            })?;
+            if !member.identity.matches_recovery(&actual) {
+                return Err(transaction_error(
+                    "recover rename capability probe",
+                    format!(
+                        "probe member identity changed after validation: {}",
+                        member.name
+                    ),
+                ));
+            }
+            match member.kind {
+                ProbeMemberKind::File => {
+                    validate_probe_file_identity(rooted, &actual)?;
+                    if rooted.read_file(&path, PRIVATE_FILE_MODE)?
+                        != *member.bytes.as_ref().ok_or_else(|| {
+                            transaction_error(
+                                "recover rename capability probe",
+                                "probe file plan has no captured bytes",
+                            )
+                        })?
+                    {
+                        return Err(transaction_error(
+                            "recover rename capability probe",
+                            format!(
+                                "probe member bytes changed after validation: {}",
+                                member.name
+                            ),
+                        ));
+                    }
+                }
+                ProbeMemberKind::Directory => {
+                    validate_probe_directory_identity(rooted, &actual)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn probe_recovery_order(name: &str, token: &str) -> usize {
+    if name == format!("probe-left-{token}") {
+        0
+    } else if name == format!("probe-moved-{token}") {
+        1
+    } else if name == format!("probe-right-{token}") {
+        2
+    } else if name == format!("intent-{token}.tmp") {
+        3
+    } else {
+        4
+    }
+}
+
+fn validate_probe_journal_identity(rooted: &RootedFs, identity: &HeldIdentity) -> Result<()> {
+    validate_probe_directory_identity(rooted, identity).map_err(|error| {
+        probe_artifact_error(
+            "validate rename capability probe journal",
+            "probe journal has the wrong type, mode, identity, owner, alias, or mount",
+            error,
+        )
+    })
+}
+
+fn validate_probe_directory_identity(rooted: &RootedFs, identity: &HeldIdentity) -> Result<()> {
+    if identity.kind() != NodeKind::Directory
+        || identity.mode() != PRIVATE_DIRECTORY_MODE
+        || identity.owner() != rooted.identity().owner()
+        || identity.device() != rooted.identity().device()
+        || identity.fsid() != rooted.identity().fsid()
+    {
+        return Err(transaction_error(
+            "validate rename capability probe directory",
+            "probe directory has the wrong type, mode, identity, owner, alias, or mount",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_probe_file_identity(rooted: &RootedFs, identity: &HeldIdentity) -> Result<()> {
+    if identity.kind() != NodeKind::Regular
+        || identity.mode() != PRIVATE_FILE_MODE
+        || identity.owner() != rooted.identity().owner()
+        || identity.link_count() != Some(1)
+        || identity.device() != rooted.identity().device()
+        || identity.fsid() != rooted.identity().fsid()
+    {
+        return Err(transaction_error(
+            "validate rename capability probe file",
+            "probe file has the wrong type, mode, identity, owner, alias, or mount",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ProbeInstallMember<'a> {
+    name: &'a str,
+    path: &'a str,
+    identity: &'a HeldIdentity,
+}
+
+fn probe_rename_flags_journaled(
+    rooted: &RootedFs,
+    intent: &ProbeIntent,
+    intent_bytes: &[u8],
+    #[cfg(test)] mut control: Option<&mut ProbeInstallControl>,
+) -> Result<()> {
+    let active = &intent.journal_path;
+    let token = &intent.token;
+    let left_name = format!("probe-left-{token}");
+    let right_name = format!("probe-right-{token}");
+    let moved_name = format!("probe-moved-{token}");
+    let left = format!("{active}/{left_name}");
+    let right = format!("{active}/{right_name}");
+    let moved = format!("{active}/{moved_name}");
+    let left_identity = rooted.create_dir_exclusive(&left, PRIVATE_DIRECTORY_MODE)?;
+    let right_identity = rooted.create_dir_exclusive(&right, PRIVATE_DIRECTORY_MODE)?;
+    let before_exclusive = [
+        ProbeInstallMember {
+            name: &left_name,
+            path: &left,
+            identity: &left_identity,
+        },
+        ProbeInstallMember {
+            name: &right_name,
+            path: &right,
+            identity: &right_identity,
+        },
+    ];
+
+    #[cfg(test)]
+    if control
+        .as_ref()
+        .is_some_and(|control| control.fault == ProbeCapabilityFault::FailExclusiveRename)
+    {
+        return finish_probe_capability_failure(
+            rooted,
+            intent,
+            intent_bytes,
+            "exclusive",
+            injected_probe_capability_error("exclusive"),
+            &before_exclusive,
+            control.as_deref_mut(),
+        );
+    }
+    if let Err(rename) = rooted.rename_exclusive_bound(&left, &moved, &left_identity) {
+        return finish_probe_capability_failure(
+            rooted,
+            intent,
+            intent_bytes,
+            "exclusive",
+            rename,
+            &before_exclusive,
+            #[cfg(test)]
+            control.as_deref_mut(),
+        );
+    }
+
+    let before_swap = [
+        ProbeInstallMember {
+            name: &moved_name,
+            path: &moved,
+            identity: &left_identity,
+        },
+        ProbeInstallMember {
+            name: &right_name,
+            path: &right,
+            identity: &right_identity,
+        },
+    ];
+    #[cfg(test)]
+    if control
+        .as_ref()
+        .is_some_and(|control| control.fault == ProbeCapabilityFault::FailSwapRename)
+    {
+        return finish_probe_capability_failure(
+            rooted,
+            intent,
+            intent_bytes,
+            "swap",
+            injected_probe_capability_error("swap"),
+            &before_swap,
+            control.as_deref_mut(),
+        );
+    }
+    if let Err(rename) = rooted.rename_swap_bound(&moved, &right, &left_identity, &right_identity) {
+        return finish_probe_capability_failure(
+            rooted,
+            intent,
+            intent_bytes,
+            "swap",
+            rename,
+            &before_swap,
+            #[cfg(test)]
+            control.as_deref_mut(),
+        );
+    }
+
+    let after_swap = [
+        ProbeInstallMember {
+            name: &right_name,
+            path: &right,
+            identity: &left_identity,
+        },
+        ProbeInstallMember {
+            name: &moved_name,
+            path: &moved,
+            identity: &right_identity,
+        },
+    ];
+    cleanup_probe_members(
+        rooted,
+        intent,
+        intent_bytes,
+        &after_swap,
+        #[cfg(test)]
+        control,
+    )
+}
+
+fn finish_probe_capability_failure(
+    rooted: &RootedFs,
+    intent: &ProbeIntent,
+    intent_bytes: &[u8],
+    rename_kind: &str,
+    rename: GeneratorError,
+    members: &[ProbeInstallMember<'_>],
+    #[cfg(test)] control: Option<&mut ProbeInstallControl>,
+) -> Result<()> {
+    if let Err(validation) = validate_probe_install_members(rooted, intent, intent_bytes, members) {
+        return Err(probe_state_failure(rename_kind, rename, validation));
+    }
+    let capability = if rename.kind() == GeneratorErrorKind::UnsupportedPlatform {
+        rename
+    } else {
+        GeneratorError::with_source(
+            GeneratorErrorKind::UnsupportedPlatform,
+            format!("probe rooted {rename_kind} rename"),
+            rename.to_string(),
+            rename,
+        )
+    };
+    match cleanup_probe_members(
+        rooted,
+        intent,
+        intent_bytes,
+        members,
+        #[cfg(test)]
+        control,
+    ) {
+        Ok(()) => Err(capability),
+        Err(cleanup) => Err(probe_cleanup_failure(capability, cleanup)),
+    }
+}
+
+fn cleanup_probe_members(
+    rooted: &RootedFs,
+    intent: &ProbeIntent,
+    intent_bytes: &[u8],
+    members: &[ProbeInstallMember<'_>],
+    #[cfg(test)] mut control: Option<&mut ProbeInstallControl>,
+) -> Result<()> {
+    for (index, member) in members.iter().enumerate() {
+        validate_probe_install_members(rooted, intent, intent_bytes, &members[index..])?;
+        #[cfg(test)]
+        if let Some(control) = control.as_deref_mut() {
+            control.before_cleanup(member.path)?;
+        }
+        rooted.remove_dir_exact(member.path, member.identity)?;
+    }
+    validate_probe_install_members(rooted, intent, intent_bytes, &[])?;
+    #[cfg(test)]
+    if let Some(control) = control {
+        control.before_cleanup("probe-directory-sync")?;
+    }
+    rooted.sync_dir(&intent.journal_path)
+}
+
+fn validate_probe_install_members(
+    rooted: &RootedFs,
+    intent: &ProbeIntent,
+    intent_bytes: &[u8],
+    members: &[ProbeInstallMember<'_>],
+) -> Result<()> {
+    let active = &intent.journal_path;
+    let active_identity = rooted.identity_at(active)?.ok_or_else(|| {
+        transaction_error(
+            "validate rename capability probe cleanup",
+            "active probe journal disappeared",
+        )
+    })?;
+    validate_probe_journal_identity(rooted, &active_identity)?;
+    if !intent.journal_identity.matches_recovery(&active_identity) {
+        return Err(transaction_error(
+            "validate rename capability probe cleanup",
+            "active probe journal identity changed",
+        ));
+    }
+
+    let mut expected_names = members
+        .iter()
+        .map(|member| member.name.to_owned())
+        .chain(std::iter::once("intent.json".to_owned()))
+        .collect::<Vec<_>>();
+    expected_names.sort();
+    if rooted.list_dir(active)? != expected_names {
+        return Err(transaction_error(
+            "validate rename capability probe cleanup",
+            "probe journal inventory changed",
+        ));
+    }
+
+    let intent_path = format!("{active}/intent.json");
+    let intent_identity = rooted.identity_at(&intent_path)?.ok_or_else(|| {
+        transaction_error(
+            "validate rename capability probe cleanup",
+            "probe intent disappeared",
+        )
+    })?;
+    validate_probe_file_identity(rooted, &intent_identity)?;
+    if rooted.read_file(&intent_path, PRIVATE_FILE_MODE)? != intent_bytes {
+        return Err(transaction_error(
+            "validate rename capability probe cleanup",
+            "probe intent bytes changed",
+        ));
+    }
+    for member in members {
+        let actual = rooted.identity_at(member.path)?.ok_or_else(|| {
+            transaction_error(
+                "validate rename capability probe cleanup",
+                format!("probe member disappeared: {}", member.name),
+            )
+        })?;
+        validate_probe_directory_identity(rooted, &actual)?;
+        if !member.identity.matches_recovery(&actual) {
+            return Err(transaction_error(
+                "validate rename capability probe cleanup",
+                format!("probe member identity changed: {}", member.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+impl ProbeInstallControl {
+    fn before_cleanup(&mut self, label: &str) -> Result<()> {
+        let cleanup_index = self.cleanup_trace.len();
+        self.cleanup_trace.push(label.to_owned());
+        if self.fail_cleanup_at == Some(cleanup_index) {
+            return Err(transaction_error(
+                "inject rename-probe cleanup failure",
+                format!("cleanup primitive rejected before mutation: {label}"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn injected_probe_capability_error(rename: &str) -> GeneratorError {
+    GeneratorError::with_source(
+        GeneratorErrorKind::UnsupportedPlatform,
+        format!("probe rooted {rename} rename"),
+        format!("injected {rename} rename capability failure"),
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("injected {rename} rename capability failure"),
+        ),
+    )
+}
+
+fn cleanup_probe_install_journal(
+    rooted: &RootedFs,
+    intent: &ProbeIntent,
+    intent_bytes: &[u8],
+    #[cfg(test)] mut control: Option<&mut ProbeInstallControl>,
+) -> Result<()> {
+    let active = &intent.journal_path;
+    let active_identity = rooted.identity_at(active)?.ok_or_else(|| {
+        transaction_error(
+            "clean rename capability probe journal",
+            "active probe journal disappeared",
+        )
+    })?;
+    if !intent.journal_identity.matches_recovery(&active_identity) {
+        return Err(transaction_error(
+            "clean rename capability probe journal",
+            "active probe journal identity changed",
+        ));
+    }
+    validate_probe_journal_identity(rooted, &active_identity)?;
+    if rooted.list_dir(active)? != ["intent.json"] {
+        return Err(transaction_error(
+            "clean rename capability probe journal",
+            "probe member cleanup did not leave the exact intent-only journal",
+        ));
+    }
+    let intent_path = format!("{active}/intent.json");
+    let intent_identity = rooted.identity_at(&intent_path)?.ok_or_else(|| {
+        transaction_error(
+            "clean rename capability probe journal",
+            "probe intent disappeared",
+        )
+    })?;
+    validate_probe_file_identity(rooted, &intent_identity)?;
+    if rooted.read_file(&intent_path, PRIVATE_FILE_MODE)? != intent_bytes {
+        return Err(transaction_error(
+            "clean rename capability probe journal",
+            "probe intent bytes changed before cleanup",
+        ));
+    }
+    #[cfg(test)]
+    if let Some(control) = control.as_deref_mut() {
+        control.before_cleanup("intent.json")?;
+    }
+    rooted.remove_file_exact(&intent_path, &intent_identity)?;
+    if !rooted.list_dir(active)?.is_empty() {
+        return Err(transaction_error(
+            "clean rename capability probe journal",
+            "probe journal gained a member before final removal",
+        ));
+    }
+    #[cfg(test)]
+    if let Some(control) = control {
+        control.before_cleanup("journal-directory")?;
+    }
+    let actual_active = rooted.identity_at(active)?.ok_or_else(|| {
+        transaction_error(
+            "clean rename capability probe journal",
+            "probe journal disappeared before final removal",
+        )
+    })?;
+    if !active_identity.matches_recovery(&actual_active) {
+        return Err(transaction_error(
+            "clean rename capability probe journal",
+            "probe journal identity changed before final removal",
+        ));
+    }
+    rooted.remove_dir_exact(active, &active_identity)
+}
+
+#[derive(Debug)]
+struct ProbeCleanupFailure {
+    capability: GeneratorError,
+    cleanup: GeneratorError,
+}
+
+impl std::fmt::Display for ProbeCleanupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "capability failure: {}; cleanup failure: {}",
+            self.capability, self.cleanup
+        )
+    }
+}
+
+impl std::error::Error for ProbeCleanupFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cleanup)
+    }
+}
+
+fn probe_cleanup_failure(capability: GeneratorError, cleanup: GeneratorError) -> GeneratorError {
+    let context = ProbeCleanupFailure {
+        capability,
+        cleanup,
+    };
+    GeneratorError::with_source(
+        GeneratorErrorKind::ArtifactTransaction,
+        "clean failed rename capability probe",
+        context.to_string(),
+        context,
+    )
+}
+
+#[derive(Debug)]
+struct ProbeStateFailure {
+    rename: GeneratorError,
+    validation: GeneratorError,
+}
+
+impl std::fmt::Display for ProbeStateFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "rename failure: {}; retained-state validation failure: {}",
+            self.rename, self.validation
+        )
+    }
+}
+
+impl std::error::Error for ProbeStateFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.rename)
+    }
+}
+
+fn probe_state_failure(
+    rename_kind: &str,
+    rename: GeneratorError,
+    validation: GeneratorError,
+) -> GeneratorError {
+    let context = ProbeStateFailure { rename, validation };
+    GeneratorError::with_source(
+        GeneratorErrorKind::ArtifactTransaction,
+        format!("classify failed rooted {rename_kind} rename"),
+        context.to_string(),
+        context,
+    )
+}
+
+fn probe_artifact_error(
+    operation: &str,
+    detail: impl Into<String>,
+    source: GeneratorError,
+) -> GeneratorError {
+    GeneratorError::with_source(
+        GeneratorErrorKind::ArtifactTransaction,
+        operation,
+        detail,
+        source,
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4342,12 +5322,14 @@ mod tests {
         ACQUISITION_LOCK, BOOTSTRAP_LOCKS, BootstrapInstallControl, BootstrapRecoveryControl,
         COORDINATION_ROOT, CoordinationAccess, CoordinationGuard, LeaseMetadata,
         OWNER_TRANSACTIONS, OwnerCleanupControl, OwnerOutcomeKind, OwnerOutcomeMarker, OwnerRecord,
-        OwnerRecordStamp, OwnerRecoveryControl, acquire_exclusive, acquire_shared_check,
-        canonical_json, cleanup_owner_journal, cleanup_owner_journal_controlled,
-        corpus_authority_key, install_owner_record_bytes, install_owner_record_controlled,
-        mutex_path, open_existing_lock, open_or_bootstrap_lock, open_or_bootstrap_lock_controlled,
-        owner_path, process_is_live, recover_bootstrap_controlled, recover_owner_transactions,
-        recover_owner_transactions_controlled,
+        OwnerRecordStamp, OwnerRecoveryControl, ProbeCapabilityFault, ProbeInstallControl,
+        ProbeRecoveryControl, acquire_exclusive, acquire_shared_check, canonical_json,
+        cleanup_owner_journal, cleanup_owner_journal_controlled, corpus_authority_key,
+        install_owner_record_bytes, install_owner_record_controlled, mutex_path,
+        open_existing_lock, open_or_bootstrap_lock, open_or_bootstrap_lock_controlled, owner_path,
+        process_is_live, recover_bootstrap_controlled, recover_owner_transactions,
+        recover_owner_transactions_controlled, recover_probe_journals,
+        recover_probe_journals_controlled, run_rename_probe, run_rename_probe_controlled,
     };
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -7488,5 +8470,591 @@ mod tests {
         }
 
         exercise_winner_recovery_prefixes(&trace, release, false);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    const PROBE_TOKEN: &str = "55555555555555555555555555555555";
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    const LATER_PROBE_TOKEN: &str = "66666666666666666666666666666666";
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    struct ProbeFixture {
+        owner: OwnerFixture,
+        protected_before: BTreeMap<PathBuf, SnapshotEntry>,
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    impl ProbeFixture {
+        fn new() -> Self {
+            let owner = OwnerFixture::new(InitialOwner::Old);
+            let rooted = owner.rooted();
+            rooted
+                .ensure_dir(".surgeist-generator/probes", PRIVATE_DIRECTORY_MODE)
+                .expect("create probe root");
+            rooted
+                .ensure_dir(".surgeist-generator/probes/layout", PRIVATE_DIRECTORY_MODE)
+                .expect("create probe domain root");
+            fs::write(
+                owner.corpus.join("domain-artifact.bin"),
+                b"domain artifact must remain byte-identical\n",
+            )
+            .expect("seed protected domain artifact");
+            fs::set_permissions(
+                owner.corpus.join("domain-artifact.bin"),
+                fs::Permissions::from_mode(0o644),
+            )
+            .expect("set protected domain artifact mode");
+            let protected_before = protected_probe_snapshot(&owner);
+            Self {
+                owner,
+                protected_before,
+            }
+        }
+
+        fn rooted(&self) -> RootedFs {
+            self.owner.rooted()
+        }
+
+        fn observed_rooted(&self, observer: RootedObserver) -> RootedFs {
+            self.owner.observed_rooted(observer)
+        }
+
+        fn active_path(&self) -> String {
+            probe_active_path(PROBE_TOKEN)
+        }
+
+        fn run_unhooked(&self, observer: RootedObserver) -> Result<()> {
+            run_rename_probe(&self.observed_rooted(observer), Domain::Layout, PROBE_TOKEN)
+        }
+
+        fn run_controlled(
+            &self,
+            observer: RootedObserver,
+            control: &mut ProbeInstallControl,
+        ) -> Result<()> {
+            run_rename_probe_controlled(
+                &self.observed_rooted(observer),
+                Domain::Layout,
+                PROBE_TOKEN,
+                control,
+            )
+        }
+
+        fn recover(&self, observer: Option<RootedObserver>) -> Result<()> {
+            let rooted =
+                observer.map_or_else(|| self.rooted(), |observer| self.observed_rooted(observer));
+            recover_probe_journals(&rooted, Domain::Layout)
+        }
+
+        fn recover_controlled(&self, control: &mut ProbeRecoveryControl<'_>) -> Result<()> {
+            recover_probe_journals_controlled(&self.rooted(), Domain::Layout, control)
+        }
+
+        fn assert_protected(&self) {
+            assert_eq!(
+                protected_probe_snapshot(&self.owner),
+                self.protected_before,
+                "rename probe changed protected owner or domain bytes"
+            );
+        }
+
+        fn assert_clean(&self) {
+            assert!(
+                self.rooted()
+                    .list_dir(".surgeist-generator/probes/layout")
+                    .expect("inspect probe residue")
+                    .is_empty(),
+                "rename probe residue remains"
+            );
+            self.assert_protected();
+        }
+
+        fn assert_fresh_recovery_and_reprobe(&self) {
+            self.recover(None).expect("recover genuine probe prefix");
+            self.assert_clean();
+            let recovered = snapshot(&self.owner.corpus);
+            self.recover(None).expect("repeat probe recovery");
+            assert_eq!(
+                snapshot(&self.owner.corpus),
+                recovered,
+                "probe recovery is not idempotent"
+            );
+            run_rename_probe(&self.rooted(), Domain::Layout, LATER_PROBE_TOKEN)
+                .expect("subsequent production rename probe");
+            self.assert_clean();
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn protected_probe_snapshot(owner: &OwnerFixture) -> BTreeMap<PathBuf, SnapshotEntry> {
+        let complete = snapshot(&owner.corpus);
+        complete
+            .into_iter()
+            .filter(|(path, _)| {
+                path == Path::new("domain-artifact.bin")
+                    || path == Path::new(&owner_path(Domain::Layout))
+            })
+            .collect()
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn probe_active_path(token: &str) -> String {
+        format!(".surgeist-generator/probes/layout/active-{token}")
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn probe_member_path(name: &str) -> String {
+        format!("{}/{name}-{PROBE_TOKEN}", probe_active_path(PROBE_TOKEN))
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn record_probe_install_trace() -> Vec<DurabilityEvent> {
+        let fixture = ProbeFixture::new();
+        let observer = RootedObserver::recording();
+        fixture
+            .run_unhooked(observer.clone())
+            .expect("record production rename-probe install");
+        fixture.assert_clean();
+        let trace = observer.events();
+        assert_probe_install_trace(&trace);
+        trace
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn record_probe_capability_trace(
+        fault: ProbeCapabilityFault,
+    ) -> (Vec<DurabilityEvent>, Vec<String>) {
+        let fixture = ProbeFixture::new();
+        let observer = RootedObserver::recording();
+        let mut control = ProbeInstallControl::new(fault);
+        let error = fixture
+            .run_controlled(observer.clone(), &mut control)
+            .expect_err("injected rename capability must be unsupported");
+        assert_capability_error(&error);
+        fixture.assert_clean();
+        (observer.events(), control.cleanup_trace().to_vec())
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn assert_capability_error(error: &GeneratorError) {
+        assert_eq!(error.kind(), GeneratorErrorKind::UnsupportedPlatform);
+        assert!(
+            std::error::Error::source(error).is_some(),
+            "capability error lost its safe source"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn assert_probe_install_trace(trace: &[DurabilityEvent]) {
+        let active = probe_active_path(PROBE_TOKEN);
+        assert_event_exists(
+            trace,
+            DurabilityPhase::ProbeInstall,
+            DurabilityPrimitive::CreateDirectory,
+            &active,
+        );
+        assert_event_exists(
+            trace,
+            DurabilityPhase::ProbeInstall,
+            DurabilityPrimitive::RenameExclusive,
+            &format!("{active}/intent.json"),
+        );
+        for name in ["probe-left", "probe-right"] {
+            assert_event_exists(
+                trace,
+                DurabilityPhase::ProbeInstall,
+                DurabilityPrimitive::CreateDirectory,
+                &probe_member_path(name),
+            );
+        }
+        assert_event_exists(
+            trace,
+            DurabilityPhase::ProbeInstall,
+            DurabilityPrimitive::RenameExclusive,
+            &probe_member_path("probe-moved"),
+        );
+        assert_event_exists(
+            trace,
+            DurabilityPhase::ProbeInstall,
+            DurabilityPrimitive::RenameSwap,
+            &probe_member_path("probe-right"),
+        );
+        for name in ["probe-right", "probe-moved"] {
+            assert_event_exists(
+                trace,
+                DurabilityPhase::ProbeInstall,
+                DurabilityPrimitive::RemoveDirectory,
+                &probe_member_path(name),
+            );
+        }
+        assert_event_exists(
+            trace,
+            DurabilityPhase::ProbeInstall,
+            DurabilityPrimitive::RemoveFile,
+            &format!("{active}/intent.json"),
+        );
+        assert_event_exists(
+            trace,
+            DurabilityPhase::ProbeInstall,
+            DurabilityPrimitive::RemoveDirectory,
+            &active,
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn interrupt_probe_install(
+        fixture: &ProbeFixture,
+        trace: &[DurabilityEvent],
+        event_index: usize,
+        fault: Option<ProbeCapabilityFault>,
+    ) {
+        let observer = RootedObserver::interrupt_after(event_index);
+        if let Some(fault) = fault {
+            let mut control = ProbeInstallControl::new(fault);
+            expect_interruption(|| fixture.run_controlled(observer.clone(), &mut control));
+        } else {
+            expect_interruption(|| fixture.run_unhooked(observer.clone()));
+        }
+        assert_event_prefix(&observer, trace, event_index, "rename probe install");
+        fixture.assert_protected();
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn seed_probe_recovery(fixture: &ProbeFixture, install_trace: &[DurabilityEvent]) {
+        let swap = one_event_index(
+            install_trace,
+            DurabilityPhase::ProbeInstall,
+            DurabilityPrimitive::RenameSwap,
+            &probe_member_path("probe-right"),
+        );
+        interrupt_probe_install(fixture, install_trace, swap, None);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn record_probe_recovery_trace(install_trace: &[DurabilityEvent]) -> Vec<DurabilityEvent> {
+        let fixture = ProbeFixture::new();
+        seed_probe_recovery(&fixture, install_trace);
+        let observer = RootedObserver::recording();
+        fixture
+            .recover(Some(observer.clone()))
+            .expect("record production rename-probe recovery");
+        fixture.assert_clean();
+        let trace = observer.events();
+        assert!(
+            trace.iter().any(|event| {
+                event.phase() == DurabilityPhase::ProbeRecovery
+                    && matches!(
+                        event.primitive(),
+                        DurabilityPrimitive::RemoveFile
+                            | DurabilityPrimitive::RemoveDirectory
+                            | DurabilityPrimitive::SyncDirectory
+                    )
+            }),
+            "probe recovery trace contains no individual removal or sync"
+        );
+        trace
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn assert_probe_error_preserves_snapshot(fixture: &ProbeFixture, label: &str) {
+        let before = snapshot(&fixture.owner.corpus);
+        let error = fixture
+            .recover(None)
+            .expect_err("corrupt probe evidence must fail closed");
+        assert_eq!(
+            error.kind(),
+            GeneratorErrorKind::ArtifactTransaction,
+            "{label}"
+        );
+        assert_eq!(
+            snapshot(&fixture.owner.corpus),
+            before,
+            "probe recovery mutated corrupt evidence: {label}"
+        );
+        fixture.assert_protected();
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn seed_probe_after_exclusive(fixture: &ProbeFixture, trace: &[DurabilityEvent]) {
+        let rename = one_event_index(
+            trace,
+            DurabilityPhase::ProbeInstall,
+            DurabilityPrimitive::RenameExclusive,
+            &probe_member_path("probe-moved"),
+        );
+        interrupt_probe_install(fixture, trace, rename, None);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn rename_probe_corruption_preserves_evidence() {
+        let trace = record_probe_install_trace();
+
+        let unknown = ProbeFixture::new();
+        seed_probe_after_exclusive(&unknown, &trace);
+        fs::write(
+            unknown
+                .owner
+                .corpus
+                .join(format!("{}/zz-unknown", unknown.active_path())),
+            b"unknown probe evidence\n",
+        )
+        .expect("seed unknown probe member");
+        assert_probe_error_preserves_snapshot(&unknown, "unknown member");
+
+        let wrong_mode = ProbeFixture::new();
+        seed_probe_after_exclusive(&wrong_mode, &trace);
+        fs::set_permissions(
+            wrong_mode
+                .owner
+                .corpus
+                .join(probe_member_path("probe-moved")),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("change probe member mode");
+        assert_probe_error_preserves_snapshot(&wrong_mode, "wrong directory mode");
+
+        let wrong_type = ProbeFixture::new();
+        seed_probe_after_exclusive(&wrong_type, &trace);
+        let moved = wrong_type
+            .owner
+            .corpus
+            .join(probe_member_path("probe-moved"));
+        fs::remove_dir(&moved).expect("remove probe directory before type replacement");
+        fs::write(&moved, b"not a probe directory\n").expect("replace probe with file");
+        fs::set_permissions(&moved, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+            .expect("set replacement probe mode");
+        assert_probe_error_preserves_snapshot(&wrong_type, "wrong member type");
+
+        let alias = ProbeFixture::new();
+        seed_probe_after_exclusive(&alias, &trace);
+        let moved = alias.owner.corpus.join(probe_member_path("probe-moved"));
+        fs::remove_dir(&moved).expect("remove probe directory before alias replacement");
+        std::os::unix::fs::symlink(probe_member_path("probe-right"), &moved)
+            .expect("replace probe with alias");
+        assert_probe_error_preserves_snapshot(&alias, "probe alias");
+
+        let replaced_journal = ProbeFixture::new();
+        seed_probe_after_exclusive(&replaced_journal, &trace);
+        let active = replaced_journal
+            .owner
+            .corpus
+            .join(replaced_journal.active_path());
+        let displaced = replaced_journal
+            .owner
+            .corpus
+            .join("displaced-probe-journal");
+        fs::rename(&active, &displaced).expect("displace bound probe journal");
+        fs::create_dir(&active).expect("replace probe journal directory");
+        fs::set_permissions(&active, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+            .expect("set replacement journal mode");
+        for entry in fs::read_dir(&displaced).expect("read displaced probe journal") {
+            let entry = entry.expect("read displaced member");
+            fs::rename(entry.path(), active.join(entry.file_name()))
+                .expect("move evidence into replacement journal");
+        }
+        fs::remove_dir(&displaced).expect("remove displaced journal shell");
+        assert_probe_error_preserves_snapshot(&replaced_journal, "replaced journal identity");
+
+        let raced_member = ProbeFixture::new();
+        seed_probe_after_exclusive(&raced_member, &trace);
+        let mut raced_snapshot = None;
+        let result = {
+            let mut before_mutation = |_: &str| {
+                if raced_snapshot.is_none() {
+                    let moved = raced_member
+                        .owner
+                        .corpus
+                        .join(probe_member_path("probe-moved"));
+                    fs::remove_dir(&moved).expect("remove validated probe before race");
+                    fs::create_dir(&moved).expect("replace validated probe before unlink");
+                    fs::set_permissions(&moved, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+                        .expect("set raced probe mode");
+                    raced_snapshot = Some(snapshot(&raced_member.owner.corpus));
+                }
+                Ok(())
+            };
+            let mut control = ProbeRecoveryControl::new(&mut before_mutation);
+            raced_member.recover_controlled(&mut control)
+        };
+        let error = result.expect_err("replaced validated member must stop recovery");
+        assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+        assert_eq!(
+            snapshot(&raced_member.owner.corpus),
+            raced_snapshot.expect("probe race captured its replacement state")
+        );
+        raced_member.assert_protected();
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn rename_probe_production_paths_recover_and_preserve_capability_errors() {
+        let install_trace = record_probe_install_trace();
+        let interrupted = ProbeFixture::new();
+        seed_probe_recovery(&interrupted, &install_trace);
+        interrupted.assert_fresh_recovery_and_reprobe();
+
+        for fault in [
+            ProbeCapabilityFault::FailExclusiveRename,
+            ProbeCapabilityFault::FailSwapRename,
+        ] {
+            let fixture = ProbeFixture::new();
+            let observer = RootedObserver::recording();
+            let mut control = ProbeInstallControl::new(fault);
+            let error = fixture
+                .run_controlled(observer, &mut control)
+                .expect_err("injected capability fault must reject the probe");
+            assert_capability_error(&error);
+            let expected_cleanup = match fault {
+                ProbeCapabilityFault::FailExclusiveRename => vec![
+                    probe_member_path("probe-left"),
+                    probe_member_path("probe-right"),
+                    "probe-directory-sync".to_owned(),
+                    "intent.json".to_owned(),
+                    "journal-directory".to_owned(),
+                ],
+                ProbeCapabilityFault::FailSwapRename => vec![
+                    probe_member_path("probe-moved"),
+                    probe_member_path("probe-right"),
+                    "probe-directory-sync".to_owned(),
+                    "intent.json".to_owned(),
+                    "journal-directory".to_owned(),
+                ],
+            };
+            assert_eq!(control.cleanup_trace(), expected_cleanup);
+            fixture.assert_clean();
+            fixture.recover(None).expect("repeat clean probe recovery");
+            fixture.assert_clean();
+
+            let interrupted_cleanup = ProbeFixture::new();
+            let mut control = ProbeInstallControl::failing_cleanup(fault, 1);
+            let error = interrupted_cleanup
+                .run_controlled(RootedObserver::recording(), &mut control)
+                .expect_err("partial capability cleanup must retain evidence");
+            assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains("capability"), "{diagnostic}");
+            assert!(diagnostic.contains("cleanup"), "{diagnostic}");
+            interrupted_cleanup.assert_protected();
+            interrupted_cleanup
+                .recover(None)
+                .expect("resume representative partial probe cleanup");
+            interrupted_cleanup.assert_clean();
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "exhaustive opt-in diagnostic"]
+    fn rename_probe_install_every_prefix_recovers() {
+        let trace = record_probe_install_trace();
+        for event_index in 0..trace.len() {
+            let fixture = ProbeFixture::new();
+            interrupt_probe_install(&fixture, &trace, event_index, None);
+            fixture.assert_fresh_recovery_and_reprobe();
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "exhaustive opt-in diagnostic"]
+    fn rename_probe_exclusive_unsupported_every_prefix_recovers() {
+        exercise_probe_capability_prefixes(ProbeCapabilityFault::FailExclusiveRename);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "exhaustive opt-in diagnostic"]
+    fn rename_probe_swap_unsupported_every_prefix_recovers() {
+        exercise_probe_capability_prefixes(ProbeCapabilityFault::FailSwapRename);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn exercise_probe_capability_prefixes(fault: ProbeCapabilityFault) {
+        let (trace, _) = record_probe_capability_trace(fault);
+        for event_index in 0..trace.len() {
+            let fixture = ProbeFixture::new();
+            interrupt_probe_install(&fixture, &trace, event_index, Some(fault));
+            fixture
+                .recover(None)
+                .expect("recover capability-probe prefix");
+            fixture.assert_clean();
+
+            let observer = RootedObserver::recording();
+            let mut control = ProbeInstallControl::new(fault);
+            let error = fixture
+                .run_controlled(observer, &mut control)
+                .expect_err("capability limitation must recur after recovery");
+            assert_capability_error(&error);
+            fixture.assert_clean();
+            fixture.assert_fresh_recovery_and_reprobe();
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "exhaustive opt-in diagnostic"]
+    fn rename_probe_unsupported_cleanup_failure_preserves_evidence() {
+        for fault in [
+            ProbeCapabilityFault::FailExclusiveRename,
+            ProbeCapabilityFault::FailSwapRename,
+        ] {
+            let (_, cleanup_trace) = record_probe_capability_trace(fault);
+            assert!(
+                !cleanup_trace.is_empty(),
+                "capability cleanup trace is empty"
+            );
+            for cleanup_index in 0..cleanup_trace.len() {
+                let fixture = ProbeFixture::new();
+                let observer = RootedObserver::recording();
+                let mut control = ProbeInstallControl::failing_cleanup(fault, cleanup_index);
+                let error = fixture
+                    .run_controlled(observer, &mut control)
+                    .expect_err("injected cleanup failure must reject the probe");
+                assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+                let diagnostic = error.to_string();
+                assert!(diagnostic.contains("capability"), "{diagnostic}");
+                assert!(diagnostic.contains("cleanup"), "{diagnostic}");
+                assert!(
+                    fixture
+                        .rooted()
+                        .identity_at(&fixture.active_path())
+                        .expect("inspect retained active probe journal")
+                        .is_some(),
+                    "cleanup failure did not retain an active probe journal"
+                );
+                fixture.assert_protected();
+                fixture.recover(None).expect("resume failed probe cleanup");
+                fixture.assert_clean();
+
+                let mut repeated = ProbeInstallControl::new(fault);
+                let repeated_error = fixture
+                    .run_controlled(RootedObserver::recording(), &mut repeated)
+                    .expect_err("capability limitation must recur after cleanup recovery");
+                assert_capability_error(&repeated_error);
+                fixture.assert_clean();
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "exhaustive opt-in diagnostic"]
+    fn rename_probe_recovery_every_prefix_is_idempotent() {
+        let install_trace = record_probe_install_trace();
+        let recovery_trace = record_probe_recovery_trace(&install_trace);
+        for event_index in 0..recovery_trace.len() {
+            let fixture = ProbeFixture::new();
+            seed_probe_recovery(&fixture, &install_trace);
+            let observer = RootedObserver::interrupt_after(event_index);
+            expect_interruption(|| fixture.recover(Some(observer.clone())));
+            assert_event_prefix(
+                &observer,
+                &recovery_trace,
+                event_index,
+                "rename probe recovery",
+            );
+            fixture.assert_fresh_recovery_and_reprobe();
+        }
     }
 }
