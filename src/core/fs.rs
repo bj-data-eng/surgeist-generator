@@ -1,4 +1,6 @@
-use std::path::{Component, Path, PathBuf};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -680,6 +682,7 @@ fn bind_path(_path: &Path) -> Result<BoundPath> {
     unreachable!("unsupported mutation target returned success")
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn validate_absolute_namespace_path(path: &Path) -> Result<()> {
     let rendered = path.to_str().ok_or_else(|| {
         invalid_path(
