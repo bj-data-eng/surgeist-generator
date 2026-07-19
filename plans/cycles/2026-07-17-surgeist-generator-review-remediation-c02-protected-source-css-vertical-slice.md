@@ -102,9 +102,11 @@
   Ordinary matrices compile and skip them. No command may contain `--ignored`
   without `--list`; only C04, after every initiative task, executes the one
   sequential all-features ignored run.
-- `private_front_doors_are_linked` may lose a reference only when a real CSS
-  command reaches the represented core path; C02-T06 removes the function once
-  all remaining references have real callers.
+- `private_front_doors_are_linked` may lose only references replaced by real CSS
+  command paths. C02 retains the function and explicitly inventories every
+  layout-only reference still required for warning-clean builds, including
+  `PublicationPolicy::DiagnosticFull`, for C04 final-linkage closure; no CSS-only
+  fake use, placeholder, or lint suppression may stand in for a layout caller.
 - Supported mutation remains Darwin arm64. The default library remains portable
   under warning-denied `wasm32-unknown-unknown`.
 
@@ -281,8 +283,8 @@
 ### C02-T06 — Close the exact CSS interface and transition matrix
 
 - Files/area: final CSS public/front integration, cross-command state fixtures,
-  Cargo metadata, rustdoc/examples, process tests, and obsolete artificial core
-  linkage only.
+  Cargo metadata, rustdoc/examples, process tests, CSS-replaced artificial core
+  references, and an exact C04 handoff of retained layout-only references.
 - Intended behavior/outcome: prove the accumulated surface is exactly SR-05.3 and
   the CLI exactly SR-05.4, with all three commands routed to their real domain
   paths and every import/generate/filter/check transition coherently composed.
@@ -294,8 +296,9 @@
   matrix; `run` is synchronous/threadless; `run_from_env` uses only `args_os`;
   invalid syntax is `Cli`; surface/rustdoc/examples are exact and no core type
   leaks; metadata has only the required CSS target; the binary remains at most 15
-  lines; real domain callers replace every artificial core reference before
-  `private_front_doors_are_linked` is removed; default/layout-only remain clean.
+  lines; real CSS callers replace only the artificial references they reach;
+  `private_front_doors_are_linked` and every enumerated layout-only reference,
+  including `DiagnosticFull`, remain for C04; default/layout-only remain clean.
 - Commands:
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus --test public_api`
   - `cargo test --locked --offline -p surgeist-generator --features css-corpus --test css_cli`
@@ -362,8 +365,10 @@
   clean task/holistic reviews; exact 15-name deferred inventory and proof no
   ignored body ran; public CSS API/binary/metadata evidence; synthetic source,
   import, generation, filtering, checking, report, and CLI evidence; final
-  matrix; preservation digest; clean authority-remote readback; and an explicit
-  statement that C03 alone may begin next while C04 alone owns ignored runtime.
+  matrix; preservation digest; clean authority-remote readback; exact remaining
+  layout-only artificial-linkage inventory for C04 (including `DiagnosticFull`);
+  and an explicit statement that C03 alone may begin next while C04 alone owns
+  final-linkage closure and ignored runtime.
 - Unresolved blocker: none. Missing installed cache/tool, unsupported declared
   host behavior, inability to preserve protected-source or atomic-publication
   invariants, a required dependency/lockfile change, or contradiction with the
