@@ -193,7 +193,9 @@ pub(super) fn canonical_bytes(
 pub(super) fn validate_fixture_path(path: &RelativePath) -> Result<()> {
     RelativePath::with_extension(path.as_str(), "json")
         .map_err(|error| invalid_inventory(error.to_string()))?;
-    if matches!(path.as_str(), SIDECAR_FILE | REPORT_RELATIVE)
+    if [SIDECAR_FILE, REPORT_RELATIVE]
+        .iter()
+        .any(|reserved| paths_overlap(path.as_str(), reserved))
         || path.as_str().split('/').any(|component| {
             component == ".surgeist-generator" || component.starts_with("._surgeist-")
         })
@@ -204,6 +206,17 @@ pub(super) fn validate_fixture_path(path: &RelativePath) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn paths_overlap(left: &str, right: &str) -> bool {
+    is_same_or_descendant(left, right) || is_same_or_descendant(right, left)
+}
+
+fn is_same_or_descendant(path: &str, ancestor: &str) -> bool {
+    path == ancestor
+        || path
+            .strip_prefix(ancestor)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn validate_object_id(value: &str, object_format: SidecarObjectFormat, label: &str) -> Result<()> {

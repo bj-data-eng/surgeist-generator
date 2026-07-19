@@ -158,12 +158,58 @@ fn css_import_sidecar_sha256_golden() {
     );
 }
 
+#[test]
+fn css_import_reserved_fixture_path_relation_matrix() {
+    for path in [
+        ".surgeist-source.json",
+        ".surgeist-source.json/child.json",
+        "generation-reports/all.json",
+        "generation-reports/all.json/child.json",
+    ] {
+        let path = RelativePath::new(path).expect("canonical fixture path");
+        let error = sidecar::validate_fixture_path(&path)
+            .expect_err("reserved equality, ancestor, or descendant");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "validate CSS import sidecar: reserved CSSTree fixture path: {}",
+                path.as_str()
+            )
+        );
+    }
+
+    for path in ["generation-reports", "generation-reports/all"] {
+        let path = RelativePath::new(path).expect("canonical fixture path");
+        let error = sidecar::validate_fixture_path(&path).expect_err("reserved ancestor");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "validate CSS import sidecar: validate relative path extension: {} does not have extension json",
+                path.as_str()
+            )
+        );
+    }
+
+    for path in [
+        ".surgeist-source.json-copy/child.json",
+        "nested/.surgeist-source.json",
+        "generation-reports/all-copy.json",
+        "generation-reports/all.json-copy/child.json",
+    ] {
+        let path = RelativePath::new(path).expect("canonical fixture path");
+        sidecar::validate_fixture_path(&path).expect("noncolliding fixture path");
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod imports {
+    use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
     use std::fs;
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -464,6 +510,62 @@ mod imports {
             .collect()
     }
 
+    fn path_identity(path: &Path) -> (u64, u64) {
+        let metadata = fs::symlink_metadata(path).expect("read path identity");
+        (metadata.dev(), metadata.ino())
+    }
+
+    fn assert_no_import_transaction_or_stage(fixture: &Fixture) {
+        let transactions = fixture.corpus.join(".surgeist-generator/transactions/css");
+        assert_eq!(
+            fs::read_dir(transactions)
+                .expect("inspect CSS transactions")
+                .count(),
+            0,
+            "reserved-path rejection created transaction intent or residue"
+        );
+        assert!(
+            fs::read_dir(&fixture.corpus)
+                .expect("inspect corpus root")
+                .all(|entry| {
+                    !entry
+                        .expect("corpus entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("._surgeist-")
+                }),
+            "reserved-path rejection created an external stage"
+        );
+    }
+
+    fn assert_reserved_fixture_descendant_rejected(path: &str) {
+        let mut fixture =
+            Fixture::new(&[("declaration/Declaration.json", b"{\"old\":true}\n", false)]);
+        fixture.import().expect("initial import");
+        let import_root = fixture.corpus.join("source");
+        let before_bytes = snapshot_tree(&import_root);
+        let before_identity = path_identity(&import_root);
+
+        fixture.replace_commit(&[(path, b"{}\n", false)]);
+        let pre_lease_reached = Cell::new(false);
+        let request = fixture.request();
+        let error = importer::run_with_pre_lease_hook(&request, || pre_lease_reached.set(true))
+            .expect_err("reserved fixture descendant");
+
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert_eq!(
+            error.to_string(),
+            format!("validate CSS import sidecar: reserved CSSTree fixture path: {path}")
+        );
+        assert!(
+            !pre_lease_reached.get(),
+            "reserved path reached lease preflight"
+        );
+        assert_eq!(snapshot_tree(&import_root), before_bytes);
+        assert_eq!(path_identity(&import_root), before_identity);
+        assert_no_import_transaction_or_stage(&fixture);
+    }
+
     #[test]
     fn css_import_publishes_exact_sidecar_and_snapshot_atomically() {
         let fixture = Fixture::new(&[
@@ -570,6 +672,16 @@ mod imports {
         let error = fixture.import().expect_err("reserved report collision");
         assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
         assert!(!fixture.corpus.join("source").exists());
+    }
+
+    #[test]
+    fn css_import_rejects_sidecar_descendant_before_transaction_intent() {
+        assert_reserved_fixture_descendant_rejected(".surgeist-source.json/child.json");
+    }
+
+    #[test]
+    fn css_import_rejects_report_descendant_before_transaction_intent() {
+        assert_reserved_fixture_descendant_rejected("generation-reports/all.json/child.json");
     }
 
     #[test]
