@@ -11,9 +11,9 @@
   `05293743a551454adcf63345e80ef0d3982786b1`.
 - Clean reviewed specification:
   `plans/specs/2026-07-17-surgeist-generator-review-remediation.md` at commit
-  `0c56de73f0280993761314f514626951de56cfb7`, normalized semantic-content
+  `e2bc72e1434f31c60f2578d4558824f252cc57b1`, normalized semantic-content
   SHA-256
-  `9a1a148c198d39145017db769b9ab91025f1cc37719efc6d3c68ab998da7c524`.
+  `e3965c21336153f876f5d2cbe304ab62497213e10cf893a4e4bf28561cc74fe0`.
 - Scope remains this leaf repository. Root integration, root API artifacts,
   sibling corpus adoption, and root gitlink promotion remain excluded.
 - Across every cycle, exhaustive real durability, byte-prefix, recovery-prefix,
@@ -90,11 +90,12 @@
 - Bounded outcome: one complete, production-reachable `layout-browser` module
   and thin layout binary expose `check-corpus`, `check-taffy-corpus`, and
   `import-taffy`. Those commands own schema-2 compatibility, partitioned Taffy
-  import and verification, deterministic current/historical inventory,
-  disposition and four-variant accounting, XML/report validation, and offline
-  corpus attestation. Every implementation path introduced by this cycle is
-  reached by one of those public commands; there is no generation engine,
-  browser backend, artificial linkage, or provisional interface.
+  import and verification against corpus-manifest-owned revision/count values,
+  deterministic current/historical inventory, disposition and four-variant
+  accounting, XML/report validation, and offline corpus attestation. Every
+  implementation path introduced by this cycle is reached by one of those
+  public commands; there is no generation engine, browser backend, artificial
+  linkage, or provisional interface.
 - Specification sections: the browser-free layout clauses of SR-01 and the
   layout portion of SR-02 **Missing domain surface**, **Tautological CLI test**,
   and affected quality obligations; layout import/check clauses of SR-03.1 and
@@ -114,12 +115,17 @@
   browser-free commands against explicit synthetic roots; their API, CLI,
   schema compatibility, partitioned import, source proof, exact inventory,
   report/digest relationships, stale-state classifications, and read-only
-  coordination behavior satisfy the affected feature matrix. The preservation
+  coordination behavior satisfy the affected feature matrix. Synthetic
+  manifests prove that different valid Taffy revisions and positive counts use
+  the same compiled generator contract, duplicate revision fields must match,
+  and a manifest pin/count update makes the old sidecar stale until re-import
+  without requiring a generator source change or release. The preservation
   source remains byte-identical, no heavy browser dependency is enabled, and no
   generation-only code or command exists.
 - Handoff: publish and remotely verify the C03 leaf candidate, then provide its
-  immutable SHA, browser-free API/CLI evidence, and mapped preservation
-  responsibilities to C04. No root or sibling handoff occurs.
+  immutable SHA, browser-free API/CLI evidence, corpus-owned Taffy pin-update
+  evidence, and mapped preservation responsibilities to C04. No root or sibling
+  handoff occurs.
 
 ### C04 — Atomic Layout Generation And Leaf Candidate
 
@@ -181,7 +187,7 @@ The sequence allocates every contract exactly once at its final closure boundary
 | Protected-source foundation and complete CSS domain surface | C02 |
 | CSS portion of missing-domain and real-CLI findings | C02 |
 | Browser-free layout surface and layout real-CLI evidence | C03 |
-| Layout schema, Taffy partition, historical authority, and offline corpus checking | C03 |
+| Layout schema, corpus-owned Taffy pin/count, partition, historical authority, and offline corpus checking | C03 |
 | Final missing-domain closure: layout generation API, browser runtime, and artifact publication | C04 |
 | Layout preservation retirement | C04 |
 | Final composed quality matrix, guidance, and leaf handoff | C04 |
