@@ -119,6 +119,10 @@ impl CssImportSidecar {
         &self.files
     }
 
+    pub(super) const fn source(&self) -> &PinnedSource {
+        &self.source
+    }
+
     fn validate(&self) -> Result<()> {
         if self.schema_version != 1 {
             return Err(invalid_inventory(

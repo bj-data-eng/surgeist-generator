@@ -23,6 +23,7 @@ pub(super) struct CssManifest {
     pub(super) expected_cases: usize,
     pub(super) expectation_root: RelativePath,
     pub(super) report_file: RelativePath,
+    pub(super) cases: Vec<CaseDispositionRecord>,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +109,7 @@ pub(super) fn parse(bytes: &[u8], path: &Path) -> Result<CssManifest> {
         ));
     }
     let mut case_ids = BTreeSet::new();
+    let mut cases = Vec::with_capacity(raw.cases.len());
     for case in raw.cases {
         let (source, pointer) = case
             .id
@@ -120,12 +122,14 @@ pub(super) fn parse(bytes: &[u8], path: &Path) -> Result<CssManifest> {
         }
         let source_path = RelativePath::with_extension(source, "json")
             .map_err(|error| invalid_manifest(error.to_string()))?;
-        CaseDispositionRecord::new(&case.id, source_path, case.status, case.reason)
+        let record = CaseDispositionRecord::new(&case.id, source_path, case.status, case.reason)
             .map_err(|error| invalid_manifest(error.to_string()))?;
         if !case_ids.insert(case.id) {
             return Err(invalid_manifest("case IDs must be unique"));
         }
+        cases.push(record);
     }
+    cases.sort_by(|left, right| left.case_id().cmp(right.case_id()));
 
     Ok(CssManifest {
         repository: raw.source.repository,
@@ -136,6 +140,7 @@ pub(super) fn parse(bytes: &[u8], path: &Path) -> Result<CssManifest> {
         expected_cases,
         expectation_root: raw.artifacts.expectation_root,
         report_file: raw.artifacts.report_file,
+        cases,
     })
 }
 

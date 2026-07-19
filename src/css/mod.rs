@@ -8,11 +8,13 @@
 //! # use surgeist_generator::css::{self, CssCommand, CssRequest};
 //! # fn example(location: CorpusLocation, checkout: PathBuf) -> Result<()> {
 //! let request = CssRequest::new(
-//!     location,
+//!     location.clone(),
 //!     CssCommand::ImportCsstree,
 //!     Some(checkout),
 //!     None,
 //! )?;
+//! css::run(request)?;
+//! let request = CssRequest::new(location, CssCommand::Generate, None, None)?;
 //! css::run(request)
 //! # }
 //! ```
@@ -22,8 +24,13 @@ use std::path::{Path, PathBuf};
 use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, RelativePath, Result};
 
 mod cli;
+mod expectation;
+mod fixture;
+mod full_generation;
+mod historical;
 mod importer;
 mod manifest;
+mod report;
 mod sidecar;
 
 #[cfg(test)]
@@ -35,6 +42,8 @@ mod tests;
 pub enum CssCommand {
     /// Import the manifest-pinned `fixtures/ast` tree from an existing checkout.
     ImportCsstree,
+    /// Generate the complete neutral expectation set from the current import.
+    Generate,
 }
 
 /// Checked request for one CSS corpus operation.
@@ -69,6 +78,20 @@ impl CssRequest {
                     return Err(cli_error(
                         "construct CSS request",
                         "import-csstree forbids a filter",
+                    ));
+                }
+            }
+            CssCommand::Generate => {
+                if filter.is_some() {
+                    return Err(cli_error(
+                        "construct CSS request",
+                        "generate forbids a filter until filtered generation is available",
+                    ));
+                }
+                if source_root.is_some() {
+                    return Err(cli_error(
+                        "construct CSS request",
+                        "generate forbids a source root",
                     ));
                 }
             }
@@ -110,6 +133,7 @@ impl CssRequest {
 pub fn run(request: CssRequest) -> Result<()> {
     match request.command() {
         CssCommand::ImportCsstree => importer::run(&request),
+        CssCommand::Generate => full_generation::run(&request),
     }
 }
 
@@ -120,4 +144,12 @@ pub fn run_from_env() -> Result<()> {
 
 fn cli_error(operation: &str, detail: impl Into<String>) -> GeneratorError {
     GeneratorError::new(GeneratorErrorKind::Cli, operation, detail)
+}
+
+fn invalid_inventory(detail: impl Into<String>) -> GeneratorError {
+    GeneratorError::new(
+        GeneratorErrorKind::InvalidInventory,
+        "revalidate CSS generation inputs",
+        detail,
+    )
 }

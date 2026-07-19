@@ -53,6 +53,9 @@ fn run_from_args(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
             Some("import-csstree") => {
                 set_once(&mut command, CssCommand::ImportCsstree, "CSS command")?;
             }
+            Some("generate") => {
+                set_once(&mut command, CssCommand::Generate, "CSS command")?;
+            }
             Some(value) => return Err(cli_error(format!("unknown CSS command: {value}"))),
             None => return Err(cli_error("CSS command name must be UTF-8")),
         }
@@ -68,6 +71,16 @@ fn run_from_args(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
             }
             if source_root.as_ref().is_none_or(|value| value.is_empty()) {
                 return Err(cli_error("import-csstree requires --source-root"));
+            }
+        }
+        CssCommand::Generate => {
+            if filter.is_some() {
+                return Err(cli_error(
+                    "generate forbids --filter until filtered generation is available",
+                ));
+            }
+            if source_root.is_some() {
+                return Err(cli_error("generate forbids --source-root"));
             }
         }
     }

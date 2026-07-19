@@ -32,7 +32,7 @@ pub(crate) use inventory::{Inventory, InventoryPolicy};
 #[cfg(feature = "css-corpus")]
 pub(crate) use lease::GenerationLease;
 #[cfg(feature = "css-corpus")]
-pub(crate) use protection::ProtectedSourceDisjointness;
+pub(crate) use protection::{NamespaceDisjointness, ProtectedSourceDisjointness};
 #[cfg(feature = "css-corpus")]
 pub(crate) use source::{
     ObjectFormat, ProtectedSource, ProtectedSourceInventory, ProtectedTreeEntryKind, SnapshotEntry,
@@ -68,7 +68,6 @@ fn private_front_doors_are_linked() {
     let _ = inventory::InventoryEntry::link_count;
     let _ = inventory::Inventory::find;
     let _ = inventory::InventoryPolicy::Private;
-    let _ = protection::NamespaceDisjointness::for_mutation;
     let _ = protection::ProtectedSourceDisjointness::for_mutation;
     let _ = source::ProtectedSource::verified;
     let _ = source::ProtectedSource::snapshot;

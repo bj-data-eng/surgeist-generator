@@ -61,6 +61,39 @@ fn css_cli_invalid_syntax_prints_exact_prefix_and_exits_64() {
     );
 }
 
+#[test]
+fn css_cli_generate_rejects_filter_and_source_root_before_io() {
+    for (extra, expected) in [
+        (
+            ["--filter", "declaration"],
+            "surgeist-css-generate: parse CSS command line: generate forbids --filter until filtered generation is available\n",
+        ),
+        (
+            ["--source-root", "checkout"],
+            "surgeist-css-generate: parse CSS command line: generate forbids --source-root\n",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_surgeist-css-generate"))
+            .args([
+                "--owner-root",
+                "does-not-exist",
+                "--corpus-root",
+                "does-not-exist",
+                "generate",
+            ])
+            .args(extra)
+            .output()
+            .expect("run packaged CSS binary");
+
+        assert_eq!(output.status.code(), Some(64));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("UTF-8 diagnostic"),
+            expected
+        );
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn css_cli_import_csstree_executes_real_public_path() {
@@ -134,4 +167,101 @@ fn css_cli_import_csstree_executes_real_public_path() {
         b"{\"case\":{}}\n"
     );
     assert!(corpus.join("source/.surgeist-source.json").is_file());
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn css_cli_generate_executes_real_unfiltered_public_path() {
+    let root = TestRoot::new();
+    let owner = root.0.join("owner");
+    let corpus = owner.join("corpus");
+    let checkout = root.0.join("checkout");
+    fs::create_dir_all(&corpus).expect("create corpus");
+    fs::create_dir(&checkout).expect("create checkout");
+    run_git(&checkout, &[OsStr::new("init"), OsStr::new("--quiet")]);
+    for (key, value) in [
+        ("user.name", "CSS CLI Generate Test"),
+        ("user.email", "css-cli-generate@example.invalid"),
+    ] {
+        run_git(
+            &checkout,
+            &[OsStr::new("config"), OsStr::new(key), OsStr::new(value)],
+        );
+    }
+    run_git(
+        &checkout,
+        &[
+            OsStr::new("remote"),
+            OsStr::new("add"),
+            OsStr::new("origin"),
+            OsStr::new(CSSTREE_REPOSITORY),
+        ],
+    );
+    let fixture = checkout.join("fixtures/ast/declaration/Declaration.json");
+    fs::create_dir_all(fixture.parent().expect("fixture parent")).expect("create fixture parent");
+    fs::write(
+        &fixture,
+        b"{\"case\":{\"source\":\"a { color: red }\",\"ast\":{},\"generate\":\"a{color:red}\"}}\n",
+    )
+    .expect("write fixture");
+    run_git(&checkout, &[OsStr::new("add"), OsStr::new("fixtures/ast")]);
+    run_git(
+        &checkout,
+        &[
+            OsStr::new("commit"),
+            OsStr::new("--quiet"),
+            OsStr::new("-m"),
+            OsStr::new("fixture"),
+        ],
+    );
+    let revision = run_git(&checkout, &[OsStr::new("rev-parse"), OsStr::new("HEAD")]);
+    fs::write(
+        corpus.join("corpus.toml"),
+        format!(
+            "schema_version = 1\n\n[source]\nkind = \"csstree\"\nrepository = \"{CSSTREE_REPOSITORY}\"\nrevision = \"{revision}\"\nfixture_root = \"fixtures/ast\"\nimport_root = \"source\"\nexpected_files = 1\nexpected_cases = 1\n\n[artifacts]\nexpectation_root = \"expectations\"\nreport_file = \"expectations/generation-reports/all.json\"\n"
+        ),
+    )
+    .expect("write manifest");
+
+    let import = Command::new(env!("CARGO_BIN_EXE_surgeist-css-generate"))
+        .arg("--owner-root")
+        .arg(&owner)
+        .arg("--corpus-root")
+        .arg(&corpus)
+        .arg("import-csstree")
+        .arg("--source-root")
+        .arg(&checkout)
+        .output()
+        .expect("run packaged CSS import");
+    assert!(
+        import.status.success(),
+        "CSS import failed: {}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+
+    let generate = Command::new(env!("CARGO_BIN_EXE_surgeist-css-generate"))
+        .arg("--owner-root")
+        .arg(&owner)
+        .arg("--corpus-root")
+        .arg(&corpus)
+        .arg("generate")
+        .output()
+        .expect("run packaged CSS generation");
+    assert!(
+        generate.status.success(),
+        "CSS generation failed: {}",
+        String::from_utf8_lossy(&generate.stderr)
+    );
+    assert!(generate.stdout.is_empty());
+    assert!(generate.stderr.is_empty());
+    assert!(
+        corpus
+            .join("expectations/declaration/Declaration.json")
+            .is_file()
+    );
+    assert!(
+        corpus
+            .join("expectations/generation-reports/all.json")
+            .is_file()
+    );
 }

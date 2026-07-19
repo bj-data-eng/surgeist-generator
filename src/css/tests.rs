@@ -325,6 +325,11 @@ mod imports {
             .expect("import request")
         }
 
+        fn generate_request(&self) -> CssRequest {
+            CssRequest::new(self.location.clone(), CssCommand::Generate, None, None)
+                .expect("full generation request")
+        }
+
         fn pin(&self) -> PinnedSource {
             PinnedSource::new(
                 "csstree",
@@ -337,6 +342,31 @@ mod imports {
 
         fn import(&self) -> crate::Result<()> {
             crate::css::run(self.request())
+        }
+
+        fn generate(&self) -> crate::Result<()> {
+            crate::css::run(self.generate_request())
+        }
+
+        fn set_manifest(
+            &self,
+            expected_files: usize,
+            expected_cases: usize,
+            overrides: &[(&str, &str, Option<&str>)],
+        ) {
+            let mut text = format!(
+                "schema_version = 1\n\n[source]\nkind = \"csstree\"\nrepository = \"{CSSTREE_REPOSITORY}\"\nrevision = \"{}\"\nfixture_root = \"fixtures/ast\"\nimport_root = \"source\"\nexpected_files = {expected_files}\nexpected_cases = {expected_cases}\n\n[artifacts]\nexpectation_root = \"expectations\"\nreport_file = \"expectations/generation-reports/all.json\"\n",
+                self.revision
+            );
+            for (id, status, reason) in overrides {
+                text.push_str(&format!(
+                    "\n[[cases]]\nid = \"{id}\"\nstatus = \"{status}\"\n"
+                ));
+                if let Some(reason) = reason {
+                    text.push_str(&format!("reason = \"{reason}\"\n"));
+                }
+            }
+            fs::write(self.corpus.join("corpus.toml"), text).expect("write generation manifest");
         }
 
         fn replace_commit(&mut self, files: &[(&str, &[u8], bool)]) {
@@ -438,6 +468,15 @@ mod imports {
 
         fn sidecar(&self) -> Vec<u8> {
             fs::read(self.imported(".surgeist-source.json")).expect("read sidecar")
+        }
+
+        fn expectation(&self, relative: &str) -> Vec<u8> {
+            fs::read(self.corpus.join("expectations").join(relative)).expect("read CSS expectation")
+        }
+
+        fn report(&self) -> Vec<u8> {
+            fs::read(self.corpus.join("expectations/generation-reports/all.json"))
+                .expect("read CSS generation report")
         }
 
         fn seed_downstream(&self, fixture: &str) -> DownstreamProof {
@@ -1190,5 +1229,409 @@ mod imports {
                 .expect("UTF-8 report")
                 .contains(downstream.sidecar_digest.as_str())
         );
+    }
+
+    fn imported_generation_fixture(
+        relative: &str,
+        bytes: &'static [u8],
+        expected_cases: usize,
+        overrides: &[(&str, &str, Option<&str>)],
+    ) -> Fixture {
+        let fixture = Fixture::new(&[(relative, bytes, false)]);
+        fixture.set_manifest(1, expected_cases, overrides);
+        fixture.import().expect("import generation fixture");
+        fixture
+    }
+
+    #[test]
+    fn css_expectation_case_order_golden() {
+        let source = b"{\n  \"slash/~label\": {\n    \"generate\": \"a{color:red}\",\n    \"options\": {\"z\": {\"\\u03b2\": 2, \"a\": 1}, \"a\": [{\"z\": true, \"a\": false}, 3]},\n    \"ast\": {\"secret\": \"must not persist\"},\n    \"source\": \"a { color: red }\",\n    \"diagnostic\": \"must not persist\",\n    \"comments\": [\"must not persist\"],\n    \"recovery\": {\"must\": \"not persist\"}\n  },\n  \"plain\": {\"source\": \"b {}\", \"ast\": null},\n  \"error\": [{\"source\": \"broken\", \"message\": \"must not persist\", \"offset\": 4}]\n}\n";
+        let fixture = imported_generation_fixture("declaration/Declaration.json", source, 3, &[]);
+        fixture.generate().expect("generate neutral expectations");
+
+        let source_digest = Sha256Digest::from_bytes(source);
+        let sidecar_digest = Sha256Digest::from_bytes(fixture.sidecar());
+        let expected = format!(
+            "{{\n  \"schema_version\": 1,\n  \"generator\": \"surgeist-css-generate\",\n  \"source\": \"source/declaration/Declaration.json\",\n  \"source_sha256\": \"{source_digest}\",\n  \"source_revision\": \"{}\",\n  \"import_provenance_sha256\": \"{sidecar_digest}\",\n  \"cases\": [\n    {{\n      \"id\": \"declaration/Declaration.json#/error/0\",\n      \"context\": \"declaration\",\n      \"input\": \"broken\",\n      \"upstream_outcome\": \"rejected\",\n      \"status\": \"active\"\n    }},\n    {{\n      \"id\": \"declaration/Declaration.json#/plain\",\n      \"context\": \"declaration\",\n      \"label\": \"plain\",\n      \"input\": \"b {{}}\",\n      \"upstream_outcome\": \"parsed\",\n      \"status\": \"active\"\n    }},\n    {{\n      \"id\": \"declaration/Declaration.json#/slash~1~0label\",\n      \"context\": \"declaration\",\n      \"label\": \"slash/~label\",\n      \"input\": \"a {{ color: red }}\",\n      \"options\": {{\n        \"a\": [\n          {{\n            \"a\": false,\n            \"z\": true\n          }},\n          3\n        ],\n        \"z\": {{\n          \"a\": 1,\n          \"β\": 2\n        }}\n      }},\n      \"upstream_outcome\": \"parsed\",\n      \"canonical_css\": \"a{{color:red}}\",\n      \"status\": \"active\"\n    }}\n  ]\n}}\n",
+            fixture.revision
+        );
+        let actual = fixture.expectation("declaration/Declaration.json");
+        assert_eq!(actual, expected.as_bytes());
+        assert!(!actual.windows(3).any(|window| window == b"ast"));
+        assert!(!actual.windows(10).any(|window| window == b"diagnostic"));
+        assert!(!actual.windows(7).any(|window| window == b"message"));
+        assert!(!actual.windows(6).any(|window| window == b"offset"));
+        assert!(!actual.windows(8).any(|window| window == b"comments"));
+        assert!(!actual.windows(8).any(|window| window == b"recovery"));
+    }
+
+    #[test]
+    fn css_expectation_duplicate_decoded_members_at_every_depth_are_rejected() {
+        let fixtures: &[&[u8]] = &[
+            b"{\"\\u0063ase\":{\"source\":\"a\",\"ast\":{}},\"case\":{\"source\":\"b\",\"ast\":{}}}\n",
+            b"{\"case\":{\"source\":\"a\",\"source\":\"b\",\"ast\":{}}}\n",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{\"x\":1,\"\\u0078\":2}}}\n",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{},\"options\":{\"nested\":{\"x\":1,\"\\u0078\":2}}}}\n",
+            b"{\"error\":[{\"source\":\"a\",\"source\":\"b\"}]}\n",
+        ];
+        for bytes in fixtures {
+            let fixture =
+                imported_generation_fixture("declaration/Declaration.json", bytes, 1, &[]);
+            let error = fixture
+                .generate()
+                .expect_err("duplicate decoded JSON member");
+            assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+            assert!(!fixture.corpus.join("expectations").exists());
+            assert_no_import_intent_journal_or_stage(&fixture);
+        }
+    }
+
+    #[test]
+    fn css_expectation_empty_malformed_and_trailing_fixtures_publish_nothing() {
+        let fixtures: &[&[u8]] = &[
+            b"not JSON\n",
+            b"{}\n",
+            b"{\"error\":[]}\n",
+            b"[]\n",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{}}} {}\n",
+            b"{\"case\":{\"source\":1,\"ast\":{}}}\n",
+            b"{\"case\":{\"source\":\"a\"}}\n",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{},\"options\":[]}}\n",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{},\"options\":null}}\n",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{},\"generate\":null}}\n",
+            b"{\"error\":{\"source\":\"a\"}}\n",
+            b"{\"error\":[{\"source\":null}]}\n",
+        ];
+        for bytes in fixtures {
+            let fixture =
+                imported_generation_fixture("declaration/Declaration.json", bytes, 1, &[]);
+            let error = fixture.generate().expect_err("invalid fixture shape");
+            assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+            assert!(!fixture.corpus.join("expectations").exists());
+        }
+    }
+
+    #[test]
+    fn css_expectation_options_recursively_sort_decoded_keys_and_preserve_arrays() {
+        let fixture = imported_generation_fixture(
+            "value/Options.json",
+            b"{\"case\":{\"source\":\"value\",\"ast\":{},\"options\":{\"\\u03b2\":{\"z\":0,\"a\":1},\"a\":[3,2,1]}}}\n",
+            1,
+            &[],
+        );
+        fixture.generate().expect("generate canonical options");
+        let expectation: serde_json::Value =
+            serde_json::from_slice(&fixture.expectation("value/Options.json"))
+                .expect("expectation JSON");
+        let options = &expectation["cases"][0]["options"];
+        assert_eq!(
+            serde_json::to_string(options).expect("serialize options"),
+            "{\"a\":[3,2,1],\"β\":{\"a\":1,\"z\":0}}"
+        );
+    }
+
+    #[test]
+    fn css_expectation_default_override_repeated_source_and_reason_accounting() {
+        let fixture = imported_generation_fixture(
+            "declaration/Disposition.json",
+            b"{\"second\":{\"source\":\"same source\",\"ast\":{}},\"quarantine\":{\"source\":\"same source\",\"ast\":{}},\"first\":{\"source\":\"same source\",\"ast\":{}},\"error\":[{\"source\":\"same source\"}]}\n",
+            4,
+            &[
+                (
+                    "declaration/Disposition.json#/error/0",
+                    "expected-fail",
+                    Some("known rejection"),
+                ),
+                (
+                    "declaration/Disposition.json#/first",
+                    "unsupported",
+                    Some("unsupported grammar"),
+                ),
+                (
+                    "declaration/Disposition.json#/quarantine",
+                    "quarantined",
+                    Some("isolated fixture"),
+                ),
+            ],
+        );
+        fixture.generate().expect("generate dispositions");
+
+        let expectation: serde_json::Value =
+            serde_json::from_slice(&fixture.expectation("declaration/Disposition.json"))
+                .expect("expectation JSON");
+        assert_eq!(expectation["cases"][0]["status"], "expected-fail");
+        assert_eq!(expectation["cases"][0]["reason"], "known rejection");
+        assert_eq!(expectation["cases"][1]["status"], "unsupported");
+        assert_eq!(expectation["cases"][1]["reason"], "unsupported grammar");
+        assert_eq!(expectation["cases"][2]["status"], "quarantined");
+        assert_eq!(expectation["cases"][2]["reason"], "isolated fixture");
+        assert_eq!(expectation["cases"][3]["status"], "active");
+        assert!(expectation["cases"][3].get("reason").is_none());
+        assert_eq!(
+            expectation["cases"]
+                .as_array()
+                .expect("cases")
+                .iter()
+                .map(|case| case["input"].as_str().expect("input"))
+                .collect::<Vec<_>>(),
+            ["same source", "same source", "same source", "same source"]
+        );
+
+        let report: GenerationReport =
+            serde_json::from_slice(&fixture.report()).expect("generation report");
+        assert_eq!(report.counts().active(), 1);
+        assert_eq!(report.counts().expected_fail(), 1);
+        assert_eq!(report.counts().unsupported(), 1);
+        assert_eq!(report.counts().quarantined(), 1);
+        assert_eq!(report.counts().failed_to_generate(), 0);
+    }
+
+    #[test]
+    fn css_expectation_unmatched_override_and_full_count_mismatch_publish_nothing() {
+        let unmatched = imported_generation_fixture(
+            "declaration/Case.json",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+            1,
+            &[(
+                "declaration/Case.json#/missing",
+                "quarantined",
+                Some("not derived"),
+            )],
+        );
+        let error = unmatched.generate().expect_err("unmatched override");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert!(!unmatched.corpus.join("expectations").exists());
+
+        let mismatch = imported_generation_fixture(
+            "declaration/Case.json",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+            2,
+            &[],
+        );
+        let error = mismatch.generate().expect_err("full count mismatch");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert!(!mismatch.corpus.join("expectations").exists());
+    }
+
+    #[test]
+    fn css_full_generate_report_binds_provenance_counts_digests_and_artifacts() {
+        let source = b"{\"case\":{\"source\":\"a{}\",\"ast\":{},\"generate\":\"a{}\"}}\n";
+        let fixture = imported_generation_fixture("declaration/Case.json", source, 1, &[]);
+        fixture.generate().expect("full generation");
+
+        let report_bytes = fixture.report();
+        assert_eq!(report_bytes.last(), Some(&b'\n'));
+        let manifest_digest =
+            Sha256Digest::from_file(fixture.corpus.join("corpus.toml")).expect("manifest digest");
+        let source_digest = Sha256Digest::from_bytes(source);
+        let sidecar_digest = Sha256Digest::from_bytes(fixture.sidecar());
+        let output_digest = Sha256Digest::from_bytes(fixture.expectation("declaration/Case.json"));
+        let expected_report = format!(
+            "{{\n  \"manifest_digest\": \"{manifest_digest}\",\n  \"source_repository\": \"{CSSTREE_REPOSITORY}\",\n  \"source_revision\": \"{}\",\n  \"counts\": {{\n    \"active\": 1,\n    \"expected_fail\": 0,\n    \"unsupported\": 0,\n    \"quarantined\": 0,\n    \"failed_to_generate\": 0\n  }},\n  \"artifacts\": [\n    {{\n      \"provenance\": {{\n        \"source_path\": \"source/declaration/Case.json\",\n        \"source_digest\": \"{source_digest}\",\n        \"generator\": \"surgeist-css-generate\",\n        \"schema_version\": 1,\n        \"domain_provenance\": {{\n          \"csstree-import\": \"{sidecar_digest}\"\n        }}\n      }},\n      \"output_path\": \"expectations/declaration/Case.json\",\n      \"output_digest\": \"{output_digest}\",\n      \"case_count\": 1\n    }}\n  ]\n}}\n",
+            fixture.revision
+        );
+        assert_eq!(report_bytes, expected_report.as_bytes());
+        let report: GenerationReport =
+            serde_json::from_slice(&report_bytes).expect("generation report");
+        assert_eq!(report.manifest_digest(), &manifest_digest);
+        assert_eq!(report.source_repository(), CSSTREE_REPOSITORY);
+        assert_eq!(report.source_revision().as_str(), fixture.revision);
+        assert_eq!(report.counts().total().expect("count total"), 1);
+        assert_eq!(report.artifacts().len(), 1);
+        let artifact = &report.artifacts()[0];
+        assert_eq!(artifact.case_count(), 1);
+        assert_eq!(
+            artifact.provenance().source_path().as_str(),
+            "source/declaration/Case.json"
+        );
+        assert_eq!(artifact.provenance().source_digest(), &source_digest);
+        assert_eq!(artifact.provenance().generator(), "surgeist-css-generate");
+        assert_eq!(artifact.provenance().schema_version().get(), 1);
+        assert_eq!(
+            artifact
+                .provenance()
+                .domain_provenance()
+                .get("csstree-import"),
+            Some(&sidecar_digest)
+        );
+        assert_eq!(
+            artifact.output_path().as_str(),
+            "expectations/declaration/Case.json"
+        );
+        assert_eq!(artifact.output_digest(), &output_digest);
+    }
+
+    #[test]
+    fn css_historical_inventory_removal_rename_addition_regenerates() {
+        let mut fixture = Fixture::new(&[(
+            "old/Old.json",
+            b"{\"case\":{\"source\":\"old\",\"ast\":{}}}\n",
+            false,
+        )]);
+        fixture.set_manifest(1, 1, &[]);
+        fixture.import().expect("initial import");
+        fixture.generate().expect("initial generation");
+        assert!(fixture.corpus.join("expectations/old/Old.json").is_file());
+
+        fixture.replace_commit(&[
+            (
+                "renamed/New.json",
+                b"{\"case\":{\"source\":\"renamed\",\"ast\":{}}}\n",
+                false,
+            ),
+            (
+                "added/Added.json",
+                b"{\"case\":{\"source\":\"added\",\"ast\":{}}}\n",
+                false,
+            ),
+        ]);
+        fixture.set_manifest(2, 2, &[]);
+        fixture.import().expect("replacement import");
+        fixture.generate().expect("replacement generation");
+
+        assert!(!fixture.corpus.join("expectations/old/Old.json").exists());
+        assert!(
+            fixture
+                .corpus
+                .join("expectations/renamed/New.json")
+                .is_file()
+        );
+        assert!(
+            fixture
+                .corpus
+                .join("expectations/added/Added.json")
+                .is_file()
+        );
+        let report: GenerationReport =
+            serde_json::from_slice(&fixture.report()).expect("replacement report");
+        assert_eq!(
+            report
+                .artifacts()
+                .iter()
+                .map(|artifact| artifact.output_path().as_str())
+                .collect::<Vec<_>>(),
+            [
+                "expectations/added/Added.json",
+                "expectations/renamed/New.json"
+            ]
+        );
+    }
+
+    #[test]
+    fn css_historical_inventory_rejects_missing_or_malformed_authority() {
+        let missing = imported_generation_fixture(
+            "declaration/Case.json",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+            1,
+            &[],
+        );
+        missing.generate().expect("initial generation");
+        fs::remove_file(
+            missing
+                .corpus
+                .join("expectations/generation-reports/all.json"),
+        )
+        .expect("remove historical authority");
+        let before = snapshot_tree(&missing.corpus.join("expectations"));
+        let error = missing.generate().expect_err("missing authority");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert_eq!(snapshot_tree(&missing.corpus.join("expectations")), before);
+
+        let malformed = imported_generation_fixture(
+            "declaration/Case.json",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+            1,
+            &[],
+        );
+        malformed.generate().expect("initial generation");
+        let report_path = malformed
+            .corpus
+            .join("expectations/generation-reports/all.json");
+        let mut report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report_path).expect("report")).expect("report JSON");
+        report["counts"]["active"] = serde_json::json!(2);
+        let mut bytes = serde_json::to_vec_pretty(&report).expect("serialize malformed report");
+        bytes.push(b'\n');
+        fs::write(&report_path, bytes).expect("write malformed authority");
+        let before = snapshot_tree(&malformed.corpus.join("expectations"));
+        let error = malformed.generate().expect_err("malformed authority");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert_eq!(
+            snapshot_tree(&malformed.corpus.join("expectations")),
+            before
+        );
+    }
+
+    #[test]
+    fn css_full_generate_replaces_stale_owned_output_and_rejects_unknown_entry() {
+        let fixture = imported_generation_fixture(
+            "declaration/Case.json",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+            1,
+            &[],
+        );
+        fixture.generate().expect("initial generation");
+        let output = fixture.corpus.join("expectations/declaration/Case.json");
+        let expected = fs::read(&output).expect("current expectation");
+        fs::write(&output, b"stale but historically owned\n").expect("stale output");
+        fixture.generate().expect("replace stale output");
+        assert_eq!(fs::read(&output).expect("replaced expectation"), expected);
+
+        fs::remove_file(&output).expect("remove historically owned output");
+        fixture.generate().expect("recreate absent owned output");
+        assert_eq!(fs::read(&output).expect("recreated expectation"), expected);
+
+        fs::write(fixture.corpus.join("expectations/unknown.json"), b"{}\n")
+            .expect("unknown expectation entry");
+        let before = snapshot_tree(&fixture.corpus.join("expectations"));
+        let error = fixture.generate().expect_err("unknown output entry");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert_eq!(snapshot_tree(&fixture.corpus.join("expectations")), before);
+    }
+
+    #[test]
+    fn css_full_generate_rejects_current_import_digest_drift_without_publication() {
+        let fixture = imported_generation_fixture(
+            "declaration/Case.json",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+            1,
+            &[],
+        );
+        fs::write(
+            fixture.imported("declaration/Case.json"),
+            b"{\"case\":{\"source\":\"drift\",\"ast\":{}}}\n",
+        )
+        .expect("drift imported bytes");
+        let error = fixture.generate().expect_err("current import digest drift");
+        assert_eq!(error.kind(), GeneratorErrorKind::Verification);
+        assert!(!fixture.corpus.join("expectations").exists());
+    }
+
+    #[test]
+    fn css_full_generate_rejects_persisted_report_path_collision() {
+        let fixture = imported_generation_fixture(
+            "declaration/Case.json",
+            b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n",
+            1,
+            &[],
+        );
+        let sidecar_path = fixture.imported(".surgeist-source.json");
+        let sidecar = String::from_utf8(fs::read(&sidecar_path).expect("sidecar"))
+            .expect("UTF-8 sidecar")
+            .replace("declaration/Case.json", "generation-reports/all.json");
+        fs::write(&sidecar_path, sidecar).expect("persist colliding sidecar");
+        fs::remove_dir_all(fixture.corpus.join("source/declaration"))
+            .expect("remove original source fixture");
+        let colliding = fixture.imported("generation-reports/all.json");
+        fs::create_dir_all(colliding.parent().expect("collision parent"))
+            .expect("create collision parent");
+        fs::write(colliding, b"{\"case\":{\"source\":\"a\",\"ast\":{}}}\n")
+            .expect("write colliding fixture");
+
+        let error = fixture
+            .generate()
+            .expect_err("persisted report path collision");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert!(!fixture.corpus.join("expectations").exists());
     }
 }
