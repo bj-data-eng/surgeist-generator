@@ -384,7 +384,7 @@ fn portable_count_bounds_and_structural_report_counts_are_enforced() {
 
 #[cfg(feature = "layout-browser")]
 #[test]
-fn layout_import_public_request_is_io_free_and_accessors_are_exact() {
+fn layout_browser_free_public_requests_are_io_free_and_accessors_are_exact() {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -422,8 +422,18 @@ fn layout_import_public_request_is_io_free_and_accessors_are_exact() {
     assert_eq!(request.command(), LayoutCommand::ImportTaffy);
     assert_eq!(request.source_root(), Some(source.as_path()));
 
+    let check = LayoutRequest::check_taffy_corpus(location.clone(), source.clone())
+        .expect("I/O-free Taffy check request");
+    assert_eq!(check.location(), &location);
+    assert_eq!(check.command(), LayoutCommand::CheckTaffyCorpus);
+    assert_eq!(check.source_root(), Some(source.as_path()));
+
     let error = LayoutRequest::import_taffy(location, PathBuf::new())
         .expect_err("empty import source root");
+    assert_eq!(error.kind(), GeneratorErrorKind::Cli);
+
+    let error = LayoutRequest::check_taffy_corpus(check.location().clone(), PathBuf::new())
+        .expect_err("empty check source root");
     assert_eq!(error.kind(), GeneratorErrorKind::Cli);
 }
 

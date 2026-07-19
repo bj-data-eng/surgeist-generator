@@ -62,7 +62,7 @@ fn layout_cli_invalid_syntax_prints_exact_prefix_and_exits_64() {
 }
 
 #[test]
-fn layout_cli_import_option_matrix_precedes_io() {
+fn layout_cli_taffy_option_matrix_precedes_io() {
     for arguments in [
         vec![
             "--owner-root",
@@ -98,6 +98,24 @@ fn layout_cli_import_option_matrix_precedes_io() {
             "does-not-exist",
             "--corpus-root",
             "does-not-exist",
+            "check-taffy-corpus",
+        ],
+        vec![
+            "--owner-root",
+            "does-not-exist",
+            "--corpus-root",
+            "does-not-exist",
+            "check-taffy-corpus",
+            "--source-root",
+            "checkout",
+            "--filter",
+            "grid",
+        ],
+        vec![
+            "--owner-root",
+            "does-not-exist",
+            "--corpus-root",
+            "does-not-exist",
             "check-corpus",
         ],
         vec![
@@ -122,30 +140,32 @@ fn layout_cli_import_option_matrix_precedes_io() {
         );
     }
 
-    let accepted = Command::new(env!("CARGO_BIN_EXE_surgeist-layout-generate"))
-        .args([
-            "--owner-root",
-            "does-not-exist",
-            "--corpus-root",
-            "does-not-exist",
-            "import-taffy",
-            "--source-root",
-            "checkout",
-        ])
-        .output()
-        .expect("run packaged layout binary");
-    assert_eq!(accepted.status.code(), Some(1));
-    assert!(accepted.stdout.is_empty());
-    assert!(
-        String::from_utf8(accepted.stderr)
-            .expect("UTF-8 diagnostic")
-            .starts_with("surgeist-layout-generate: canonicalize owner root:")
-    );
+    for command in ["import-taffy", "check-taffy-corpus"] {
+        let accepted = Command::new(env!("CARGO_BIN_EXE_surgeist-layout-generate"))
+            .args([
+                "--owner-root",
+                "does-not-exist",
+                "--corpus-root",
+                "does-not-exist",
+                command,
+                "--source-root",
+                "checkout",
+            ])
+            .output()
+            .expect("run packaged layout binary");
+        assert_eq!(accepted.status.code(), Some(1));
+        assert!(accepted.stdout.is_empty());
+        assert!(
+            String::from_utf8(accepted.stderr)
+                .expect("UTF-8 diagnostic")
+                .starts_with("surgeist-layout-generate: canonicalize owner root:")
+        );
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn layout_cli_import_taffy_executes_real_public_path() {
+fn layout_cli_import_and_check_taffy_execute_real_public_paths() {
     let root = TestRoot::new();
     let owner = root.0.join("owner");
     let corpus = owner.join("corpus");
@@ -214,6 +234,48 @@ fn layout_cli_import_taffy_executes_real_public_path() {
     assert_eq!(value["source"]["revision"], revision);
     assert_eq!(value["source_file_count"], 1);
     assert_eq!(value["imported_file_count"], 1);
+
+    let imported_path = corpus.join("html/grid/basic.html");
+    let imported_identity = path_identity(&imported_path);
+    let sidecar_identity = path_identity(&corpus.join("html/.surgeist-taffy-source.json"));
+    let output = Command::new(env!("CARGO_BIN_EXE_surgeist-layout-generate"))
+        .arg("--owner-root")
+        .arg(&owner)
+        .arg("--corpus-root")
+        .arg(&corpus)
+        .arg("check-taffy-corpus")
+        .arg("--source-root")
+        .arg(&checkout)
+        .output()
+        .expect("run packaged layout Taffy check");
+    assert!(
+        output.status.success(),
+        "layout check binary failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        fs::read(&imported_path).expect("read checked fixture"),
+        b"<div>CLI fixture</div>\n"
+    );
+    assert_eq!(
+        fs::read(corpus.join("html/.surgeist-taffy-source.json")).unwrap(),
+        sidecar
+    );
+    assert_eq!(path_identity(&imported_path), imported_identity);
+    assert_eq!(
+        path_identity(&corpus.join("html/.surgeist-taffy-source.json")),
+        sidecar_identity
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn path_identity(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path).expect("path identity");
+    (metadata.dev(), metadata.ino())
 }
 
 fn manifest_text(revision: &str) -> String {

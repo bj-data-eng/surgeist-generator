@@ -1,4 +1,4 @@
-//! Browser-free Taffy import over caller-supplied corpus and checkout roots.
+//! Browser-free Taffy import and checking over explicit corpus and checkout roots.
 //!
 //! Import verifies an existing clean checkout at the manifest-owned pin. It
 //! never downloads, installs, or executes the source:
@@ -9,6 +9,19 @@
 //! # use surgeist_generator::layout::{self, LayoutRequest};
 //! # fn example(location: CorpusLocation, checkout: PathBuf) -> Result<()> {
 //! let request = LayoutRequest::import_taffy(location, checkout)?;
+//! layout::run(request)
+//! # }
+//! ```
+//!
+//! Checking verifies the checkout, persisted sidecar, and imported files without
+//! acquiring a mutation lease or repairing coordination:
+//!
+//! ```no_run
+//! # use std::path::PathBuf;
+//! # use surgeist_generator::{CorpusLocation, Result};
+//! # use surgeist_generator::layout::{self, LayoutRequest};
+//! # fn example(location: CorpusLocation, checkout: PathBuf) -> Result<()> {
+//! let request = LayoutRequest::check_taffy_corpus(location, checkout)?;
 //! layout::run(request)
 //! # }
 //! ```
@@ -30,6 +43,8 @@ mod tests;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum LayoutCommand {
+    /// Verify the manifest-pinned checkout and persisted Taffy import read-only.
+    CheckTaffyCorpus,
     /// Import the manifest-pinned Taffy `test_fixtures` tree.
     ImportTaffy,
 }
@@ -43,22 +58,30 @@ pub struct LayoutRequest {
 }
 
 impl LayoutRequest {
+    /// Constructs a read-only Taffy corpus check without filesystem access.
+    ///
+    /// The caller supplies an existing checkout. An empty source path is a
+    /// [`GeneratorErrorKind::Cli`] error.
+    pub fn check_taffy_corpus(location: CorpusLocation, source_root: PathBuf) -> Result<Self> {
+        source_request(
+            location,
+            LayoutCommand::CheckTaffyCorpus,
+            source_root,
+            "check-taffy-corpus",
+        )
+    }
+
     /// Constructs a Taffy import request without filesystem access.
     ///
     /// The caller supplies an existing checkout. An empty source path is a
     /// [`GeneratorErrorKind::Cli`] error.
     pub fn import_taffy(location: CorpusLocation, source_root: PathBuf) -> Result<Self> {
-        if source_root.as_os_str().is_empty() {
-            return Err(cli_error(
-                "construct layout request",
-                "import-taffy requires a nonempty source root",
-            ));
-        }
-        Ok(Self {
+        source_request(
             location,
-            command: LayoutCommand::ImportTaffy,
+            LayoutCommand::ImportTaffy,
             source_root,
-        })
+            "import-taffy",
+        )
     }
 
     /// Returns the explicit corpus location.
@@ -73,7 +96,7 @@ impl LayoutRequest {
         self.command
     }
 
-    /// Returns the source checkout supplied by this import request.
+    /// Returns the source checkout supplied by this Taffy request.
     #[must_use]
     pub fn source_root(&self) -> Option<&Path> {
         Some(&self.source_root)
@@ -83,6 +106,7 @@ impl LayoutRequest {
 /// Executes one browser-free layout operation synchronously.
 pub fn run(request: LayoutRequest) -> Result<()> {
     match request.command() {
+        LayoutCommand::CheckTaffyCorpus => importer::check(&request),
         LayoutCommand::ImportTaffy => importer::run(&request),
     }
 }
@@ -94,4 +118,23 @@ pub fn run_from_env() -> Result<()> {
 
 fn cli_error(operation: &str, detail: impl Into<String>) -> GeneratorError {
     GeneratorError::new(GeneratorErrorKind::Cli, operation, detail)
+}
+
+fn source_request(
+    location: CorpusLocation,
+    command: LayoutCommand,
+    source_root: PathBuf,
+    command_name: &str,
+) -> Result<LayoutRequest> {
+    if source_root.as_os_str().is_empty() {
+        return Err(cli_error(
+            "construct layout request",
+            format!("{command_name} requires a nonempty source root"),
+        ));
+    }
+    Ok(LayoutRequest {
+        location,
+        command,
+        source_root,
+    })
 }

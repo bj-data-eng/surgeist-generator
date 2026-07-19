@@ -5,6 +5,12 @@ use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, Result};
 
 use super::LayoutRequest;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Command {
+    CheckTaffyCorpus,
+    ImportTaffy,
+}
+
 pub(super) fn run_from_env() -> Result<()> {
     run_from_args(std::env::args_os().skip(1))
 }
@@ -36,7 +42,10 @@ fn run_from_args(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
             Some(value) if value.starts_with("--") => {
                 return Err(cli_error(format!("unknown flag: {value}")));
             }
-            Some("import-taffy") => set_once(&mut command, (), "layout command")?,
+            Some("check-taffy-corpus") => {
+                set_once(&mut command, Command::CheckTaffyCorpus, "layout command")?
+            }
+            Some("import-taffy") => set_once(&mut command, Command::ImportTaffy, "layout command")?,
             Some(value) => return Err(cli_error(format!("unknown layout command: {value}"))),
             None => return Err(cli_error("layout command name must be UTF-8")),
         }
@@ -44,10 +53,14 @@ fn run_from_args(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
 
     let owner_root = required_path(owner_root, "--owner-root")?;
     let corpus_root = required_path(corpus_root, "--corpus-root")?;
-    command.ok_or_else(|| cli_error("missing layout command"))?;
+    let command = command.ok_or_else(|| cli_error("missing layout command"))?;
     let source_root = required_path(source_root, "--source-root")?;
     let location = CorpusLocation::new(owner_root, corpus_root)?;
-    super::run(LayoutRequest::import_taffy(location, source_root)?)
+    let request = match command {
+        Command::CheckTaffyCorpus => LayoutRequest::check_taffy_corpus(location, source_root)?,
+        Command::ImportTaffy => LayoutRequest::import_taffy(location, source_root)?,
+    };
+    super::run(request)
 }
 
 fn next_value(arguments: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<OsString> {

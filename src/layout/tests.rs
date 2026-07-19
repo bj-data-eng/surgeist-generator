@@ -347,8 +347,9 @@ mod imports {
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use crate::core::{Domain, GenerationLease};
     use crate::layout::LayoutRequest;
-    use crate::{CorpusLocation, GeneratorErrorKind};
+    use crate::{CorpusLocation, GeneratorErrorKind, RunScope};
 
     use super::{manifest, manifest_text};
     use crate::layout::importer;
@@ -367,6 +368,17 @@ mod imports {
 
     impl Fixture {
         fn new(source_files: Vec<(&'static str, &'static [u8], bool)>) -> Self {
+            Self::new_with_object_format(source_files, false)
+        }
+
+        fn new_sha256(source_files: Vec<(&'static str, &'static [u8], bool)>) -> Self {
+            Self::new_with_object_format(source_files, true)
+        }
+
+        fn new_with_object_format(
+            source_files: Vec<(&'static str, &'static [u8], bool)>,
+            sha256: bool,
+        ) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "surgeist-generator-layout-import-{}-{}",
                 std::process::id(),
@@ -377,7 +389,18 @@ mod imports {
             let source = root.join("checkout");
             fs::create_dir_all(&corpus).expect("create corpus");
             fs::create_dir(&source).expect("create source root");
-            run_git(&source, &[OsStr::new("init"), OsStr::new("--quiet")]);
+            if sha256 {
+                run_git(
+                    &source,
+                    &[
+                        OsStr::new("init"),
+                        OsStr::new("--quiet"),
+                        OsStr::new("--object-format=sha256"),
+                    ],
+                );
+            } else {
+                run_git(&source, &[OsStr::new("init"), OsStr::new("--quiet")]);
+            }
             for (key, value) in [
                 ("user.name", "Layout Test"),
                 ("user.email", "layout@example.invalid"),
@@ -443,6 +466,15 @@ mod imports {
 
         fn import(&self) -> crate::Result<()> {
             crate::layout::run(self.request())
+        }
+
+        fn check_request(&self) -> LayoutRequest {
+            LayoutRequest::check_taffy_corpus(self.location.clone(), self.source.clone())
+                .expect("Taffy check request")
+        }
+
+        fn check(&self) -> crate::Result<()> {
+            crate::layout::run(self.check_request())
         }
 
         fn seed_authored(&self) {
@@ -572,6 +604,52 @@ mod imports {
     fn path_identity(path: &Path) -> (u64, u64) {
         let metadata = fs::symlink_metadata(path).expect("path identity");
         (metadata.dev(), metadata.ino())
+    }
+
+    fn snapshot_path_identities(root: &Path) -> BTreeMap<PathBuf, (u64, u64)> {
+        fn visit(base: &Path, current: &Path, output: &mut BTreeMap<PathBuf, (u64, u64)>) {
+            let metadata = fs::symlink_metadata(current).expect("snapshot path identity");
+            output.insert(
+                current
+                    .strip_prefix(base)
+                    .expect("relative snapshot identity path")
+                    .to_path_buf(),
+                (metadata.dev(), metadata.ino()),
+            );
+            if metadata.is_dir() {
+                let mut entries = fs::read_dir(current)
+                    .expect("read identity snapshot directory")
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .expect("identity snapshot entries");
+                entries.sort_by_key(fs::DirEntry::file_name);
+                for entry in entries {
+                    visit(base, &entry.path(), output);
+                }
+            }
+        }
+
+        let mut output = BTreeMap::new();
+        visit(root, root, &mut output);
+        output
+    }
+
+    fn assert_check_preserves(fixture: &Fixture, expected: Option<GeneratorErrorKind>) {
+        let before_bytes = snapshot_tree(&fixture.root);
+        let before_identities = snapshot_path_identities(&fixture.root);
+        let before_root_identity = path_identity(&fixture.root);
+
+        let result = fixture.check();
+        match expected {
+            Some(kind) => {
+                let error = result.expect_err("Taffy corpus check must reject state");
+                assert_eq!(error.kind(), kind, "unexpected check diagnostic: {error}");
+            }
+            None => result.expect("Taffy corpus check must accept current state"),
+        }
+
+        assert_eq!(snapshot_tree(&fixture.root), before_bytes);
+        assert_eq!(snapshot_path_identities(&fixture.root), before_identities);
+        assert_eq!(path_identity(&fixture.root), before_root_identity);
     }
 
     fn sidecar_paths(fixture: &Fixture) -> BTreeSet<String> {
@@ -853,5 +931,176 @@ mod imports {
                 .join("html/.surgeist-taffy-source.json")
                 .exists()
         );
+    }
+
+    #[test]
+    fn layout_check_taffy_matching_sha1_and_sha256_imports_are_read_only() {
+        for fixture in [
+            Fixture::new(vec![("grid/sha1.html", b"sha1\n", false)]),
+            Fixture::new_sha256(vec![("grid/sha256.html", b"sha256\n", false)]),
+        ] {
+            fixture.import().expect("seed current Taffy import");
+            fs::remove_dir_all(fixture.corpus.join(".surgeist-generator"))
+                .expect("remove completed coordination before read-only check");
+            fs::write(
+                fixture.root.join("outside-sentinel"),
+                b"outside bytes remain unchanged\n",
+            )
+            .expect("write outside sentinel");
+
+            assert_check_preserves(&fixture, None);
+            assert!(!fixture.corpus.join(".surgeist-generator").exists());
+        }
+    }
+
+    #[test]
+    fn layout_check_taffy_checkout_pin_object_and_snapshot_drift_are_source_verification() {
+        let dirty = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
+        dirty.import().expect("seed current import");
+        fs::write(
+            dirty.source.join("test_fixtures/grid/current.html"),
+            b"dirty source bytes\n",
+        )
+        .expect("drift source snapshot");
+        assert_check_preserves(&dirty, Some(GeneratorErrorKind::SourceVerification));
+
+        let pin_drift = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
+        pin_drift.import().expect("seed current import");
+        write_source_files(
+            &pin_drift.source,
+            &[("grid/added.html", b"new commit\n", false)],
+        );
+        run_git(&pin_drift.source, &[OsStr::new("add"), OsStr::new("--all")]);
+        run_git(
+            &pin_drift.source,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("--quiet"),
+                OsStr::new("-m"),
+                OsStr::new("advance checkout without manifest"),
+            ],
+        );
+        assert_check_preserves(&pin_drift, Some(GeneratorErrorKind::SourceVerification));
+
+        let sha1 = Fixture::new(vec![("grid/sha1.html", b"sha1\n", false)]);
+        sha1.import().expect("seed SHA-1 import");
+        let sha256 = Fixture::new_sha256(vec![("grid/sha256.html", b"sha256\n", false)]);
+        let before_bytes = snapshot_tree(&sha1.root);
+        let before_identities = snapshot_path_identities(&sha1.root);
+        let request =
+            LayoutRequest::check_taffy_corpus(sha1.location.clone(), sha256.source.clone())
+                .expect("cross-format check request");
+        let error = crate::layout::run(request).expect_err("object-format/pin drift");
+        assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+        assert_eq!(snapshot_tree(&sha1.root), before_bytes);
+        assert_eq!(snapshot_path_identities(&sha1.root), before_identities);
+    }
+
+    #[test]
+    fn layout_check_taffy_absent_and_stale_known_imports_are_verification() {
+        let absent = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
+        assert_check_preserves(&absent, Some(GeneratorErrorKind::Verification));
+
+        let missing = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
+        missing.import().expect("seed current import");
+        fs::remove_file(missing.corpus.join("html/grid/current.html"))
+            .expect("remove known imported fixture");
+        assert_check_preserves(&missing, Some(GeneratorErrorKind::Verification));
+
+        let stale = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
+        stale.import().expect("seed current import");
+        fs::write(
+            stale.corpus.join("html/grid/current.html"),
+            b"stale imported bytes\n",
+        )
+        .expect("drift imported fixture bytes");
+        assert_check_preserves(&stale, Some(GeneratorErrorKind::Verification));
+    }
+
+    #[test]
+    fn layout_check_taffy_malformed_and_unknown_inventory_are_invalid_inventory() {
+        let malformed = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
+        malformed.import().expect("seed current import");
+        fs::write(
+            malformed.corpus.join("html/.surgeist-taffy-source.json"),
+            b"{}\n",
+        )
+        .expect("malform Taffy sidecar");
+        assert_check_preserves(&malformed, Some(GeneratorErrorKind::InvalidInventory));
+
+        let unknown = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
+        unknown.import().expect("seed current import");
+        write_corpus_file(&unknown.corpus.join("html/unknown.html"), b"unknown\n");
+        assert_check_preserves(&unknown, Some(GeneratorErrorKind::InvalidInventory));
+    }
+
+    #[test]
+    fn layout_read_only_taffy_coordination_states_are_verification_and_byte_identical() {
+        let active = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
+        active.import().expect("seed current import");
+        let lease = GenerationLease::acquire(
+            &active.location,
+            Domain::Layout,
+            "surgeist-layout-generate",
+            &RunScope::Full,
+            "import-taffy",
+        )
+        .expect("hold active exclusive layout lease");
+        assert_check_preserves(&active, Some(GeneratorErrorKind::Verification));
+        drop(lease);
+
+        let resumable = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
+        resumable.import().expect("seed current import");
+        let active_transaction = resumable
+            .corpus
+            .join(".surgeist-generator/transactions/layout/active-read-only-test");
+        fs::create_dir(&active_transaction).expect("create resumable transaction residue");
+        fs::set_permissions(&active_transaction, fs::Permissions::from_mode(0o700))
+            .expect("set private residue mode");
+        assert_check_preserves(&resumable, Some(GeneratorErrorKind::Verification));
+
+        let malformed = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
+        malformed.import().expect("seed current import");
+        fs::write(
+            malformed
+                .corpus
+                .join(".surgeist-generator/acquisition.lock"),
+            b"malformed lock header\n",
+        )
+        .expect("malform immutable acquisition lock");
+        assert_check_preserves(&malformed, Some(GeneratorErrorKind::Verification));
+    }
+
+    #[test]
+    fn layout_taffy_pin_and_count_update_requires_reimport_not_generator_change() {
+        let mut fixture = Fixture::new(vec![("grid/first.html", b"first\n", false)]);
+        fixture.import().expect("import first manifest-owned pair");
+        fixture.check().expect("check first manifest-owned pair");
+        let first_sidecar = fs::read(fixture.corpus.join("html/.surgeist-taffy-source.json"))
+            .expect("read first sidecar");
+
+        fixture.replace_source(vec![
+            ("grid/second.html", b"second\n", false),
+            ("nested/third.html", b"third\n", false),
+        ]);
+        assert_check_preserves(&fixture, Some(GeneratorErrorKind::Verification));
+        assert_eq!(
+            fs::read(fixture.corpus.join("html/.surgeist-taffy-source.json"))
+                .expect("old sidecar remains"),
+            first_sidecar
+        );
+
+        fixture
+            .import()
+            .expect("reimport second manifest-owned pair");
+        assert_check_preserves(&fixture, None);
+        let second_sidecar = fs::read(fixture.corpus.join("html/.surgeist-taffy-source.json"))
+            .expect("read second sidecar");
+        let value: serde_json::Value =
+            serde_json::from_slice(&second_sidecar).expect("second sidecar JSON");
+        assert_ne!(second_sidecar, first_sidecar);
+        assert_eq!(value["source"]["revision"], fixture.revision);
+        assert_eq!(value["source_file_count"], 2);
+        assert_eq!(value["imported_file_count"], 2);
     }
 }
