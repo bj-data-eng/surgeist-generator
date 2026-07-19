@@ -3,8 +3,7 @@
 ## Header
 
 - Repository: `/Users/codex/Development/surgeist-generator`.
-- Status: `proposed`; no implementation may begin before this specification and
-  its implementation sequence independently receive `CLEAN` planning reviews.
+- Status: `proposed`.
 - Immutable implementation-series base:
   `1e545530fb992e2e749f26a1ba7ac0d77ed85dd6`.
 - First planning artifact: committed baseline review
