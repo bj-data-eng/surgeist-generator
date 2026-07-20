@@ -1085,7 +1085,7 @@ fn layout_check_accepts_self_consistent_historical_browser_attestation_rewrite()
 #[test]
 fn layout_read_only_corpus_coordination_states_are_verification_and_byte_identical() {
     let active = Fixture::current();
-    let lease = GenerationLease::acquire(
+    let lease = GenerationLease::acquire_for_test(
         &active.location,
         Domain::Layout,
         "surgeist-layout-generate",
@@ -1118,7 +1118,7 @@ fn layout_read_only_corpus_coordination_states_are_verification_and_byte_identic
 #[test]
 fn layout_stale_freshness_precedes_active_coordination() {
     let fixture = Fixture::current();
-    let lease = GenerationLease::acquire(
+    let lease = GenerationLease::acquire_for_test(
         &fixture.location,
         Domain::Layout,
         "surgeist-layout-generate",

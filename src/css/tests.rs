@@ -3256,7 +3256,7 @@ mod imports {
     #[test]
     fn css_read_only_coordination_states_are_verification_and_byte_identical() {
         let active = current_check_fixture();
-        let lease = GenerationLease::acquire(
+        let lease = GenerationLease::acquire_for_test(
             &active.location,
             Domain::Css,
             "surgeist-css-generate",

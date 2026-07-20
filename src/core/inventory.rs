@@ -15,7 +15,6 @@ const INVENTORY_SCHEMA_VERSION: u8 = 1;
 pub(crate) enum InventoryPolicy {
     FinalCorpus,
     ConstructionCorpus,
-    Private,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -70,31 +69,6 @@ impl InventoryEntry {
         })
     }
 
-    pub(crate) fn symlink(
-        path: RelativePath,
-        identity: HeldIdentity,
-        target: Vec<u8>,
-    ) -> Result<Self> {
-        if identity.kind() != NodeKind::Symlink || identity.link_count() != Some(1) {
-            return Err(inventory_error(
-                "construct inventory symbolic link",
-                format!("symbolic-link identity is invalid: {}", path.as_str()),
-            ));
-        }
-        Ok(Self {
-            path,
-            identity,
-            length: Some(u64::try_from(target.len()).map_err(|_| {
-                inventory_error(
-                    "construct inventory symbolic link",
-                    "symbolic-link target exceeds u64",
-                )
-            })?),
-            digest: Some(Sha256Digest::from_bytes(&target)),
-            link_target: Some(target),
-        })
-    }
-
     pub(crate) const fn path(&self) -> &RelativePath {
         &self.path
     }
@@ -103,20 +77,9 @@ impl InventoryEntry {
         &self.identity
     }
 
-    pub(crate) const fn link_count(&self) -> Option<u64> {
-        self.identity.link_count()
-    }
-
-    pub(crate) const fn length(&self) -> Option<u64> {
-        self.length
-    }
-
+    #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
     pub(crate) const fn digest(&self) -> Option<&Sha256Digest> {
         self.digest.as_ref()
-    }
-
-    pub(crate) fn link_target(&self) -> Option<&[u8]> {
-        self.link_target.as_deref()
     }
 
     fn validate_shape(&self) -> Result<()> {
@@ -281,6 +244,7 @@ impl Inventory {
         &self.entries
     }
 
+    #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
     pub(crate) fn find(&self, path: &RelativePath) -> Option<&InventoryEntry> {
         self.entries
             .binary_search_by(|entry| entry.path.cmp(path))
@@ -437,12 +401,6 @@ fn validate_policy_identity(
             matches!(identity.mode(), PRIVATE_FILE_MODE | CORPUS_FILE_MODE)
                 && identity.link_count() == Some(1)
         }
-        (InventoryPolicy::Private, NodeKind::Directory) => {
-            identity.mode() == PRIVATE_DIRECTORY_MODE
-        }
-        (InventoryPolicy::Private, NodeKind::Regular) => {
-            identity.mode() == PRIVATE_FILE_MODE && identity.link_count() == Some(1)
-        }
         (_, NodeKind::Symlink) => false,
     };
     if !valid || (directory_position && identity.kind() != NodeKind::Directory) {
@@ -496,7 +454,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(inventory.entries()[0].path().as_str(), "nested");
-        assert_eq!(inventory.entries()[0].link_count(), None);
+        assert_eq!(inventory.entries()[0].identity().link_count(), None);
         assert!(inventory.canonical_bytes().unwrap().ends_with(b"\n"));
         assert!(inventory.is_exact_remaining_subset_of(&inventory).is_ok());
 

@@ -162,7 +162,7 @@ impl GenerationHarness {
     }
 
     fn lease(&self) -> GenerationLease {
-        GenerationLease::acquire(
+        GenerationLease::acquire_for_test(
             &self.location,
             Domain::Layout,
             "surgeist-layout-generate",

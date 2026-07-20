@@ -199,18 +199,15 @@ impl VerifiedSource {
     }
 }
 
+#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
 #[derive(Debug)]
 pub(crate) struct ProtectedSource {
-    verified: VerifiedSource,
     snapshot: VerifiedSourceSnapshot,
     protection: SourceProtection,
 }
 
+#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
 impl ProtectedSource {
-    pub(crate) const fn verified(&self) -> &VerifiedSource {
-        &self.verified
-    }
-
     pub(crate) const fn snapshot(&self) -> &VerifiedSourceSnapshot {
         &self.snapshot
     }
@@ -221,10 +218,6 @@ impl ProtectedSource {
 
     pub(crate) fn closing_revalidate(&self) -> Result<()> {
         revalidate_protection(&self.protection)
-    }
-
-    fn into_verified(self) -> VerifiedSource {
-        self.verified
     }
 }
 
@@ -261,7 +254,6 @@ impl ProtectedSourceInventory {
             }
         }
         Ok(ProtectedSource {
-            verified: self.verified,
             snapshot,
             protection: self.protection,
         })
@@ -444,6 +436,7 @@ pub(crate) struct SourceProtection {
 }
 
 impl SourceProtection {
+    #[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
     fn namespaces(&self) -> impl Iterator<Item = (&'static str, &Path)> {
         self.authorities
             .iter()
@@ -566,9 +559,25 @@ struct TrustedGit {
 
 /// Verifies an existing Git checkout without fetching or mutating Git state.
 pub fn verify_git_source(checkout: impl AsRef<Path>, pin: &PinnedSource) -> Result<VerifiedSource> {
-    verify_protected_git_source(checkout.as_ref(), pin).map(ProtectedSource::into_verified)
+    verify_git_source_proof(
+        checkout.as_ref(),
+        pin,
+        None,
+        verify_raw_cleanliness,
+        build_snapshot,
+    )
+    .map(|proof| {
+        let ProtectedSourceProof {
+            verified,
+            snapshot,
+            protection,
+        } = proof;
+        drop((snapshot, protection));
+        verified
+    })
 }
 
+#[cfg(test)]
 pub(crate) fn verify_protected_git_source(
     checkout: &Path,
     pin: &PinnedSource,
@@ -615,6 +624,7 @@ where
     verify_git_source_impl(checkout.as_ref(), pin, Some(Box::new(hook)))
 }
 
+#[cfg(test)]
 fn verify_git_source_impl(
     checkout: &Path,
     pin: &PinnedSource,
@@ -628,7 +638,6 @@ fn verify_git_source_impl(
         build_snapshot,
     )?;
     Ok(ProtectedSource {
-        verified: proof.verified,
         snapshot: proof.snapshot,
         protection: proof.protection,
     })
@@ -3012,13 +3021,10 @@ mod tests {
                 .expect("protected recursive source");
 
         let leaf_root = fs::canonicalize(leaf.path()).expect("canonical leaf worktree");
-        assert_eq!(protected.verified().canonical_root(), leaf_root);
-        assert_eq!(protected.verified().revision(), &revision);
         assert_eq!(protected.snapshot().entries.len(), 1);
         assert_eq!(protected.snapshot().entries[0].bytes, b"{}\n");
         let public = verify_git_source(leaf.path(), &pin(&origin, revision.clone(), "fixtures"))
             .expect("unchanged public source proof");
-        assert_eq!(&public, protected.verified());
         let public_debug = format!("{public:?}");
         assert!(!public_debug.contains("snapshot:"));
         assert!(!public_debug.contains("protection:"));
@@ -3067,6 +3073,8 @@ mod tests {
         )
         .expect_err("writable root beneath a protected object store must fail");
         assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
+        assert_eq!(public.canonical_root(), leaf_root);
+        assert_eq!(public.revision(), &revision);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

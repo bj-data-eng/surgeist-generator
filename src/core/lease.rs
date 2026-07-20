@@ -20,17 +20,6 @@ pub(crate) struct GenerationLease {
 }
 
 impl GenerationLease {
-    /// Acquires a corpus-local exclusive lease after all coordination recovery.
-    pub(crate) fn acquire(
-        location: &CorpusLocation,
-        domain: Domain,
-        generator: &str,
-        scope: &RunScope,
-        command: &str,
-    ) -> Result<Self> {
-        Self::acquire_with_revalidation(location, domain, generator, scope, command, |_| Ok(()))
-    }
-
     /// Acquires a lease and performs a final protected-source check while locked.
     pub(crate) fn acquire_with_revalidation(
         location: &CorpusLocation,
@@ -128,6 +117,19 @@ impl GenerationLease {
         let metadata = LeaseMetadata::new(generator, scope, command)?;
         acquire_exclusive_controlled(location, domain, metadata, protected_revalidation, control)
             .map(|guard| Self { guard })
+    }
+}
+
+#[cfg(test)]
+impl GenerationLease {
+    pub(crate) fn acquire_for_test(
+        location: &CorpusLocation,
+        domain: Domain,
+        generator: &str,
+        scope: &RunScope,
+        command: &str,
+    ) -> Result<Self> {
+        Self::acquire_with_revalidation(location, domain, generator, scope, command, |_| Ok(()))
     }
 }
 
@@ -287,7 +289,7 @@ mod tests {
     #[test]
     fn distinct_owner_ancestors_for_one_corpus_contend_on_the_corpus_mutex() {
         let (_temporary, outer, inner) = locations();
-        let held = GenerationLease::acquire(
+        let held = GenerationLease::acquire_for_test(
             &outer,
             Domain::Layout,
             "layout-generator",
@@ -295,7 +297,7 @@ mod tests {
             "generate",
         )
         .expect("first lease");
-        let error = GenerationLease::acquire(
+        let error = GenerationLease::acquire_for_test(
             &inner,
             Domain::Layout,
             "layout-generator",
@@ -311,7 +313,7 @@ mod tests {
     fn two_shared_checks_are_read_only_and_can_coexist() {
         let (_temporary, outer, _) = locations();
         drop(
-            GenerationLease::acquire(
+            GenerationLease::acquire_for_test(
                 &outer,
                 Domain::Layout,
                 "layout-generator",
@@ -331,7 +333,7 @@ mod tests {
     #[test]
     fn binding_rejects_release_and_a_later_reacquisition() {
         let (_temporary, outer, _) = locations();
-        let first = GenerationLease::acquire(
+        let first = GenerationLease::acquire_for_test(
             &outer,
             Domain::Layout,
             "layout-generator",
@@ -346,7 +348,7 @@ mod tests {
         assert_eq!(binding.canonical_corpus, outer.corpus_root());
         assert!(binding.validate(&outer, Domain::Layout).is_ok());
         drop(first);
-        let second = GenerationLease::acquire(
+        let second = GenerationLease::acquire_for_test(
             &outer,
             Domain::Layout,
             "layout-generator",
@@ -367,7 +369,7 @@ mod tests {
     #[test]
     fn validated_binding_pins_the_os_mutex_until_the_operation_finishes() {
         let (_temporary, outer, _) = locations();
-        let first = GenerationLease::acquire(
+        let first = GenerationLease::acquire_for_test(
             &outer,
             Domain::Layout,
             "layout-generator",
@@ -380,7 +382,7 @@ mod tests {
             .validate(&outer, Domain::Layout)
             .expect("validated operation");
         drop(first);
-        let error = GenerationLease::acquire(
+        let error = GenerationLease::acquire_for_test(
             &outer,
             Domain::Layout,
             "layout-generator",
@@ -391,7 +393,7 @@ mod tests {
         assert_eq!(error.kind(), GeneratorErrorKind::LeaseActive);
         drop(operation);
         drop(
-            GenerationLease::acquire(
+            GenerationLease::acquire_for_test(
                 &outer,
                 Domain::Layout,
                 "layout-generator",
@@ -405,7 +407,7 @@ mod tests {
     #[test]
     fn one_acquisition_serializes_in_process_transactions() {
         let (_temporary, outer, _) = locations();
-        let lease = GenerationLease::acquire(
+        let lease = GenerationLease::acquire_for_test(
             &outer,
             Domain::Layout,
             "layout-generator",
@@ -458,7 +460,7 @@ mod tests {
         )
         .expect("seed acquisition domain artifact");
         drop(
-            GenerationLease::acquire(
+            GenerationLease::acquire_for_test(
                 location,
                 Domain::Layout,
                 "layout-generator",
@@ -600,7 +602,7 @@ mod tests {
                 .is_none()
         );
         drop(
-            GenerationLease::acquire(
+            GenerationLease::acquire_for_test(
                 &outer,
                 Domain::Layout,
                 "layout-generator",
@@ -682,7 +684,7 @@ mod tests {
                 .is_none()
         );
         drop(
-            GenerationLease::acquire(
+            GenerationLease::acquire_for_test(
                 &cleanup_location,
                 Domain::Layout,
                 "layout-generator",

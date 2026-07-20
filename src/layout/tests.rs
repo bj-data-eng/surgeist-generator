@@ -1860,7 +1860,7 @@ mod imports {
     fn layout_read_only_taffy_coordination_states_are_verification_and_byte_identical() {
         let active = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
         active.import().expect("seed current import");
-        let lease = GenerationLease::acquire(
+        let lease = GenerationLease::acquire_for_test(
             &active.location,
             Domain::Layout,
             "surgeist-layout-generate",

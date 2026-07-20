@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as _;
 
-use crate::{
-    CorpusLocation, GeneratorError, GeneratorErrorKind, RelativePath, Result, Sha256Digest,
-};
+#[cfg(any(test, feature = "layout-browser"))]
+use crate::Sha256Digest;
+use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, RelativePath, Result};
 
 use super::coordination::{Domain, new_token};
 use super::fs::{CORPUS_FILE_MODE, NodeKind};
@@ -17,6 +17,7 @@ use super::transaction::{StagedTree, TransactionEngine, TransactionRequest};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PublicationPolicy {
     CleanFull,
+    #[cfg(any(test, feature = "layout-browser"))]
     DiagnosticFull,
     Filtered,
 }
@@ -66,6 +67,7 @@ impl PublicationInventory {
 #[derive(Clone, Debug)]
 struct PlannedArtifact {
     bytes: Vec<u8>,
+    #[cfg(any(test, feature = "layout-browser"))]
     digest: Sha256Digest,
 }
 
@@ -79,7 +81,7 @@ pub(crate) struct ArtifactPlan {
     policy: PublicationPolicy,
     inventory: PublicationInventory,
     artifacts: BTreeMap<RelativePath, PlannedArtifact>,
-    #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+    #[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
     transaction_token: Option<String>,
 }
 
@@ -144,6 +146,7 @@ impl ArtifactPlan {
                 return Err(plan_error("filtered publication cannot write a report"));
             }
             let artifact = PlannedArtifact {
+                #[cfg(any(test, feature = "layout-browser"))]
                 digest: Sha256Digest::from_bytes(&bytes),
                 bytes,
             };
@@ -171,7 +174,7 @@ impl ArtifactPlan {
             policy,
             inventory,
             artifacts: planned,
-            #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+            #[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
             transaction_token: None,
         })
     }
@@ -192,11 +195,6 @@ impl ArtifactPlan {
         Ok(self)
     }
 
-    /// Installs the complete new unit through one EXCL or SWAP root transition.
-    pub(crate) fn install(&self) -> Result<()> {
-        self.install_impl(|_| Ok(()), None)
-    }
-
     /// Revalidates domain-owned read authorities at the last pre-intent boundary.
     #[cfg(all(any(feature = "css-corpus", feature = "layout-browser"), not(test)))]
     pub(crate) fn install_with_revalidation(
@@ -207,7 +205,7 @@ impl ArtifactPlan {
         self.install_impl(pre_intent_revalidation, transaction_token)
     }
 
-    #[cfg(all(test, any(feature = "css-corpus", feature = "layout-browser")))]
+    #[cfg(test)]
     pub(crate) fn install_with_revalidation_and_inter_scan_hook(
         self,
         pre_intent_revalidation: impl FnOnce(&super::fs::RootedFs) -> Result<()>,
@@ -217,6 +215,7 @@ impl ArtifactPlan {
         self.install_impl_inner(pre_intent_revalidation, transaction_token, inter_scan_hook)
     }
 
+    #[cfg(not(test))]
     fn install_impl(
         &self,
         pre_intent_revalidation: impl FnOnce(&super::fs::RootedFs) -> Result<()>,
@@ -309,6 +308,7 @@ impl ArtifactPlan {
         })
     }
 
+    #[cfg(any(test, feature = "layout-browser"))]
     pub(crate) fn artifact_digest(&self, path: &RelativePath) -> Option<&Sha256Digest> {
         self.artifacts.get(path).map(|artifact| &artifact.digest)
     }
@@ -440,7 +440,7 @@ mod tests {
         }
 
         fn lease(&self) -> GenerationLease {
-            GenerationLease::acquire(
+            GenerationLease::acquire_for_test(
                 &self.location,
                 Domain::Layout,
                 "layout-generator",
@@ -491,7 +491,9 @@ mod tests {
         .expect("plan");
         drop(lease);
         let before = snapshot(fixture.location.corpus_root());
-        let error = plan.install().expect_err("released lease");
+        let error = plan
+            .install_with_revalidation_and_inter_scan_hook(|_| Ok(()), || {})
+            .expect_err("released lease");
         assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
         assert_eq!(snapshot(fixture.location.corpus_root()), before);
     }
@@ -519,7 +521,8 @@ mod tests {
             plan.artifact_digest(&path("new.xml")),
             Some(&crate::Sha256Digest::from_bytes(b"new"))
         );
-        plan.install().expect("install clean plan");
+        plan.install_with_revalidation_and_inter_scan_hook(|_| Ok(()), || {})
+            .expect("install clean plan");
         assert_eq!(fixture.read("keep.xml"), b"keep");
         assert_eq!(fixture.read("new.xml"), b"new");
         assert!(
@@ -553,7 +556,7 @@ mod tests {
             ),
         )
         .expect("diagnostic plan")
-        .install()
+        .install_with_revalidation_and_inter_scan_hook(|_| Ok(()), || {})
         .expect("install diagnostic plan");
         assert!(
             !fixture
@@ -605,7 +608,7 @@ mod tests {
             classification(),
         )
         .expect("filtered plan")
-        .install()
+        .install_with_revalidation_and_inter_scan_hook(|_| Ok(()), || {})
         .expect("install filtered plan");
         assert_eq!(fixture.read("matched.xml"), b"new");
         assert_eq!(fixture.read("stale.xml"), b"stale");
@@ -627,7 +630,9 @@ mod tests {
             inventory(&["new.xml"], &["new.xml"], &[]),
         )
         .expect("plan");
-        let error = plan.install().expect_err("unknown inventory");
+        let error = plan
+            .install_with_revalidation_and_inter_scan_hook(|_| Ok(()), || {})
+            .expect_err("unknown inventory");
         assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
         let transactions = fixture
             .location
