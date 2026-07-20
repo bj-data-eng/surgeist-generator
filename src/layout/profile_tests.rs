@@ -1,6 +1,6 @@
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
@@ -8,18 +8,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::core::{
-    Domain, GenerationLease, ObjectFormat, PRIVATE_FILE_MODE, RootedFs, SnapshotEntry,
-    VerifiedSourceSnapshot,
+    Domain, DurabilityEvent, DurabilityPhase, DurabilityPrimitive, GenerationLease, ObjectFormat,
+    PRIVATE_FILE_MODE, RootedFs, RootedObserver, SnapshotEntry, VerifiedSourceSnapshot,
 };
 use crate::{
-    CorpusLocation, GeneratorError, GeneratorErrorKind, PinnedSource, RelativePath, RunScope,
-    Sha256Digest, SourceRevision,
+    CorpusLocation, GeneratorErrorKind, PinnedSource, RelativePath, RunScope, Sha256Digest,
+    SourceRevision,
 };
 
 use super::browser::TrustedBrowser;
 use super::measurement::{TestBrowserPlan, TestGenerationHost};
 use super::profile::{
-    PROFILE_PARENT, ProfileAttempt, ProfileCreateContext, ProfileCreateStep, ProfileJournal,
+    PROFILE_PARENT, ProfileAttempt, ProfileCreateContext, ProfileJournal, classify_pending,
     force_kill_group, test_cleanup_path, test_group_is_dead, test_validate_journal_name,
 };
 use super::supervisor::TestBrowserMode;
@@ -137,12 +137,27 @@ impl GenerationHarness {
         (result, host)
     }
 
+    fn replace_fixture(&self, relative: &str, bytes: &[u8]) {
+        fs::remove_file(self.corpus().join("html/grid/basic.html"))
+            .expect("remove original fixture");
+        write(&self.corpus().join("html").join(relative), bytes);
+        write(
+            &self.corpus().join("html").join(manifest::SIDECAR_FILE),
+            &sidecar_bytes_for(relative, bytes),
+        );
+    }
+
     fn check(&self) -> crate::Result<()> {
         super::run(LayoutRequest::check_corpus(self.location.clone()))
     }
 
     fn rooted(&self) -> RootedFs {
         RootedFs::open_corpus(&self.location).expect("open generation corpus")
+    }
+
+    fn observed_rooted(&self, observer: RootedObserver) -> RootedFs {
+        RootedFs::open_corpus_observed(&self.location, observer)
+            .expect("open observed generation corpus")
     }
 
     fn lease(&self) -> GenerationLease {
@@ -182,6 +197,28 @@ impl GenerationHarness {
             },
         )
         .expect("create real version profile journal")
+    }
+
+    fn observed_version_journal(
+        &self,
+        lease: &GenerationLease,
+        rooted: &RootedFs,
+    ) -> ProfileJournal {
+        let manifest = self.parsed_manifest();
+        let browser = self.trusted_browser(&manifest);
+        ProfileJournal::create_observed(
+            ProfileCreateContext {
+                location: &self.location,
+                lease,
+                browser: &browser,
+                manifest: &manifest,
+            },
+            ProfileAttempt::Version {
+                launch_strings: vec!["version".to_owned()],
+            },
+            rooted,
+        )
+        .expect("create observed version profile journal")
     }
 
     fn spawn_supervisor(&self, journal: &ProfileJournal, mode: TestBrowserMode) -> Child {
@@ -432,42 +469,195 @@ fn layout_profile_transition_lock_closes_launch_race() {
 #[test]
 #[ignore = "exhaustive durability-prefix diagnostic requires separate authorization"]
 fn layout_profile_cleanup_every_prefix_recovers() {
-    for stop_after in ProfileCreateStep::ALL {
+    let trace_harness = GenerationHarness::new();
+    let lifecycle_observer = RootedObserver::recording();
+    run_observed_profile_lifecycle(&trace_harness, lifecycle_observer.clone())
+        .expect("record complete production profile lifecycle");
+    let lifecycle_trace = normalized_events(&lifecycle_observer.events());
+    assert!(!lifecycle_trace.is_empty());
+
+    for event_index in 0..lifecycle_trace.len() {
         let harness = GenerationHarness::new();
-        let lease = harness.lease();
-        let manifest = harness.parsed_manifest();
-        let browser = harness.trusted_browser(&manifest);
-        let error = ProfileJournal::create_observed(
-            ProfileCreateContext {
-                location: &harness.location,
-                lease: &lease,
-                browser: &browser,
-                manifest: &manifest,
-            },
-            ProfileAttempt::Version {
-                launch_strings: vec!["version".to_owned()],
-            },
-            |step| {
-                if step == stop_after {
-                    Err(GeneratorError::new(
-                        GeneratorErrorKind::ArtifactTransaction,
-                        "interrupt layout profile creation prefix",
-                        format!("interrupted after {step:?}"),
-                    ))
-                } else {
-                    Ok(())
-                }
-            },
-        )
-        .expect_err("selected prefix must interrupt journal creation");
-        assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
-        drop(lease);
+        let observer = RootedObserver::interrupt_after(event_index);
+        let interrupted = catch_unwind(AssertUnwindSafe(|| {
+            run_observed_profile_lifecycle(&harness, observer.clone())
+        }))
+        .expect_err("selected production lifecycle event must interrupt");
+        assert!(RootedObserver::is_interruption(interrupted.as_ref()));
+        assert_eq!(
+            normalized_events(&observer.events()),
+            lifecycle_trace[..=event_index]
+        );
         harness
             .run(TestBrowserPlan::Success)
             .0
-            .expect("fresh generation recovers interrupted prefix");
+            .expect("fresh generation recovers interrupted lifecycle prefix");
         harness.assert_terminal();
     }
+
+    let recovery_trace_harness = GenerationHarness::new();
+    recovery_trace_harness.abandon_dead_journal();
+    let recovery_observer = RootedObserver::recording();
+    run_observed_profile_recovery(&recovery_trace_harness, recovery_observer.clone())
+        .expect("record complete production profile recovery");
+    let recovery_trace = normalized_events(&recovery_observer.events());
+    assert!(!recovery_trace.is_empty());
+
+    for event_index in 0..recovery_trace.len() {
+        let harness = GenerationHarness::new();
+        harness.abandon_dead_journal();
+        let observer = RootedObserver::interrupt_after(event_index);
+        let interrupted = catch_unwind(AssertUnwindSafe(|| {
+            run_observed_profile_recovery(&harness, observer.clone())
+        }))
+        .expect_err("selected production recovery event must interrupt");
+        assert!(RootedObserver::is_interruption(interrupted.as_ref()));
+        assert_eq!(
+            normalized_events(&observer.events()),
+            recovery_trace[..=event_index]
+        );
+        harness
+            .run(TestBrowserPlan::Success)
+            .0
+            .expect("fresh generation recovers interrupted recovery prefix");
+        harness.assert_terminal();
+    }
+}
+
+#[test]
+fn layout_profile_durability_trace_registers_complete_production_lifecycle() {
+    let harness = GenerationHarness::new();
+    let lifecycle_observer = RootedObserver::recording();
+    run_observed_profile_lifecycle(&harness, lifecycle_observer.clone())
+        .expect("record production profile lifecycle");
+    let lifecycle = lifecycle_observer.events();
+
+    for phase in [
+        DurabilityPhase::ProfileCreate,
+        DurabilityPhase::ProfileRunningPublication,
+        DurabilityPhase::ProfileTerminalization,
+    ] {
+        assert!(
+            lifecycle.iter().any(|event| event.phase() == phase),
+            "missing profile durability phase {phase:?}"
+        );
+    }
+    assert_profile_event(
+        &lifecycle,
+        DurabilityPhase::ProfileCreate,
+        DurabilityPrimitive::WritePartial,
+        "intent.json.temporary",
+    );
+    assert_profile_event(
+        &lifecycle,
+        DurabilityPhase::ProfileCreate,
+        DurabilityPrimitive::RenameExclusive,
+        "intent.json",
+    );
+    assert_profile_event(
+        &lifecycle,
+        DurabilityPhase::ProfileRunningPublication,
+        DurabilityPrimitive::RenameExclusive,
+        "running.json",
+    );
+    assert_profile_event(
+        &lifecycle,
+        DurabilityPhase::ProfileTerminalization,
+        DurabilityPrimitive::RenameExclusive,
+        "cleanup-",
+    );
+    assert_profile_event(
+        &lifecycle,
+        DurabilityPhase::ProfileTerminalization,
+        DurabilityPrimitive::RemoveFile,
+        "opaque-file",
+    );
+    assert_profile_event(
+        &lifecycle,
+        DurabilityPhase::ProfileTerminalization,
+        DurabilityPrimitive::RemoveDirectory,
+        "/profile",
+    );
+
+    let recovery_harness = GenerationHarness::new();
+    recovery_harness.abandon_dead_journal();
+    let recovery_observer = RootedObserver::recording();
+    run_observed_profile_recovery(&recovery_harness, recovery_observer.clone())
+        .expect("record production profile recovery");
+    let recovery = recovery_observer.events();
+    assert_profile_event(
+        &recovery,
+        DurabilityPhase::ProfileRecovery,
+        DurabilityPrimitive::RenameExclusive,
+        "cleanup-",
+    );
+    assert_profile_event(
+        &recovery,
+        DurabilityPhase::ProfileRecovery,
+        DurabilityPrimitive::RemoveDirectory,
+        "cleanup-",
+    );
+    assert!(
+        recovery.iter().any(|event| {
+            event.phase() == DurabilityPhase::ProfileRecovery
+                && event.primitive() == DurabilityPrimitive::SyncDirectory
+        }),
+        "profile recovery must register synchronization"
+    );
+}
+
+#[test]
+fn layout_profile_durability_observer_interrupts_real_creation_and_recovers() {
+    let harness = GenerationHarness::new();
+    let observer = RootedObserver::interrupt_after(0);
+    let interrupted = catch_unwind(AssertUnwindSafe(|| {
+        run_observed_profile_lifecycle(&harness, observer.clone())
+    }))
+    .expect_err("first production profile event must interrupt");
+    assert!(RootedObserver::is_interruption(interrupted.as_ref()));
+    assert_eq!(observer.events().len(), 1);
+    assert_eq!(observer.events()[0].phase(), DurabilityPhase::ProfileCreate);
+    harness
+        .run(TestBrowserPlan::Success)
+        .0
+        .expect("fresh generation recovers first production event prefix");
+    harness.assert_terminal();
+}
+
+#[test]
+fn layout_profile_partial_metadata_publication_prefix_recovers() {
+    let trace_harness = GenerationHarness::new();
+    let trace_observer = RootedObserver::recording();
+    let (trace_lease, trace_journal, trace_rooted) =
+        create_observed_profile_only(&trace_harness, trace_observer.clone());
+    let trace = trace_observer.events();
+    let partial_index = trace
+        .iter()
+        .position(|event| {
+            event.phase() == DurabilityPhase::ProfileCreate
+                && event.primitive() == DurabilityPrimitive::WritePartial
+                && event.path().ends_with("intent.json.temporary")
+        })
+        .expect("production trace contains an intent byte prefix");
+    trace_journal
+        .terminalize(&trace_rooted)
+        .expect("clean trace journal");
+    drop(trace_lease);
+
+    let harness = GenerationHarness::new();
+    let observer = RootedObserver::interrupt_after(partial_index);
+    let interrupted = catch_unwind(AssertUnwindSafe(|| {
+        let _ = create_observed_profile_only(&harness, observer.clone());
+    }))
+    .expect_err("intent byte prefix must interrupt");
+    assert!(RootedObserver::is_interruption(interrupted.as_ref()));
+    let rooted = harness.rooted();
+    classify_pending(&rooted)
+        .expect("classify intent publication prefix")
+        .expect("intent publication is pending")
+        .execute(&rooted)
+        .expect("recover intent publication prefix");
+    harness.assert_terminal();
 }
 
 #[test]
@@ -517,6 +707,76 @@ fn layout_profile_cleanup_failure_preserves_evidence() {
             .len(),
         1
     );
+}
+
+#[test]
+fn layout_profile_terminalization_rejects_journal_root_symlink_before_snapshot() {
+    let harness = GenerationHarness::new();
+    let lease = harness.lease();
+    let journal = harness.version_journal(&lease);
+    let active = harness.corpus().join(journal.journal_path());
+    let displaced = harness
+        .corpus()
+        .join(format!("{}-displaced", journal.journal_path()));
+    let outside = harness._temporary.path().join("outside-journal");
+    fs::create_dir(&outside).expect("create outside journal");
+    let secret = outside.join("secret");
+    fs::write(&secret, b"outside evidence\n").expect("write outside evidence");
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000))
+        .expect("make outside evidence unreadable");
+    fs::rename(&active, &displaced).expect("displace held journal");
+    symlink(&outside, &active).expect("replace journal root with outside symlink");
+
+    let error = journal
+        .terminalize(lease.rooted())
+        .expect_err("terminalization must reject a replaced journal root");
+
+    assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+    assert!(
+        error
+            .to_string()
+            .contains("profile journal root identity changed before snapshot"),
+        "{error}"
+    );
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600))
+        .expect("restore outside evidence permissions");
+    assert_eq!(
+        fs::read(&secret).expect("read outside evidence"),
+        b"outside evidence\n"
+    );
+    assert!(displaced.is_dir(), "original journal evidence is retained");
+}
+
+#[test]
+fn layout_profile_terminalization_rejects_journal_root_replacement_before_snapshot() {
+    let harness = GenerationHarness::new();
+    let lease = harness.lease();
+    let journal = harness.version_journal(&lease);
+    let active = harness.corpus().join(journal.journal_path());
+    let displaced = harness
+        .corpus()
+        .join(format!("{}-displaced", journal.journal_path()));
+    fs::rename(&active, &displaced).expect("displace held journal");
+    fs::create_dir(&active).expect("replace journal directory");
+    let sentinel = active.join("sentinel");
+    fs::write(&sentinel, b"replacement evidence\n").expect("write replacement evidence");
+
+    let error = journal
+        .terminalize(lease.rooted())
+        .expect_err("terminalization must reject a replacement directory");
+
+    assert_eq!(error.kind(), GeneratorErrorKind::ArtifactTransaction);
+    assert!(
+        error
+            .to_string()
+            .contains("profile journal root identity changed before snapshot"),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read(&sentinel).expect("read replacement evidence"),
+        b"replacement evidence\n"
+    );
+    assert!(displaced.is_dir(), "original journal evidence is retained");
 }
 
 #[test]
@@ -625,6 +885,70 @@ fn layout_generate_filtered_success_preserves_full_report() {
 }
 
 #[test]
+fn layout_filter_invalid_historical_authority_precedes_zero_match() {
+    let harness = GenerationHarness::new();
+    write(
+        &harness.corpus().join("xml/generation-reports/all.json"),
+        b"{malformed historical report}\n",
+    );
+
+    let (result, host) = harness.run_filtered("absent", TestBrowserPlan::Success);
+    let error = result.expect_err("invalid history must precede zero-match selection");
+
+    assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+    assert!(host.attempts().is_empty());
+    harness.assert_terminal();
+}
+
+#[test]
+fn layout_filter_unknown_historical_inventory_precedes_unowned_selection() {
+    let harness = GenerationHarness::new();
+    harness
+        .run(TestBrowserPlan::Success)
+        .0
+        .expect("seed historically owned fixture");
+    harness.replace_fixture("grid/new.html", b"<div>new fixture</div>\n");
+    write(&harness.corpus().join("xml/unknown.bin"), b"unknown\n");
+    let before = snapshot_xml(harness.corpus());
+
+    let (result, host) = harness.run_filtered("grid/new.html", TestBrowserPlan::Success);
+    let error = result.expect_err("unknown history must precede unowned selection");
+
+    assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+    assert!(host.attempts().is_empty());
+    assert_eq!(snapshot_xml(harness.corpus()), before);
+    harness.assert_terminal();
+}
+
+#[test]
+fn layout_filter_valid_history_keeps_zero_match_and_unowned_verification() {
+    let zero_match = GenerationHarness::new();
+    let (result, host) = zero_match.run_filtered("absent", TestBrowserPlan::Success);
+    assert_eq!(
+        result.expect_err("zero-match filter").kind(),
+        GeneratorErrorKind::Verification
+    );
+    assert!(host.attempts().is_empty());
+    zero_match.assert_terminal();
+
+    let unowned = GenerationHarness::new();
+    unowned
+        .run(TestBrowserPlan::Success)
+        .0
+        .expect("seed historical ownership");
+    unowned.replace_fixture("grid/new.html", b"<div>new fixture</div>\n");
+    let before = snapshot_xml(unowned.corpus());
+    let (result, host) = unowned.run_filtered("grid/new.html", TestBrowserPlan::Success);
+    assert_eq!(
+        result.expect_err("unowned filter").kind(),
+        GeneratorErrorKind::Verification
+    );
+    assert!(host.attempts().is_empty());
+    assert_eq!(snapshot_xml(unowned.corpus()), before);
+    unowned.assert_terminal();
+}
+
+#[test]
 fn layout_fake_supervisor_process() {
     if std::env::var_os(supervisor::CAPSULE_ENV).is_none() {
         return;
@@ -670,14 +994,18 @@ fn layout_profile_name_and_cleanup_grammar_is_exact() {
 }
 
 fn sidecar_bytes() -> Vec<u8> {
+    sidecar_bytes_for("grid/basic.html", FIXTURE_BYTES)
+}
+
+fn sidecar_bytes_for(relative: &str, bytes: &[u8]) -> Vec<u8> {
     let snapshot = VerifiedSourceSnapshot {
         object_format: ObjectFormat::Sha1,
         entries: vec![SnapshotEntry {
-            path: RelativePath::new("grid/basic.html").expect("fixture path"),
+            path: RelativePath::new(relative).expect("fixture path"),
             git_mode: "100644".to_owned(),
             blob_object_id: "2".repeat(40),
-            digest: Sha256Digest::from_bytes(FIXTURE_BYTES),
-            bytes: FIXTURE_BYTES.to_vec(),
+            digest: Sha256Digest::from_bytes(bytes),
+            bytes: bytes.to_vec(),
         }],
     };
     let pin = PinnedSource::new(
@@ -688,6 +1016,108 @@ fn sidecar_bytes() -> Vec<u8> {
     )
     .expect("Taffy pin");
     sidecar::canonical_bytes(&pin, 1, &snapshot).expect("canonical Taffy sidecar")
+}
+
+fn run_observed_profile_lifecycle(
+    harness: &GenerationHarness,
+    observer: RootedObserver,
+) -> crate::Result<()> {
+    let dead_group = dead_crate_owned_process_id();
+    let lease = harness.lease();
+    let rooted = harness.observed_rooted(observer);
+    let journal = harness.observed_version_journal(&lease, &rooted);
+    fs::write(journal.profile_path().join("opaque-file"), b"opaque\n")
+        .expect("seed opaque browser file");
+    let outside = harness._temporary.path().join("opaque-outside");
+    fs::write(&outside, b"outside\n").expect("seed opaque outside sentinel");
+    symlink(&outside, journal.profile_path().join("opaque-link"))
+        .expect("seed opaque browser symlink");
+    journal.test_publish_running(&rooted, dead_group)?;
+    journal.terminalize(&rooted)?;
+    assert_eq!(fs::read(outside).expect("outside sentinel"), b"outside\n");
+    drop(lease);
+    harness.assert_terminal();
+    Ok(())
+}
+
+fn create_observed_profile_only(
+    harness: &GenerationHarness,
+    observer: RootedObserver,
+) -> (GenerationLease, ProfileJournal, RootedFs) {
+    let lease = harness.lease();
+    let rooted = harness.observed_rooted(observer);
+    let journal = harness.observed_version_journal(&lease, &rooted);
+    (lease, journal, rooted)
+}
+
+fn run_observed_profile_recovery(
+    harness: &GenerationHarness,
+    observer: RootedObserver,
+) -> crate::Result<()> {
+    let lease = harness.lease();
+    let rooted = harness.observed_rooted(observer);
+    classify_pending(&rooted)?
+        .expect("abandoned profile is pending")
+        .execute(&rooted)?;
+    drop(lease);
+    harness.assert_terminal();
+    Ok(())
+}
+
+fn dead_crate_owned_process_id() -> u32 {
+    let executable = std::env::current_exe().expect("current test executable");
+    let mut child = std::process::Command::new(executable)
+        .args([
+            "--exact",
+            "layout::profile_tests::layout_fake_browser_success_process",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn crate-owned dead-group probe");
+    let id = child.id();
+    assert!(child.wait().expect("reap dead-group probe").success());
+    id
+}
+
+fn assert_profile_event(
+    events: &[DurabilityEvent],
+    phase: DurabilityPhase,
+    primitive: DurabilityPrimitive,
+    path_fragment: &str,
+) {
+    assert!(
+        events.iter().any(|event| {
+            event.phase() == phase
+                && event.primitive() == primitive
+                && event.path().contains(path_fragment)
+        }),
+        "missing {phase:?}/{primitive:?} event containing {path_fragment:?}"
+    );
+}
+
+fn normalized_events(
+    events: &[DurabilityEvent],
+) -> Vec<(DurabilityPhase, DurabilityPrimitive, String)> {
+    events
+        .iter()
+        .map(|event| {
+            let path = event
+                .path()
+                .split('/')
+                .map(|component| {
+                    if component.starts_with("active-") || component.starts_with("cleanup-") {
+                        "<profile-journal>"
+                    } else {
+                        component
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            (event.phase(), event.primitive(), path)
+        })
+        .collect()
 }
 
 fn path_relative_to(root: &Path, path: &Path) -> String {

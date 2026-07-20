@@ -32,9 +32,13 @@ pub(crate) use coordination::{
     authenticate_layout_supervisor_owner, corpus_authority_key, new_token,
 };
 #[cfg(feature = "layout-browser")]
-pub(crate) use fs::{BoundPath, HeldIdentity, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE};
+pub(crate) use fs::{
+    BoundPath, HeldIdentity, OpaqueTreeSnapshot, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE,
+};
 #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 pub(crate) use fs::{CORPUS_FILE_MODE, NodeKind, RootedFs};
+#[cfg(all(test, feature = "layout-browser"))]
+pub(crate) use fs::{DurabilityEvent, DurabilityPhase, DurabilityPrimitive, RootedObserver};
 #[cfg(feature = "layout-browser")]
 pub(crate) use inventory::InventoryEntry;
 #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]

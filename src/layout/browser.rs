@@ -22,6 +22,7 @@ const DRIVER_KEYS: [&str; 3] = [
 /// One path/descriptor-bound trusted external browser capability.
 #[derive(Debug)]
 pub(super) struct TrustedBrowser {
+    owner: BoundPath,
     cache: BoundPath,
     executable: BoundPath,
     relative: RelativePath,
@@ -44,10 +45,17 @@ impl TrustedBrowser {
             ));
         }
 
+        let owner = BoundPath::bind(location.owner_root())?;
+        owner.require_existing_directory("bind trusted browser owner root")?;
         let cache_path = manifest.browser.cache_root.join(location.owner_root());
         let executable_path = relative.join(location.owner_root());
         let cache = BoundPath::bind(&cache_path)?;
         cache.require_existing_directory("bind trusted browser cache root")?;
+        if !cache.is_strict_descendant_of(&owner) {
+            return Err(invalid_path(
+                "trusted browser cache root does not resolve to a strict descendant of its owner root",
+            ));
+        }
         let executable = BoundPath::bind(&executable_path)?;
         if !executable.is_strict_descendant_of(&cache) {
             return Err(invalid_path(
@@ -70,6 +78,7 @@ impl TrustedBrowser {
         }
         let digest = digest_held(&executable).map_err(source_verification_revalidation)?;
         Ok(Self {
+            owner,
             cache,
             executable,
             relative: relative.clone(),
@@ -79,9 +88,13 @@ impl TrustedBrowser {
     }
 
     pub(super) fn closing_revalidate(&self) -> Result<()> {
-        self.cache
-            .revalidate()
-            .map_err(source_verification_revalidation)?;
+        self.owner.revalidate()?;
+        self.cache.revalidate()?;
+        if !self.cache.is_strict_descendant_of(&self.owner) {
+            return Err(invalid_path(
+                "trusted browser cache root no longer resolves beneath its owner root",
+            ));
+        }
         self.executable
             .revalidate()
             .map_err(source_verification_revalidation)?;
@@ -476,6 +489,27 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
+    fn layout_browser_cache_root_symlink_escape_is_invalid_path() {
+        let temporary = TestDirectory::new();
+        let owner = temporary.path().join("owner");
+        let corpus = owner.join("corpus");
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(&corpus).expect("create corpus");
+        fs::create_dir(&outside).expect("create outside cache");
+        executable(&outside.join("chromium"));
+        symlink(&outside, owner.join("browser-cache")).expect("alias cache outside owner");
+        let location = CorpusLocation::new(&owner, &corpus).expect("location");
+        let manifest = parsed_manifest(&corpus);
+        let relative = RelativePath::new("browser-cache/chromium").expect("browser path");
+
+        let error = TrustedBrowser::validate(&location, &manifest, &relative)
+            .expect_err("cache root outside its owner must be rejected");
+
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
     fn layout_browser_intermediate_path_drift_fails_closing_revalidation() {
         let temporary = TestDirectory::new();
         let owner = temporary.path().join("owner");
@@ -502,5 +536,34 @@ mod tests {
             .expect_err("closing validation must detect intermediate drift");
 
         assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn layout_browser_cache_root_replacement_is_invalid_path_at_close() {
+        let temporary = TestDirectory::new();
+        let owner = temporary.path().join("owner");
+        let corpus = owner.join("corpus");
+        let cache = owner.join("browser-cache");
+        let displaced = owner.join("held-browser-cache");
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(&corpus).expect("create corpus");
+        fs::create_dir(&cache).expect("create cache");
+        fs::create_dir(&outside).expect("create outside cache");
+        executable(&cache.join("chromium"));
+        executable(&outside.join("chromium"));
+        let location = CorpusLocation::new(&owner, &corpus).expect("location");
+        let manifest = parsed_manifest(&corpus);
+        let relative = RelativePath::new("browser-cache/chromium").expect("browser path");
+        let browser = TrustedBrowser::validate(&location, &manifest, &relative)
+            .expect("initial trusted browser");
+
+        fs::rename(&cache, &displaced).expect("displace cache root");
+        symlink(&outside, &cache).expect("replace cache root with escaping symlink");
+        let error = browser
+            .closing_revalidate()
+            .expect_err("closing validation must reject cache-root replacement");
+
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
     }
 }

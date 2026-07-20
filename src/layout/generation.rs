@@ -146,10 +146,10 @@ async fn generate(request: &LayoutRequest, host: &GenerationHost) -> Result<()> 
     )?;
     let preflight_rooted = RootedFs::open_corpus(location)?;
     let inputs = selection::inspect(&preflight_rooted, &manifest)?;
-    let selection = SelectionLedger::new(&inputs, request.filter())?;
     let historical = report::inspect_historical(&preflight_rooted, &manifest)?;
     let desired = desired_paths(&inputs, &manifest)?;
     historical.validate_union(&desired)?;
+    let selection = SelectionLedger::new(&inputs, request.filter())?;
     if selection.is_filtered() {
         if selection.is_disposition_only() {
             return Ok(());

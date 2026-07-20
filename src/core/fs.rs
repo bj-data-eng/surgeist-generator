@@ -15,6 +15,14 @@ pub(crate) const CORPUS_FILE_MODE: u32 = 0o644;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum DurabilityPhase {
     Rooted,
+    #[cfg(feature = "layout-browser")]
+    ProfileCreate,
+    #[cfg(feature = "layout-browser")]
+    ProfileRunningPublication,
+    #[cfg(feature = "layout-browser")]
+    ProfileTerminalization,
+    #[cfg(feature = "layout-browser")]
+    ProfileRecovery,
     FilePublication,
     TransactionInstall,
     TransactionStage,
@@ -366,6 +374,22 @@ pub(crate) struct BoundPath {
     components: Vec<BoundComponent>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     descriptors: Vec<rustix::fd::OwnedFd>,
+}
+
+/// One descriptor-relative snapshot of an opaque directory tree.
+#[cfg(feature = "layout-browser")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OpaqueTreeSnapshot {
+    root: HeldIdentity,
+    entries: Vec<OpaqueTreeEntry>,
+}
+
+#[cfg(feature = "layout-browser")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OpaqueTreeEntry {
+    relative: PathBuf,
+    identity: HeldIdentity,
+    bytes: Vec<u8>,
 }
 
 impl std::fmt::Debug for BoundPath {
@@ -1899,6 +1923,71 @@ impl RootedFs {
         }
     }
 
+    /// Snapshots one opaque directory through retained no-follow descriptors.
+    #[cfg(feature = "layout-browser")]
+    pub(crate) fn snapshot_opaque_directory(
+        &self,
+        relative: &str,
+        expected: &HeldIdentity,
+    ) -> Result<OpaqueTreeSnapshot> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.revalidate_root()?;
+            let named = self.identity_at(relative)?.ok_or_else(|| {
+                transaction_error(
+                    "snapshot opaque directory",
+                    format!("opaque root disappeared before snapshot: {relative}"),
+                )
+            })?;
+            if named.kind != NodeKind::Directory || !expected.matches_recovery(&named) {
+                return Err(transaction_error(
+                    "snapshot opaque directory",
+                    format!("profile journal root identity changed before snapshot: {relative}"),
+                ));
+            }
+            let directory = self.open_dir(relative)?;
+            let actual = identity_from_fd(&directory, "inspect opaque snapshot root")?;
+            require_same_mount(&self.identity, &actual, "validate opaque snapshot mount")?;
+            if !expected.matches_recovery(&actual) {
+                return Err(transaction_error(
+                    "snapshot opaque directory",
+                    format!("profile journal root identity changed before snapshot: {relative}"),
+                ));
+            }
+            let mut entries = Vec::new();
+            snapshot_opaque_children(self, &directory, Path::new(""), &mut entries)?;
+            let after = identity_from_fd(&directory, "reinspect opaque snapshot root")?;
+            let renamed = self.identity_at(relative)?;
+            if !expected.matches_recovery(&after)
+                || renamed
+                    .as_ref()
+                    .is_none_or(|identity| !expected.matches_recovery(identity))
+            {
+                return Err(transaction_error(
+                    "snapshot opaque directory",
+                    format!("profile journal root identity changed during snapshot: {relative}"),
+                ));
+            }
+            entries.sort_by(|left, right| {
+                left.relative
+                    .components()
+                    .count()
+                    .cmp(&right.relative.components().count())
+                    .then_with(|| left.relative.cmp(&right.relative))
+            });
+            Ok(OpaqueTreeSnapshot {
+                root: actual,
+                entries,
+            })
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (relative, expected);
+            MutationTarget::Unsupported.require_supported("snapshot opaque browser directory")?;
+            unreachable!("unsupported mutation target returned success")
+        }
+    }
+
     fn remove_exact(&self, relative: &str, expected: &HeldIdentity, directory: bool) -> Result<()> {
         #[cfg(test)]
         let _phase = self.begin_default_observation_phase(DurabilityPhase::Rooted);
@@ -2178,6 +2267,150 @@ fn erase_opaque_children(
         })?;
         #[cfg(test)]
         rooted.record_durability(DurabilityPrimitive::SyncDirectory, relative);
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "layout-browser",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+fn snapshot_opaque_children(
+    rooted: &RootedFs,
+    parent: &rustix::fd::OwnedFd,
+    relative_parent: &Path,
+    entries: &mut Vec<OpaqueTreeEntry>,
+) -> Result<()> {
+    use std::ffi::{CString, OsString};
+    use std::io::Read as _;
+    use std::os::unix::ffi::OsStringExt as _;
+
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, openat, readlinkat, statat};
+
+    let parent_identity = identity_from_fd(parent, "inspect opaque snapshot directory")?;
+    require_same_mount(
+        &rooted.identity,
+        &parent_identity,
+        "validate opaque snapshot directory mount",
+    )?;
+    let mut directory = rustix::fs::Dir::read_from(parent).map_err(|source| {
+        io_error(
+            "open opaque snapshot directory stream",
+            &rooted.canonical_root.join(relative_parent),
+            source,
+        )
+    })?;
+    let mut names = Vec::new();
+    for entry in &mut directory {
+        let entry = entry.map_err(|source| {
+            io_error(
+                "read opaque snapshot directory",
+                &rooted.canonical_root.join(relative_parent),
+                source,
+            )
+        })?;
+        let bytes = entry.file_name().to_bytes();
+        if bytes != b"." && bytes != b".." {
+            names.push(bytes.to_vec());
+        }
+    }
+    names.sort();
+    drop(directory);
+
+    for bytes in names {
+        let name = CString::new(bytes.clone()).map_err(|_| {
+            transaction_error(
+                "snapshot opaque directory",
+                "directory entry unexpectedly contains NUL",
+            )
+        })?;
+        let mut relative = relative_parent.to_path_buf();
+        relative.push(OsString::from_vec(bytes));
+        let display = rooted.canonical_root.join(&relative);
+        let before = statat(parent, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|source| io_error("inspect opaque snapshot entry", &display, source))?;
+        let file_type = FileType::from_raw_mode(before.st_mode);
+        let identity = identity_from_stat(&before, parent_identity.fsid)?;
+        require_same_mount(
+            &rooted.identity,
+            &identity,
+            "validate opaque snapshot entry mount",
+        )?;
+        let content = if file_type == FileType::Directory {
+            let child = openat(
+                parent,
+                name.as_c_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|source| io_error("open opaque snapshot child directory", &display, source))?;
+            let opened = identity_from_fd(&child, "inspect opaque snapshot child directory")?;
+            if !identity.matches_recovery(&opened) {
+                return Err(transaction_error(
+                    "snapshot opaque directory",
+                    format!("opaque child identity changed: {}", display.display()),
+                ));
+            }
+            snapshot_opaque_children(rooted, &child, &relative, entries)?;
+            let after = identity_from_fd(&child, "reinspect opaque snapshot child directory")?;
+            if !identity.matches_recovery(&after) {
+                return Err(transaction_error(
+                    "snapshot opaque directory",
+                    format!("opaque child identity drifted: {}", display.display()),
+                ));
+            }
+            Vec::new()
+        } else if file_type == FileType::RegularFile {
+            let opened = openat(
+                parent,
+                name.as_c_str(),
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|source| io_error("open opaque snapshot regular file", &display, source))?;
+            let opened_identity =
+                identity_from_fd(&opened, "inspect opaque snapshot regular file")?;
+            if !identity.matches_recovery(&opened_identity) {
+                return Err(transaction_error(
+                    "snapshot opaque directory",
+                    format!("opaque file identity changed: {}", display.display()),
+                ));
+            }
+            let mut file = std::fs::File::from(opened);
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(|source| {
+                io_error("read opaque snapshot regular file", &display, source)
+            })?;
+            let after = identity_from_fd(&file, "reinspect opaque snapshot regular file")?;
+            if !identity.matches_recovery(&after) {
+                return Err(transaction_error(
+                    "snapshot opaque directory",
+                    format!("opaque file identity drifted: {}", display.display()),
+                ));
+            }
+            bytes
+        } else if file_type == FileType::Symlink {
+            readlinkat(parent, name.as_c_str(), Vec::new())
+                .map_err(|source| io_error("read opaque snapshot symlink", &display, source))?
+                .into_bytes()
+        } else {
+            Vec::new()
+        };
+        let current = statat(parent, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|source| io_error("reinspect opaque snapshot entry", &display, source))?;
+        let current_identity = identity_from_stat(&current, parent_identity.fsid)?;
+        if !identity.matches_recovery(&current_identity) {
+            return Err(transaction_error(
+                "snapshot opaque directory",
+                format!("opaque entry identity changed: {}", display.display()),
+            ));
+        }
+        entries.push(OpaqueTreeEntry {
+            relative,
+            identity,
+            bytes: content,
+        });
     }
     Ok(())
 }

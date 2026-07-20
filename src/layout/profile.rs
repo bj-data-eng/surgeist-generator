@@ -3,15 +3,16 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+#[cfg(test)]
+use crate::core::DurabilityPhase;
 use crate::core::{
-    Domain, GenerationLease, HeldIdentity, NodeKind, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE,
-    RootedFs, corpus_authority_key, new_token,
+    Domain, GenerationLease, HeldIdentity, NodeKind, OpaqueTreeSnapshot, PRIVATE_DIRECTORY_MODE,
+    PRIVATE_FILE_MODE, RootedFs, corpus_authority_key, new_token,
 };
 use crate::{
     CorpusLocation, GeneratorError, GeneratorErrorKind, RelativePath, Result, Sha256Digest,
@@ -22,6 +23,10 @@ use super::manifest::LayoutManifest;
 
 pub(super) const PROFILE_PARENT: &str = ".surgeist-generator/profiles/layout";
 const LOCK_HEADER: &[u8] = b"surgeist-generator-lock-v1\n";
+const INTENT_TEMPORARY: &str = "intent.json.temporary";
+const TRANSITION_TEMPORARY: &str = "transition.lock.temporary";
+const PROFILE_TEMPORARY: &str = "profile.json.temporary";
+const RUNNING_TEMPORARY: &str = "running.json.temporary";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -83,40 +88,6 @@ struct ProfileAttemptParts {
     batch_ordinal: Option<u64>,
     retry_ordinal: Option<u64>,
     launch_strings: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ProfileCreateStep {
-    JournalDirectory,
-    IntentRecord,
-    TransitionLock,
-    ProfileDirectory,
-    HomeDirectory,
-    TemporaryDirectory,
-    XdgConfigDirectory,
-    XdgCacheDirectory,
-    XdgDataDirectory,
-    ProfileRecord,
-    JournalSync,
-    ParentSync,
-}
-
-#[cfg(test)]
-impl ProfileCreateStep {
-    pub(super) const ALL: [Self; 12] = [
-        Self::JournalDirectory,
-        Self::IntentRecord,
-        Self::TransitionLock,
-        Self::ProfileDirectory,
-        Self::HomeDirectory,
-        Self::TemporaryDirectory,
-        Self::XdgConfigDirectory,
-        Self::XdgCacheDirectory,
-        Self::XdgDataDirectory,
-        Self::ProfileRecord,
-        Self::JournalSync,
-        Self::ParentSync,
-    ];
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -217,21 +188,22 @@ impl ProfileJournal {
         context: ProfileCreateContext<'_>,
         attempt: ProfileAttempt,
     ) -> Result<Self> {
-        Self::create_with_observer(context, attempt, |_| Ok(()))
+        Self::create_at(&context, attempt, context.lease.rooted())
     }
 
-    fn create_with_observer(
-        context: ProfileCreateContext<'_>,
+    fn create_at(
+        context: &ProfileCreateContext<'_>,
         attempt: ProfileAttempt,
-        mut observe: impl FnMut(ProfileCreateStep) -> Result<()>,
+        rooted: &RootedFs,
     ) -> Result<Self> {
+        #[cfg(test)]
+        let _observation = rooted.begin_observation_phase(DurabilityPhase::ProfileCreate);
         let ProfileAttemptParts {
             purpose,
             batch_ordinal,
             retry_ordinal,
             launch_strings,
         } = attempt.into_parts()?;
-        let rooted = context.lease.rooted();
         rooted.ensure_dir(".surgeist-generator/profiles", PRIVATE_DIRECTORY_MODE)?;
         rooted.ensure_dir(PROFILE_PARENT, PRIVATE_DIRECTORY_MODE)?;
         if !rooted.list_dir(PROFILE_PARENT)?.is_empty() {
@@ -256,7 +228,6 @@ impl ProfileJournal {
         let name = format!("active-{suffix}");
         let path = format!("{PROFILE_PARENT}/{name}");
         let identity = rooted.create_dir_exclusive(&path, PRIVATE_DIRECTORY_MODE)?;
-        observe(ProfileCreateStep::JournalDirectory)?;
 
         let intent = IntentRecord {
             schema_version: 1,
@@ -273,34 +244,28 @@ impl ProfileJournal {
             launch_profile_sha256: context.manifest.launch_digest.clone(),
         };
         let intent_bytes = canonical_json_line(&intent, "serialize layout profile intent")?;
-        rooted.create_file_exclusive(
-            &format!("{path}/intent.json"),
+        rooted.publish_file_exclusive(
+            &path,
+            "intent.json",
+            INTENT_TEMPORARY,
             &intent_bytes,
             PRIVATE_FILE_MODE,
         )?;
-        observe(ProfileCreateStep::IntentRecord)?;
-        rooted.create_file_exclusive(
-            &format!("{path}/transition.lock"),
+        rooted.publish_file_exclusive(
+            &path,
+            "transition.lock",
+            TRANSITION_TEMPORARY,
             LOCK_HEADER,
             PRIVATE_FILE_MODE,
         )?;
-        observe(ProfileCreateStep::TransitionLock)?;
         let profile_relative = format!("{path}/profile");
         let profile_identity =
             rooted.create_dir_exclusive(&profile_relative, PRIVATE_DIRECTORY_MODE)?;
-        observe(ProfileCreateStep::ProfileDirectory)?;
-        for (directory, step) in [
-            ("home", ProfileCreateStep::HomeDirectory),
-            ("tmp", ProfileCreateStep::TemporaryDirectory),
-            ("xdg-config", ProfileCreateStep::XdgConfigDirectory),
-            ("xdg-cache", ProfileCreateStep::XdgCacheDirectory),
-            ("xdg-data", ProfileCreateStep::XdgDataDirectory),
-        ] {
+        for directory in ["home", "tmp", "xdg-config", "xdg-cache", "xdg-data"] {
             rooted.create_dir_exclusive(
                 &format!("{profile_relative}/{directory}"),
                 PRIVATE_DIRECTORY_MODE,
             )?;
-            observe(step)?;
         }
         let profile = ProfileRecord {
             schema_version: 1,
@@ -309,16 +274,15 @@ impl ProfileJournal {
             identity: profile_identity,
         };
         let profile_bytes = canonical_json_line(&profile, "serialize layout profile record")?;
-        rooted.create_file_exclusive(
-            &format!("{path}/profile.json"),
+        rooted.publish_file_exclusive(
+            &path,
+            "profile.json",
+            PROFILE_TEMPORARY,
             &profile_bytes,
             PRIVATE_FILE_MODE,
         )?;
-        observe(ProfileCreateStep::ProfileRecord)?;
         rooted.sync_dir(&path)?;
-        observe(ProfileCreateStep::JournalSync)?;
         rooted.sync_dir(PROFILE_PARENT)?;
-        observe(ProfileCreateStep::ParentSync)?;
 
         let profile_path = context.location.corpus_root().join(&profile_relative);
         let capsule = LaunchCapsule {
@@ -348,9 +312,9 @@ impl ProfileJournal {
     pub(super) fn create_observed(
         context: ProfileCreateContext<'_>,
         attempt: ProfileAttempt,
-        observe: impl FnMut(ProfileCreateStep) -> Result<()>,
+        rooted: &RootedFs,
     ) -> Result<Self> {
-        Self::create_with_observer(context, attempt, observe)
+        Self::create_at(&context, attempt, rooted)
     }
 
     pub(super) fn capsule_json(&self) -> Result<String> {
@@ -368,7 +332,9 @@ impl ProfileJournal {
     }
 
     pub(super) fn terminalize(self, rooted: &RootedFs) -> Result<()> {
-        let snapshot = snapshot_tree(rooted.canonical_root(), &self.path)?;
+        #[cfg(test)]
+        let _observation = rooted.begin_observation_phase(DurabilityPhase::ProfileTerminalization);
+        let snapshot = snapshot_tree(rooted, &self.path, &self.identity)?;
         if let Some(running) =
             read_optional_record::<RunningRecord>(rooted, &self.path, "running.json")?
             && probe_group(running.process_group_id)? != GroupState::Dead
@@ -382,7 +348,7 @@ impl ProfileJournal {
         let cleanup = cleanup_path(&self.path)?;
         rooted.rename_exclusive_bound(&self.path, &cleanup, &self.identity)?;
         rooted.sync_dir(PROFILE_PARENT)?;
-        if snapshot_tree(rooted.canonical_root(), &cleanup)? != snapshot.with_root_name(&cleanup) {
+        if snapshot_tree(rooted, &cleanup, &self.identity)? != snapshot.with_root_name(&cleanup) {
             return Err(artifact_error(
                 "terminalize layout browser profile",
                 "profile journal changed before cleanup",
@@ -430,6 +396,21 @@ impl ProfileJournal {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(super) fn test_publish_running(
+        &self,
+        rooted: &RootedFs,
+        supervisor_pid: u32,
+    ) -> Result<()> {
+        publish_running(
+            rooted,
+            &self.path,
+            &self.capsule.profile_token,
+            self.capsule.parent_pid,
+            supervisor_pid,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -442,7 +423,9 @@ pub(super) struct PendingRecovery {
 
 impl PendingRecovery {
     pub(super) fn execute(self, rooted: &RootedFs) -> Result<()> {
-        if snapshot_tree(rooted.canonical_root(), &self.path)? != self.snapshot {
+        #[cfg(test)]
+        let _observation = rooted.begin_observation_phase(DurabilityPhase::ProfileRecovery);
+        if snapshot_tree(rooted, &self.path, &self.identity)? != self.snapshot {
             return Err(artifact_error(
                 "recover layout browser profile",
                 "profile identity or bytes changed after classification",
@@ -513,7 +496,7 @@ pub(super) fn classify_pending(rooted: &RootedFs) -> Result<Option<PendingRecove
         }
     }
     Ok(Some(PendingRecovery {
-        snapshot: snapshot_tree(rooted.canonical_root(), &path)?,
+        snapshot: snapshot_tree(rooted, &path, &identity)?,
         path,
         identity,
         _transition: transition,
@@ -527,6 +510,8 @@ pub(super) fn publish_running(
     parent_pid: u32,
     supervisor_pid: u32,
 ) -> Result<()> {
+    #[cfg(test)]
+    let _observation = rooted.begin_observation_phase(DurabilityPhase::ProfileRunningPublication);
     if supervisor_pid == 0 {
         return Err(process_error(
             "register layout browser supervisor",
@@ -540,8 +525,10 @@ pub(super) fn publish_running(
         supervisor_pid,
         process_group_id: supervisor_pid,
     };
-    rooted.create_file_exclusive(
-        &format!("{journal}/running.json"),
+    rooted.publish_file_exclusive(
+        journal,
+        "running.json",
+        RUNNING_TEMPORARY,
         &canonical_json_line(&record, "serialize running browser group")?,
         PRIVATE_FILE_MODE,
     )?;
@@ -609,10 +596,25 @@ fn validate_journal_prefix(rooted: &RootedFs, path: &str) -> Result<()> {
     };
     let active_prefix = [
         set(&[]),
+        set(&[INTENT_TEMPORARY]),
         set(&["intent.json"]),
+        set(&["intent.json", TRANSITION_TEMPORARY]),
         set(&["intent.json", "transition.lock"]),
         set(&["intent.json", "transition.lock", "profile"]),
+        set(&[
+            "intent.json",
+            "transition.lock",
+            "profile",
+            PROFILE_TEMPORARY,
+        ]),
         set(&["intent.json", "transition.lock", "profile", "profile.json"]),
+        set(&[
+            "intent.json",
+            "transition.lock",
+            "profile",
+            "profile.json",
+            RUNNING_TEMPORARY,
+        ]),
         set(&[
             "intent.json",
             "transition.lock",
@@ -623,9 +625,18 @@ fn validate_journal_prefix(rooted: &RootedFs, path: &str) -> Result<()> {
     ];
     let cleanup_prefix = [
         set(&[]),
+        set(&[INTENT_TEMPORARY]),
         set(&["intent.json"]),
+        set(&["intent.json", TRANSITION_TEMPORARY]),
         set(&["intent.json", "transition.lock"]),
+        set(&["intent.json", "transition.lock", PROFILE_TEMPORARY]),
         set(&["intent.json", "transition.lock", "profile.json"]),
+        set(&[
+            "intent.json",
+            "transition.lock",
+            "profile.json",
+            RUNNING_TEMPORARY,
+        ]),
         set(&[
             "intent.json",
             "transition.lock",
@@ -646,6 +657,16 @@ fn validate_journal_prefix(rooted: &RootedFs, path: &str) -> Result<()> {
             "validate layout profile journal",
             "journal contains an unknown or out-of-order member",
         ));
+    }
+    for temporary in [
+        INTENT_TEMPORARY,
+        TRANSITION_TEMPORARY,
+        PROFILE_TEMPORARY,
+        RUNNING_TEMPORARY,
+    ] {
+        if names.contains(temporary) {
+            let _ = rooted.read_file(&format!("{path}/{temporary}"), PRIVATE_FILE_MODE)?;
+        }
     }
     let mut intent_record = None;
     if names.contains("intent.json") {
@@ -760,9 +781,13 @@ fn erase_validated_journal(rooted: &RootedFs, path: &str) -> Result<()> {
     }
     for name in [
         "running.json",
+        RUNNING_TEMPORARY,
         "profile.json",
+        PROFILE_TEMPORARY,
         "transition.lock",
+        TRANSITION_TEMPORARY,
         "intent.json",
+        INTENT_TEMPORARY,
     ] {
         let member = format!("{path}/{name}");
         if let Some(identity) = rooted.identity_at(&member)? {
@@ -782,7 +807,7 @@ fn erase_opaque(rooted: &RootedFs, relative: &str, expected: &HeldIdentity) -> R
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TreeSnapshot {
     root_name: String,
-    raw: RawTreeSnapshot,
+    raw: OpaqueTreeSnapshot,
 }
 
 impl TreeSnapshot {
@@ -794,106 +819,14 @@ impl TreeSnapshot {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RawTreeSnapshot {
-    root_device: u64,
-    entries: Vec<RawEntry>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RawEntry {
-    relative: PathBuf,
-    directory: bool,
-    device: u64,
-    inode: u64,
-    mode: u32,
-    owner: u32,
-    link_count: u64,
-    bytes: Vec<u8>,
-}
-
-fn snapshot_tree(corpus: &Path, relative: &str) -> Result<TreeSnapshot> {
-    let absolute = corpus.join(relative);
-    let metadata = fs::symlink_metadata(&absolute)
-        .map_err(|source| artifact_io("snapshot layout profile journal", &absolute, source))?;
+fn snapshot_tree(
+    rooted: &RootedFs,
+    relative: &str,
+    expected: &HeldIdentity,
+) -> Result<TreeSnapshot> {
     Ok(TreeSnapshot {
         root_name: relative.to_owned(),
-        raw: snapshot_raw_tree(&absolute, metadata.dev())?,
-    })
-}
-
-fn snapshot_raw_tree(root: &Path, root_device: u64) -> Result<RawTreeSnapshot> {
-    fn visit(
-        root: &Path,
-        current: &Path,
-        root_device: u64,
-        entries: &mut Vec<RawEntry>,
-    ) -> Result<()> {
-        let mut children = fs::read_dir(current)
-            .map_err(|source| artifact_io("enumerate opaque browser profile", current, source))?
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|source| artifact_io("read opaque browser profile entry", current, source))?;
-        children.sort_by_key(fs::DirEntry::file_name);
-        for child in children {
-            let path = child.path();
-            let metadata = fs::symlink_metadata(&path).map_err(|source| {
-                artifact_io("inspect opaque browser profile entry", &path, source)
-            })?;
-            if metadata.dev() != root_device {
-                return Err(artifact_error(
-                    "snapshot opaque browser profile",
-                    "profile entry crosses a mount boundary",
-                ));
-            }
-            let relative = path
-                .strip_prefix(root)
-                .expect("profile child remains below its root")
-                .to_path_buf();
-            let directory = metadata.file_type().is_dir();
-            let bytes = if directory {
-                Vec::new()
-            } else if metadata.file_type().is_symlink() {
-                fs::read_link(&path)
-                    .map_err(|source| artifact_io("read opaque profile symlink", &path, source))?
-                    .as_os_str()
-                    .as_bytes()
-                    .to_vec()
-            } else if metadata.file_type().is_file() {
-                fs::read(&path).map_err(|source| {
-                    artifact_io("read opaque browser profile entry", &path, source)
-                })?
-            } else {
-                Vec::new()
-            };
-            entries.push(RawEntry {
-                relative,
-                directory,
-                device: metadata.dev(),
-                inode: metadata.ino(),
-                mode: metadata.mode(),
-                owner: metadata.uid(),
-                link_count: metadata.nlink(),
-                bytes,
-            });
-            if directory {
-                visit(root, &path, root_device, entries)?;
-            }
-        }
-        Ok(())
-    }
-
-    let mut entries = Vec::new();
-    visit(root, root, root_device, &mut entries)?;
-    entries.sort_by(|left, right| {
-        left.relative
-            .components()
-            .count()
-            .cmp(&right.relative.components().count())
-            .then_with(|| left.relative.cmp(&right.relative))
-    });
-    Ok(RawTreeSnapshot {
-        root_device,
-        entries,
+        raw: rooted.snapshot_opaque_directory(relative, expected)?,
     })
 }
 
