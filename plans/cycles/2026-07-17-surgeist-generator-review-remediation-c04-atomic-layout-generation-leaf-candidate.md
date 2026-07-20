@@ -226,16 +226,17 @@ runs before the separately authorized terminal diagnostic.
 ### C04-T03 — Finalize guidance, policy evidence, and handoff readiness
 
 - Files/area: `README.md`, `AGENTS.md`, rustdoc/examples, focused public/process
-  tests, policy/metadata evidence, and deletion of the obsolete C01-C03 cycle-plan
-  paths. Retain `.gitkeep`, baseline review, reviewed spec/sequence, and C04 plan.
-  No root/sibling artifact is generated.
+  tests, and policy/metadata evidence. Retain `.gitkeep`, baseline review, the
+  reviewed spec/sequence, and every C01-C04 cycle plan as initiative planning
+  history. No root/sibling artifact is generated.
 - Outcome: accurately document the completed two-driver crate and close stale-
-  guidance, policy, target, tautological-test, and terminal planning-tree findings.
+  guidance, policy, target, tautological-test, and planning-tree hygiene findings.
 - RED evidence: source/doc assertions first identify stale scaffold/migration and
   incomplete-command text; add or strengthen executable rustdoc/process evidence
   for trust, acquisition-free operation, offline attestation, profile recovery,
   Taffy adoption, and exact API/CLI boundaries before replacing prose. The final
-  one-cycle-plan/count predicates initially fail because C01-C03 remain tracked.
+  planning-tree predicates reject transcript/verdict/evidence/handoff documents
+  outside the canonical planning packet.
 - Acceptance:
   - docs state exact features/binaries/roots/ownership, mutable pins/counts,
     normal-build independence, platform support, trusted-browser containment
@@ -244,18 +245,15 @@ runs before the separately authorized terminal diagnostic.
   - exact dependency isolation, license/advisory/MSRV/wasm/metadata evidence,
     preservation deletion, unsafe absence, and 16-name list-only inventory are
     recorded in task evidence; no evidence document is committed;
-  - obsolete C01-C03 cycle plans are deleted; tracked `plans/` contains exactly
-    `.gitkeep`, the baseline review, reviewed specification, reviewed sequence,
-    and this C04 plan, with no transcript/verdict/evidence/handoff document;
+  - tracked `plans/` retains `.gitkeep`, the baseline review, reviewed
+    specification, reviewed sequence, and C01-C04 cycle plans, with no
+    transcript/verdict/evidence/handoff document;
   - reusable gate plus `cargo deny --all-features --locked --offline check licenses`,
     `cargo audit --no-fetch --stale`, and `test ! -e src/layout/legacy_generator.rs`
     pass; lock regeneration leaves the committed graph/worktree unchanged;
-  - `test "$(git ls-files plans/cycles | wc -l | tr -d ' ')" = 1`
-  - `test "$(git ls-files plans | wc -l | tr -d ' ')" = 5`
-  - `git ls-files --error-unmatch plans/.gitkeep plans/2026-07-17-crate-baseline-review.md plans/specs/2026-07-17-surgeist-generator-review-remediation.md plans/sequences/2026-07-17-surgeist-generator-review-remediation.md plans/cycles/2026-07-17-surgeist-generator-review-remediation-c04-atomic-layout-generation-leaf-candidate.md`
-  - `test ! -e plans/cycles/2026-07-17-surgeist-generator-review-remediation-c01-rooted-core-production-recovery.md`
-  - `test ! -e plans/cycles/2026-07-17-surgeist-generator-review-remediation-c02-protected-source-css-vertical-slice.md`
-  - `test ! -e plans/cycles/2026-07-17-surgeist-generator-review-remediation-c03-browser-free-layout-corpus-interface.md`
+  - `test "$(git ls-files plans/cycles | wc -l | tr -d ' ')" = 4`
+  - `test "$(git ls-files plans | wc -l | tr -d ' ')" = 8`
+  - `git ls-files --error-unmatch plans/.gitkeep plans/2026-07-17-crate-baseline-review.md plans/specs/2026-07-17-surgeist-generator-review-remediation.md plans/sequences/2026-07-17-surgeist-generator-review-remediation.md plans/cycles/2026-07-17-surgeist-generator-review-remediation-c01-rooted-core-production-recovery.md plans/cycles/2026-07-17-surgeist-generator-review-remediation-c02-protected-source-css-vertical-slice.md plans/cycles/2026-07-17-surgeist-generator-review-remediation-c03-browser-free-layout-corpus-interface.md plans/cycles/2026-07-17-surgeist-generator-review-remediation-c04-atomic-layout-generation-leaf-candidate.md`
 - Dependencies: T02 and its fresh task review are clean.
 - Intended commit: `docs: finalize generator guidance and policy`.
 
@@ -264,7 +262,7 @@ runs before the separately authorized terminal diagnostic.
 - Follow `$surgeist-agent` canonical-gate.md for delegated task/fix review,
   administrative status transitions, final checks, and holistic review. After all
   task ranges are clean and status is `complete`, run the reusable gate plus lock
-  generation, license, advisory, preservation/planning-tree absence, and the unsafe
+  generation, license, advisory, preservation deletion, planning-tree hygiene, and the unsafe
   scan below. C04's eventual holistic packet additionally includes every ordered
   T01-T03 task/fix range, preservation map/verdict, policy evidence, exact ignored
   inventory, and the authorized exhaustive result.

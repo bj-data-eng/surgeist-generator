@@ -1976,12 +1976,12 @@ documentation/handoff normalization until both features are executable. The
 specification does not restate or redefine that gate.
 
 The terminal tree retains canonical `plans/.gitkeep`, the already committed
-baseline review, and only the reviewed specification, implementation-sequence,
-and cycle-plan paths required by the candidate handoff. Planning-review verdicts,
-worker/reviewer transcripts, command evidence, and handoff chatter remain
-task-local and are embedded in the canonical candidate record; they are not
-persisted as additional planning documents. The handoff names each canonical
-planning path and reviewed revision together with the immutable published leaf
-SHA and exact feature/command/verification contract. Root and sibling adoption
-remain separate future work. Execution-resource cleanup remains solely governed
-by `surgeist-agent`.
+baseline review, and the reviewed specification, implementation-sequence, and
+cycle-plan paths that form the initiative planning history. Planning-review
+verdicts, worker/reviewer transcripts, command evidence, and handoff chatter
+remain task-local and are embedded in the canonical candidate record; they are
+not persisted as additional planning documents. The handoff names each active
+canonical planning path and reviewed revision together with the immutable
+published leaf SHA and exact feature/command/verification contract. Root and
+sibling adoption remain separate future work. Execution-resource cleanup remains
+solely governed by `surgeist-agent`.
