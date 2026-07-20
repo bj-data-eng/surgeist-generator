@@ -912,8 +912,9 @@ fn layout_taffy_sidecar_sha256_golden() {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod imports {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::fs;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -1092,6 +1093,36 @@ mod imports {
             self.source_files = files;
             self.write_manifest();
         }
+
+        fn move_source_to_non_utf8_checkout_root(&mut self) -> bool {
+            let destination = self
+                .root
+                .join(OsString::from_vec(b"checkout-native-\xff".to_vec()));
+            match fs::rename(&self.source, &destination) {
+                Ok(()) => {}
+                Err(error) => {
+                    // APFS rejects invalid UTF-8 names before a real checkout can
+                    // be created; each caller test still proves domain forwarding.
+                    assert_eq!(
+                        error.raw_os_error(),
+                        Some(92),
+                        "unexpected failure creating non-UTF-8 checkout root: {error}"
+                    );
+                    self.source = destination;
+                    return false;
+                }
+            }
+            self.source = destination;
+            assert!(self.source.to_str().is_none());
+            assert_eq!(
+                self.source
+                    .file_name()
+                    .expect("native checkout file name")
+                    .as_bytes(),
+                b"checkout-native-\xff"
+            );
+            true
+        }
     }
 
     impl Drop for Fixture {
@@ -1234,6 +1265,102 @@ mod imports {
             .iter()
             .map(|file| file["path"].as_str().expect("sidecar path").to_owned())
             .collect()
+    }
+
+    #[test]
+    fn layout_import_taffy_accepts_non_utf8_checkout_root_and_preserves_source_bytes() {
+        let mut fixture = Fixture::new(vec![(
+            "grid/native.html",
+            b"<div>native checkout fixture</div>\n",
+            false,
+        )]);
+        if !fixture.move_source_to_non_utf8_checkout_root() {
+            let before_bytes = snapshot_tree(&fixture.root);
+            let before_identities = snapshot_path_identities(&fixture.root);
+            let error = fixture
+                .import()
+                .expect_err("unsupported filesystem still forwards native checkout bytes");
+            assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("resolve caller checkout root:"),
+                "native checkout was rejected before OS canonicalization: {error}"
+            );
+            assert_eq!(snapshot_tree(&fixture.root), before_bytes);
+            assert_eq!(snapshot_path_identities(&fixture.root), before_identities);
+            return;
+        }
+        let source_bytes = snapshot_tree(&fixture.source);
+        let source_identities = snapshot_path_identities(&fixture.source);
+        let source_root_identity = path_identity(&fixture.source);
+        let authored = fixture
+            .authored
+            .iter()
+            .map(|(path, bytes)| ((*path).to_owned(), bytes.to_vec()))
+            .collect::<BTreeMap<_, _>>();
+
+        fixture
+            .import()
+            .expect("import from valid non-UTF-8 checkout root");
+
+        assert_eq!(snapshot_tree(&fixture.source), source_bytes);
+        assert_eq!(snapshot_path_identities(&fixture.source), source_identities);
+        assert_eq!(path_identity(&fixture.source), source_root_identity);
+        assert_eq!(
+            fs::read(fixture.corpus.join("html/grid/native.html"))
+                .expect("read imported native fixture"),
+            b"<div>native checkout fixture</div>\n"
+        );
+        for (path, expected) in authored {
+            assert_eq!(
+                fs::read(fixture.corpus.join("html").join(path))
+                    .expect("read preserved authored fixture"),
+                expected
+            );
+        }
+        assert_eq!(
+            sidecar_paths(&fixture),
+            BTreeSet::from(["grid/native.html".to_owned()])
+        );
+    }
+
+    #[test]
+    fn layout_check_taffy_accepts_non_utf8_checkout_root_and_is_read_only() {
+        let mut fixture = Fixture::new(vec![(
+            "grid/native.html",
+            b"<div>native checkout fixture</div>\n",
+            false,
+        )]);
+        fixture.import().expect("seed current Taffy import");
+        let native_checkout_supported = fixture.move_source_to_non_utf8_checkout_root();
+        let sidecar = fixture.corpus.join("html/.surgeist-taffy-source.json");
+        let fixture_path = fixture.corpus.join("html/grid/native.html");
+        let sidecar_identity = path_identity(&sidecar);
+        let fixture_identity = path_identity(&fixture_path);
+        let before_bytes = snapshot_tree(&fixture.root);
+        let before_identities = snapshot_path_identities(&fixture.root);
+        let before_root_identity = path_identity(&fixture.root);
+
+        let result = fixture.check();
+        if native_checkout_supported {
+            result.expect("check valid non-UTF-8 checkout root read-only");
+        } else {
+            let error = result.expect_err("unsupported filesystem forwards native checkout bytes");
+            assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("resolve caller checkout root:"),
+                "native checkout was rejected before OS canonicalization: {error}"
+            );
+        }
+
+        assert_eq!(snapshot_tree(&fixture.root), before_bytes);
+        assert_eq!(snapshot_path_identities(&fixture.root), before_identities);
+        assert_eq!(path_identity(&fixture.root), before_root_identity);
+        assert_eq!(path_identity(&sidecar), sidecar_identity);
+        assert_eq!(path_identity(&fixture_path), fixture_identity);
     }
 
     #[test]

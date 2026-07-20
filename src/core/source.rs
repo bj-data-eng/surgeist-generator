@@ -649,8 +649,9 @@ fn verify_git_source_proof<S>(
         "true",
         "checkout is not a Git worktree",
     )?;
-    let canonical_root = canonical_source_directory(
-        Path::new(&initial_runner.line(&["rev-parse", "--show-toplevel"])?),
+    let canonical_root = canonical_git_relative_directory(
+        &checkout,
+        &initial_runner.line(&["rev-parse", "--path-format=relative", "--show-toplevel"])?,
         "resolve Git worktree root",
     )?;
     if !checkout.starts_with(&canonical_root) {
@@ -660,18 +661,21 @@ fn verify_git_source_proof<S>(
     }
     let runner = GitRunner::new(trust, canonical_root.clone());
 
-    let worktree_git_dir = protected_directory_from_line(
-        &runner.line(&["rev-parse", "--absolute-git-dir"])?,
+    let worktree_git_dir = protected_directory_from_relative_line(
+        &canonical_root,
+        &runner.line(&["rev-parse", "--path-format=relative", "--git-dir"])?,
         "resolve per-worktree Git directory",
     )?;
-    let common_git_dir = protected_directory_from_line(
-        &runner.line(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?,
+    let common_git_dir = protected_directory_from_relative_line(
+        &canonical_root,
+        &runner.line(&["rev-parse", "--path-format=relative", "--git-common-dir"])?,
         "resolve common Git directory",
     )?;
-    let primary_objects = protected_directory_from_line(
+    let primary_objects = protected_directory_from_relative_line(
+        &canonical_root,
         &runner.line(&[
             "rev-parse",
-            "--path-format=absolute",
+            "--path-format=relative",
             "--git-path",
             "objects",
         ])?,
@@ -1565,18 +1569,17 @@ fn validate_read_only_git_arguments(arguments: &[OsString]) -> Result<&'static s
         ["rev-parse", option]
             if matches!(
                 *option,
-                "--is-inside-work-tree"
-                    | "--show-toplevel"
-                    | "--absolute-git-dir"
-                    | "--show-object-format=storage"
+                "--is-inside-work-tree" | "--show-object-format=storage"
             ) =>
         {
             Some("rev-parse")
         }
-        ["rev-parse", "--path-format=absolute", "--git-common-dir"]
+        ["rev-parse", "--path-format=relative", "--show-toplevel"]
+        | ["rev-parse", "--path-format=relative", "--git-dir"]
+        | ["rev-parse", "--path-format=relative", "--git-common-dir"]
         | [
             "rev-parse",
-            "--path-format=absolute",
+            "--path-format=relative",
             "--git-path",
             "objects",
         ]
@@ -1651,14 +1654,28 @@ struct ProtectedIndexEntry {
     object_id: String,
 }
 
-fn protected_directory_from_line(line: &str, operation: &str) -> Result<ProtectionEntry> {
-    let path = Path::new(line);
-    if !path.is_absolute() {
+fn canonical_git_relative_directory(base: &Path, line: &str, operation: &str) -> Result<PathBuf> {
+    let relative = Path::new(line);
+    if relative.is_absolute() {
         return Err(invalid_source(format!(
-            "{operation} returned a non-absolute path"
+            "{operation} returned a non-relative path"
         )));
     }
-    protected_directory(path, operation)
+    canonical_source_directory(&base.join(relative), operation)
+}
+
+fn protected_directory_from_relative_line(
+    base: &Path,
+    line: &str,
+    operation: &str,
+) -> Result<ProtectionEntry> {
+    let relative = Path::new(line);
+    if relative.is_absolute() {
+        return Err(invalid_source(format!(
+            "{operation} returned a non-relative path"
+        )));
+    }
+    protected_directory(&base.join(relative), operation)
 }
 
 fn protected_directory(path: &Path, operation: &str) -> Result<ProtectionEntry> {
@@ -2687,9 +2704,9 @@ fn require_identity(path: &Path, expected: &ObjectIdentity, operation: &str) -> 
 
 fn canonical_source_directory(path: &Path, operation: &str) -> Result<PathBuf> {
     let canonical = fs::canonicalize(path).map_err(|error| source_io(operation, path, error))?;
-    if canonical.to_str().is_none() || !canonical.is_dir() {
+    if !canonical.is_dir() {
         return Err(invalid_source(format!(
-            "{operation} did not resolve an existing UTF-8 directory: {}",
+            "{operation} did not resolve an existing directory: {}",
             path.display()
         )));
     }
@@ -2697,9 +2714,6 @@ fn canonical_source_directory(path: &Path, operation: &str) -> Result<PathBuf> {
 }
 
 fn canonical_checkout_directory(path: &Path) -> Result<PathBuf> {
-    if path.to_str().is_none() {
-        return Err(invalid_checkout_path("caller checkout root is not UTF-8"));
-    }
     let canonical = fs::canonicalize(path).map_err(|error| {
         GeneratorError::with_source(
             GeneratorErrorKind::InvalidPath,
@@ -2708,9 +2722,9 @@ fn canonical_checkout_directory(path: &Path) -> Result<PathBuf> {
             error,
         )
     })?;
-    if canonical.to_str().is_none() || !canonical.is_dir() {
+    if !canonical.is_dir() {
         return Err(invalid_checkout_path(format!(
-            "caller checkout root is not an existing UTF-8 directory: {}",
+            "caller checkout root is not an existing directory: {}",
             path.display()
         )));
     }
@@ -2748,7 +2762,7 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::process::{Command, Output};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2782,6 +2796,36 @@ mod tests {
 
         fn path(&self) -> &Path {
             &self.0
+        }
+
+        #[cfg(unix)]
+        fn try_rename_with_non_utf8_suffix(&mut self) -> bool {
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+            let mut file_name = self
+                .0
+                .file_name()
+                .expect("test directory name")
+                .as_bytes()
+                .to_vec();
+            file_name.extend_from_slice(b"-\xff");
+            let renamed = self.0.with_file_name(OsString::from_vec(file_name));
+            match fs::rename(&self.0, &renamed) {
+                Ok(()) => {
+                    self.0 = renamed;
+                    true
+                }
+                Err(error) => {
+                    // APFS rejects invalid UTF-8 names before a real checkout can
+                    // be created; the caller test still proves OS-byte forwarding.
+                    assert_eq!(
+                        error.raw_os_error(),
+                        Some(92),
+                        "unexpected failure creating non-UTF-8 checkout root: {error}"
+                    );
+                    false
+                }
+            }
         }
     }
 
@@ -3151,12 +3195,12 @@ mod tests {
 
         let allowed: &[&[&str]] = &[
             &["rev-parse", "--is-inside-work-tree"],
-            &["rev-parse", "--show-toplevel"],
-            &["rev-parse", "--absolute-git-dir"],
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            &["rev-parse", "--path-format=relative", "--show-toplevel"],
+            &["rev-parse", "--path-format=relative", "--git-dir"],
+            &["rev-parse", "--path-format=relative", "--git-common-dir"],
             &[
                 "rev-parse",
-                "--path-format=absolute",
+                "--path-format=relative",
                 "--git-path",
                 "objects",
             ],
@@ -3199,6 +3243,15 @@ mod tests {
         }
 
         let rejected: &[&[&str]] = &[
+            &["rev-parse", "--show-toplevel"],
+            &["rev-parse", "--absolute-git-dir"],
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects",
+            ],
             &["rev-parse", "--verify", "0123456789ab^{commit}"],
             &["rev-parse", "--verify", "HEAD~1^{commit}"],
             &["rev-parse", "--verify", "HEAD^{tree}"],
@@ -3706,6 +3759,106 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn valid_non_utf8_checkout_is_forwarded_natively_and_verified() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        use std::os::unix::process::ExitStatusExt;
+
+        let native_checkout = PathBuf::from(OsString::from_vec(b"/checkout-native-\xff".to_vec()));
+        assert!(native_checkout.to_str().is_none());
+
+        let runner = GitRunner::new(
+            TrustedGit::discover().expect("supported installed Apple Git"),
+            native_checkout.clone(),
+        );
+        let command_ran = Cell::new(false);
+        let output = runner
+            .run_with(
+                &os_arguments(&["rev-parse", "--is-inside-work-tree"]),
+                |command| {
+                    let arguments = command.get_args().collect::<Vec<_>>();
+                    let checkout_index = arguments
+                        .iter()
+                        .position(|argument| *argument == OsStr::new("-C"))
+                        .expect("sanitized Git command has checkout selector")
+                        + 1;
+                    assert_eq!(
+                        arguments[checkout_index].as_bytes(),
+                        native_checkout.as_os_str().as_bytes(),
+                        "checkout argument was not forwarded as exact OS bytes"
+                    );
+                    command_ran.set(true);
+                    Ok(Output {
+                        status: std::process::ExitStatus::from_raw(0),
+                        stdout: b"true\n".to_vec(),
+                        stderr: Vec::new(),
+                    })
+                },
+            )
+            .expect("construct sanitized Git command from native checkout");
+        assert!(command_ran.get());
+        assert_eq!(
+            super::strict_stdout_line(&output, "read native checkout probe")
+                .expect("strict UTF-8 Git result"),
+            "true"
+        );
+
+        let non_utf8_token = OsString::from_vec(vec![0xff]);
+        let spawn_attempted = Cell::new(false);
+        let error = runner
+            .run_with(&[non_utf8_token], |_| {
+                spawn_attempted.set(true);
+                Err(std::io::Error::other("non-UTF-8 token reached spawn"))
+            })
+            .expect_err("non-UTF-8 Git-returned/token rules remain strict");
+        assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+        assert!(!spawn_attempted.get());
+
+        let non_utf8_output = Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: vec![0xff, b'\n'],
+            stderr: Vec::new(),
+        };
+        let error = super::strict_stdout_line(&non_utf8_output, "read sanitized Git output")
+            .expect_err("Git-returned data remains strict UTF-8");
+        assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
+
+        let (mut directory, origin, revision) = repository();
+        if !directory.try_rename_with_non_utf8_suffix() {
+            // Exercise the same boundary on APFS: native bytes must reach
+            // canonicalization instead of being rejected as text.
+            let missing_native = directory
+                .path()
+                .with_file_name(OsString::from_vec(b"missing-checkout-\xff".to_vec()));
+            let error = super::canonical_checkout_directory(&missing_native)
+                .expect_err("filesystem rejects native checkout fixture");
+            assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("resolve caller checkout root:"),
+                "native checkout was rejected before OS canonicalization: {error}"
+            );
+            return;
+        }
+        let checkout = fs::canonicalize(directory.path()).expect("canonical native checkout");
+        assert!(checkout.to_str().is_none());
+
+        let verified = verify_git_source(
+            directory.path(),
+            &pin(&origin, revision.clone(), "fixtures"),
+        )
+        .expect("valid non-UTF-8 checkout root");
+        assert_eq!(verified.canonical_root(), checkout);
+        assert_eq!(verified.revision(), &revision);
+        assert_eq!(
+            fs::read(verified.canonical_source_root().join("case.json"))
+                .expect("read verified fixture"),
+            b"{}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn caller_checkout_path_failures_are_invalid_paths() {
         use std::os::unix::ffi::OsStringExt;
 
@@ -3722,8 +3875,9 @@ mod tests {
         let error = verify_git_source(&regular, &source).expect_err("non-directory caller root");
         assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
 
-        let non_utf8 = parent.path().join(OsString::from_vec(vec![0xff]));
-        let error = verify_git_source(&non_utf8, &source).expect_err("non-UTF-8 caller root");
+        let missing_non_utf8 = parent.path().join(OsString::from_vec(vec![0xff]));
+        let error = verify_git_source(&missing_non_utf8, &source)
+            .expect_err("missing OS-native caller root");
         assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
     }
 
