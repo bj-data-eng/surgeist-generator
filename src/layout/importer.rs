@@ -35,14 +35,20 @@ pub(super) fn check(request: &LayoutRequest) -> Result<()> {
     let manifest_path = location.corpus_root().join(MANIFEST_FILE);
     let manifest_bytes = super::manifest::read_file(&manifest_path)?;
     let manifest = super::manifest::parse(&manifest_bytes, &manifest_path)?;
-    let expected = source_expectation(request, &manifest)?;
-    prove_partition_sets(&manifest.authored_files, &expected.desired_taffy)?;
-
-    let (existing, authored) = inspect_html(
-        RootedFs::open_corpus(location)?,
-        &manifest,
-        &expected.desired_taffy,
-    )?;
+    let inspection = scan_html(RootedFs::open_corpus(location)?)?;
+    // A persisted sidecar owns current Taffy paths, so classify its inventory
+    // before consulting the explicitly named checkout.
+    let (expected, existing, authored) = if inspection.sidecar.is_some() {
+        let (existing, authored) = classify_html(inspection, &manifest, &BTreeSet::new())?;
+        let expected = source_expectation(request, &manifest)?;
+        prove_partition_sets(&manifest.authored_files, &expected.desired_taffy)?;
+        (expected, existing, authored)
+    } else {
+        let expected = source_expectation(request, &manifest)?;
+        prove_partition_sets(&manifest.authored_files, &expected.desired_taffy)?;
+        let (existing, authored) = classify_html(inspection, &manifest, &expected.desired_taffy)?;
+        (expected, existing, authored)
+    };
     validate_checked_import(&existing, &expected.sidecar)?;
     let authored_records = authored.records();
 
@@ -74,7 +80,6 @@ fn check_current(
     authored: &AuthoredPartition,
     authored_records: &[(RelativePath, Vec<u8>, HeldIdentity)],
 ) -> Result<()> {
-    expected.source.closing_revalidate()?;
     let rooted = RootedFs::open_corpus(request.location())?;
     super::manifest::revalidate(&rooted, manifest_bytes)?;
     authored.revalidate(&rooted)?;
@@ -86,6 +91,7 @@ fn check_current(
         ));
     }
 
+    expected.source.closing_revalidate()?;
     let repeated = source_expectation(request, manifest)?;
     if repeated.sidecar != expected.sidecar || repeated.desired_taffy != expected.desired_taffy {
         return Err(source_verification(
@@ -575,6 +581,16 @@ fn inspect_html(
     manifest: &LayoutManifest,
     desired_taffy: &BTreeSet<RelativePath>,
 ) -> Result<(ExistingHtml, AuthoredPartition)> {
+    classify_html(scan_html(rooted)?, manifest, desired_taffy)
+}
+
+struct HtmlInspection {
+    rooted: RootedFs,
+    inventory: Option<Inventory>,
+    sidecar: Option<TaffyImportSidecar>,
+}
+
+fn scan_html(rooted: RootedFs) -> Result<HtmlInspection> {
     let inventory = Inventory::scan(&rooted, HTML_ROOT, InventoryPolicy::FinalCorpus)?;
     let sidecar_path = RelativePath::new(SIDECAR_FILE)?;
     let sidecar_entry = inventory
@@ -593,6 +609,24 @@ fn inspect_html(
     } else {
         None
     };
+    Ok(HtmlInspection {
+        rooted,
+        inventory,
+        sidecar,
+    })
+}
+
+fn classify_html(
+    inspection: HtmlInspection,
+    manifest: &LayoutManifest,
+    desired_taffy: &BTreeSet<RelativePath>,
+) -> Result<(ExistingHtml, AuthoredPartition)> {
+    let HtmlInspection {
+        rooted,
+        inventory,
+        sidecar,
+    } = inspection;
+    let sidecar_path = RelativePath::new(SIDECAR_FILE)?;
 
     let current_taffy = sidecar.as_ref().map_or_else(
         || desired_taffy.clone(),

@@ -1035,6 +1035,56 @@ mod imports {
     }
 
     #[test]
+    fn layout_check_taffy_malformed_sidecar_precedes_dirty_source_verification() {
+        let malformed = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
+        malformed.import().expect("seed current import");
+        fs::write(
+            malformed.corpus.join("html/.surgeist-taffy-source.json"),
+            b"{}\n",
+        )
+        .expect("malform Taffy sidecar");
+        fs::write(
+            malformed.source.join("test_fixtures/grid/current.html"),
+            b"dirty source bytes\n",
+        )
+        .expect("drift source snapshot");
+
+        assert_check_preserves(&malformed, Some(GeneratorErrorKind::InvalidInventory));
+    }
+
+    #[test]
+    fn layout_check_taffy_unknown_inventory_precedes_wrong_checkout_verification() {
+        let unknown = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
+        unknown.import().expect("seed current import");
+        write_corpus_file(&unknown.corpus.join("html/unknown.html"), b"unknown\n");
+        let wrong = Fixture::new(vec![("other/wrong.html", b"wrong checkout\n", false)]);
+        let before_unknown_bytes = snapshot_tree(&unknown.root);
+        let before_unknown_identities = snapshot_path_identities(&unknown.root);
+        let before_wrong_bytes = snapshot_tree(&wrong.root);
+        let before_wrong_identities = snapshot_path_identities(&wrong.root);
+        let request =
+            LayoutRequest::check_taffy_corpus(unknown.location.clone(), wrong.source.clone())
+                .expect("wrong-checkout request");
+
+        let error = crate::layout::run(request).expect_err("unknown import inventory");
+        assert_eq!(
+            error.kind(),
+            GeneratorErrorKind::InvalidInventory,
+            "unexpected check diagnostic: {error}"
+        );
+        assert_eq!(snapshot_tree(&unknown.root), before_unknown_bytes);
+        assert_eq!(
+            snapshot_path_identities(&unknown.root),
+            before_unknown_identities
+        );
+        assert_eq!(snapshot_tree(&wrong.root), before_wrong_bytes);
+        assert_eq!(
+            snapshot_path_identities(&wrong.root),
+            before_wrong_identities
+        );
+    }
+
+    #[test]
     fn layout_read_only_taffy_coordination_states_are_verification_and_byte_identical() {
         let active = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
         active.import().expect("seed current import");
