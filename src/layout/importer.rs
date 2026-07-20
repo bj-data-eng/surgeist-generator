@@ -36,20 +36,13 @@ pub(super) fn check(request: &LayoutRequest) -> Result<()> {
     let manifest_bytes = super::manifest::read_file(&manifest_path)?;
     let manifest = super::manifest::parse(&manifest_bytes, &manifest_path)?;
     let inspection = scan_html(RootedFs::open_corpus(location)?)?;
-    // A persisted sidecar owns current Taffy paths, so classify its inventory
-    // before consulting the explicitly named checkout.
-    let (expected, existing, authored) = if inspection.sidecar.is_some() {
-        let (existing, authored) = classify_html(inspection, &manifest, &BTreeSet::new())?;
-        let expected = source_expectation(request, &manifest)?;
-        prove_partition_sets(&manifest.authored_files, &expected.desired_taffy)?;
-        (expected, existing, authored)
-    } else {
-        let expected = source_expectation(request, &manifest)?;
-        prove_partition_sets(&manifest.authored_files, &expected.desired_taffy)?;
-        let (existing, authored) = classify_html(inspection, &manifest, &expected.desired_taffy)?;
-        (expected, existing, authored)
-    };
-    validate_checked_import(&existing, &expected.sidecar)?;
+    // A persisted sidecar owns current Taffy paths, so classify and validate
+    // the import before consulting the explicitly named checkout.
+    let (existing, authored) = classify_html(inspection, &manifest, &BTreeSet::new())?;
+    let persisted_sidecar = validate_checked_import(&existing)?;
+    let expected = source_expectation(request, &manifest)?;
+    prove_partition_sets(&manifest.authored_files, &expected.desired_taffy)?;
+    validate_expected_sidecar(persisted_sidecar, &expected.sidecar)?;
     let authored_records = authored.records();
 
     let check =
@@ -84,7 +77,8 @@ fn check_current(
     super::manifest::revalidate(&rooted, manifest_bytes)?;
     authored.revalidate(&rooted)?;
     let (current, current_authored) = inspect_html(rooted, manifest, &expected.desired_taffy)?;
-    validate_checked_import(&current, &expected.sidecar)?;
+    let current_sidecar = validate_checked_import(&current)?;
+    validate_expected_sidecar(current_sidecar, &expected.sidecar)?;
     if &current != existing || current_authored.records() != authored_records {
         return Err(verification(
             "layout HTML identities or inventory changed during Taffy checking",
@@ -147,7 +141,7 @@ fn source_expectation(
     })
 }
 
-fn validate_checked_import(existing: &ExistingHtml, expected: &TaffyImportSidecar) -> Result<()> {
+fn validate_checked_import(existing: &ExistingHtml) -> Result<&TaffyImportSidecar> {
     let sidecar = existing.sidecar.as_ref().ok_or_else(|| {
         verification("Taffy import sidecar is absent; run import-taffy with the named source")
     })?;
@@ -164,11 +158,6 @@ fn validate_checked_import(existing: &ExistingHtml, expected: &TaffyImportSideca
             "Taffy import sidecar bytes changed during inventory inspection",
         ));
     }
-    if sidecar != expected {
-        return Err(verification(
-            "Taffy import sidecar is stale against the manifest and named source",
-        ));
-    }
     for file in sidecar.files() {
         let Some(entry) = inventory.find(&file.path) else {
             return Err(verification(format!(
@@ -182,6 +171,18 @@ fn validate_checked_import(existing: &ExistingHtml, expected: &TaffyImportSideca
                 file.path.as_str()
             )));
         }
+    }
+    Ok(sidecar)
+}
+
+fn validate_expected_sidecar(
+    sidecar: &TaffyImportSidecar,
+    expected: &TaffyImportSidecar,
+) -> Result<()> {
+    if sidecar != expected {
+        return Err(verification(
+            "Taffy import sidecar is stale against the manifest and named source",
+        ));
     }
     Ok(())
 }

@@ -1018,6 +1018,33 @@ mod imports {
     }
 
     #[test]
+    fn layout_check_taffy_missing_sidecar_precedes_dirty_source_with_import_instruction() {
+        let fixture = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
+        fs::write(
+            fixture.source.join("test_fixtures/grid/current.html"),
+            b"dirty source bytes\n",
+        )
+        .expect("drift source snapshot");
+        let before_bytes = snapshot_tree(&fixture.root);
+        let before_identities = snapshot_path_identities(&fixture.root);
+        let before_root_identity = path_identity(&fixture.root);
+
+        let error = fixture.check().expect_err("missing Taffy sidecar");
+        assert_eq!(
+            error.kind(),
+            GeneratorErrorKind::Verification,
+            "unexpected check diagnostic: {error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "check Taffy corpus: Taffy import sidecar is absent; run import-taffy with the named source"
+        );
+        assert_eq!(snapshot_tree(&fixture.root), before_bytes);
+        assert_eq!(snapshot_path_identities(&fixture.root), before_identities);
+        assert_eq!(path_identity(&fixture.root), before_root_identity);
+    }
+
+    #[test]
     fn layout_check_taffy_malformed_and_unknown_inventory_are_invalid_inventory() {
         let malformed = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
         malformed.import().expect("seed current import");
