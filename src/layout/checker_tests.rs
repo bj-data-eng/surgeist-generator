@@ -712,6 +712,33 @@ status = "active"
     collision.assert_preserved(Some(GeneratorErrorKind::InvalidInventory));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn layout_check_corpus_rejects_case_only_taffy_sidecar_aliases() {
+    let aliases = Fixture::current();
+    aliases.write_manifest(2);
+    aliases.write_import(&[("Grid/basic.html", SOURCE), ("grid/basic.html", SOURCE)]);
+    aliases.assert_preserved(Some(GeneratorErrorKind::InvalidInventory));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn layout_check_corpus_stale_sidecar_does_not_mask_case_only_authored_taffy_collision() {
+    let collision = Fixture::current();
+    let cases = r#"[[cases]]
+id = "authored/collision"
+source_root = "surgeist"
+source = "Grid/basic.html"
+generator = "constrained-html"
+status = "active"
+"#;
+    write_file(
+        &collision.corpus.join("corpus.toml"),
+        manifest_text(&"2".repeat(40), 1, cases).as_bytes(),
+    );
+    collision.assert_preserved(Some(GeneratorErrorKind::InvalidInventory));
+}
+
 #[test]
 fn layout_historical_inventory_rejects_malformed_authority_and_unknown_entries() {
     let malformed = Fixture::current();

@@ -7,7 +7,7 @@ use crate::core::{
 use crate::{GeneratorError, GeneratorErrorKind, RelativePath, Result, Sha256Digest};
 
 use super::LayoutRequest;
-use super::manifest::{HTML_ROOT, LayoutManifest, MANIFEST_FILE, SIDECAR_FILE};
+use super::manifest::{HTML_ROOT, LayoutManifest, MANIFEST_FILE, SIDECAR_FILE, paths_target_equal};
 use super::report::{
     self, CheckState, CurrentCorpus, DesiredDisposition, DesiredSource, desired_disposition,
 };
@@ -126,23 +126,15 @@ fn inspect_html(rooted: &RootedFs, manifest: &LayoutManifest) -> Result<HtmlStat
         .read_file(&format!("{HTML_ROOT}/{SIDECAR_FILE}"), CORPUS_FILE_MODE)
         .map_err(html_io)?;
     let sidecar = TaffyImportSidecar::parse_canonical(&sidecar_bytes)?;
-    let sidecar_is_stale = sidecar.revision() != &manifest.revision
-        || sidecar.source_file_count() != manifest.expected_source_files;
-
     let taffy_paths = sidecar
         .files()
         .iter()
         .map(|file| file.path.clone())
         .collect::<BTreeSet<_>>();
-    if manifest
-        .authored_files
-        .iter()
-        .any(|path| taffy_paths.contains(path))
-    {
-        return Err(invalid_inventory(
-            "manifest-authored and Taffy-owned HTML paths collide",
-        ));
-    }
+    validate_partition_paths(&manifest.authored_files, &taffy_paths)?;
+    let sidecar_is_stale = sidecar.revision() != &manifest.revision
+        || sidecar.source_file_count() != manifest.expected_source_files;
+
     let mut admitted = manifest.authored_files.clone();
     admitted.extend(taffy_paths);
     admitted.insert(sidecar_path);
@@ -278,6 +270,32 @@ fn required_regular_identity(rooted: &RootedFs, path: &str, label: &str) -> Resu
         )));
     }
     Ok(identity)
+}
+
+fn validate_partition_paths(
+    authored_files: &BTreeSet<RelativePath>,
+    taffy_paths: &BTreeSet<RelativePath>,
+) -> Result<()> {
+    let taffy_paths = taffy_paths.iter().collect::<Vec<_>>();
+    for (index, path) in taffy_paths.iter().enumerate() {
+        if taffy_paths[index + 1..]
+            .iter()
+            .any(|other| paths_target_equal(path.as_str(), other.as_str()))
+        {
+            return Err(invalid_inventory(
+                "Taffy sidecar paths alias on the checker target",
+            ));
+        }
+        if authored_files
+            .iter()
+            .any(|authored| paths_target_equal(authored.as_str(), path.as_str()))
+        {
+            return Err(invalid_inventory(
+                "manifest-authored and Taffy-owned HTML paths collide",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
