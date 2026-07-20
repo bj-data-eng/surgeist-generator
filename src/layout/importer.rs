@@ -36,6 +36,11 @@ pub(super) fn check(request: &LayoutRequest) -> Result<()> {
     let manifest_bytes = super::manifest::read_file(&manifest_path)?;
     let manifest = super::manifest::parse(&manifest_bytes, &manifest_path)?;
     let inspection = scan_html(RootedFs::open_corpus(location)?)?;
+    if inspection.sidecar.is_none() {
+        return Err(verification(
+            "Taffy import sidecar is absent; run import-taffy with the named source",
+        ));
+    }
     // A persisted sidecar owns current Taffy paths, so classify and validate
     // the import before consulting the explicitly named checkout.
     let (existing, authored) = classify_html(inspection, &manifest, &BTreeSet::new())?;

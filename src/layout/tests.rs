@@ -1640,6 +1640,29 @@ mod imports {
     }
 
     #[test]
+    fn layout_check_taffy_sidecar_free_legacy_with_taffy_html_is_verification_and_read_only() {
+        let fixture = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
+        write_corpus_file(&fixture.corpus.join("html/grid/current.html"), b"current\n");
+        let before_bytes = snapshot_tree(&fixture.root);
+        let before_identities = snapshot_path_identities(&fixture.root);
+        let before_root_identity = path_identity(&fixture.root);
+
+        let error = fixture.check().expect_err("sidecar-free legacy import");
+        assert_eq!(
+            error.kind(),
+            GeneratorErrorKind::Verification,
+            "unexpected check diagnostic: {error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "check Taffy corpus: Taffy import sidecar is absent; run import-taffy with the named source"
+        );
+        assert_eq!(snapshot_tree(&fixture.root), before_bytes);
+        assert_eq!(snapshot_path_identities(&fixture.root), before_identities);
+        assert_eq!(path_identity(&fixture.root), before_root_identity);
+    }
+
+    #[test]
     fn layout_check_taffy_malformed_and_unknown_inventory_are_invalid_inventory() {
         let malformed = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
         malformed.import().expect("seed current import");

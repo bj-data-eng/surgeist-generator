@@ -27,10 +27,14 @@ pub(crate) use artifact::{
 pub(crate) use case::validate_disposition_reason;
 #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 pub(crate) use coordination::Domain;
+#[cfg(feature = "layout-browser")]
+pub(crate) use fs::HeldIdentity;
 #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
-pub(crate) use fs::{CORPUS_FILE_MODE, HeldIdentity, NodeKind, RootedFs};
+pub(crate) use fs::{CORPUS_FILE_MODE, NodeKind, RootedFs};
+#[cfg(feature = "layout-browser")]
+pub(crate) use inventory::InventoryEntry;
 #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
-pub(crate) use inventory::{Inventory, InventoryEntry, InventoryPolicy};
+pub(crate) use inventory::{Inventory, InventoryPolicy};
 #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 pub(crate) use lease::GenerationCheck;
 #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
