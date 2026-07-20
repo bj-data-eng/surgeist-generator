@@ -4,7 +4,7 @@
 
 - Cycle ID: `C04`
 - Owning repository: `/Users/codex/Development/surgeist-generator`
-- Status: `in_progress`
+- Status: `draft`
 - Cycle base: `65ae2af6e3b1a2e9640decfa186dc2bf37ae4f7a`
 - Published prerequisite: C03 at the cycle base, with local `main`, its authority
   tracking ref, and observed authority-remote `main` equal at readback.
@@ -98,6 +98,23 @@
 - Supported mutation remains Apple-Silicon macOS. Default value/read code stays
   native/wasm portable; CSS-only builds do not activate browser dependencies;
   `#![forbid(unsafe_code)]` remains and no executable unsafe is allowed.
+
+## Impacts
+
+- API: additive layout `Generate` capability under `layout-browser`; existing
+  shared, CSS, and browser-free layout signatures remain unchanged.
+- Dependencies/features: add only the four reviewed optional browser-edge
+  dependencies, their offline lock graph, and exact license policy; default and
+  CSS-only builds remain isolated from that graph.
+- Artifacts: commit no production corpus, browser, fixture, XML, report, or cache;
+  tests use temporary synthetic roots. T02 deletes the mapped preservation copy.
+- Docs/examples: T03 updates README, AGENTS, rustdoc, examples, and command
+  guidance to the completed two-driver and trusted-browser contracts.
+- MSRV/platform: retain Rust 1.97; mutation remains Apple-Silicon macOS while the
+  default value/read library remains native/wasm portable.
+- Root follow-up: no root gitlink, facade, API audit artifact, or sibling adoption
+  changes; those remain later owning-repository work.
+- Unsafe: none; executable owned Rust remains forbidden from using unsafe.
 
 ## Reusable Task-Clean Gate
 
@@ -222,17 +239,13 @@ runs before the separately authorized terminal diagnostic.
 
 ## Completion
 
-- The coordinator assigns one fresh worker per task and one fresh task reviewer
-  per task/range. Findings use a fresh fix worker and fresh rereviewer until
-  clean. Status transitions are separate coordinator commits: `reviewed` after
-  clean planning review, `in_progress` before T01, and `complete` only after all
-  task reviews are clean. Any final/holistic defect reopens `in_progress` and
-  repeats the affected worker/reviewer loop before a new `complete` commit.
-- After task-clean completion, rerun the reusable gate plus lock generation,
-  license, advisory, preservation-absence, and the unsafe scan below. A fresh
-  holistic reviewer evaluates the exact cycle range, ordered task/fix ranges,
-  responsibility map/verdict, policy evidence, and exact ignored inventory.
-  After a clean verdict, rerun the same ordinary final gate and list-only count.
+- Follow `$surgeist-agent` canonical-gate.md for delegated task/fix review,
+  administrative status transitions, final checks, and fresh holistic review.
+  C04's holistic packet additionally includes every ordered T01-T03 task/fix
+  range, the preservation responsibility map/verdict, dependency/policy evidence,
+  and exact ignored inventory. Rerun the reusable gate plus lock generation,
+  license, advisory, preservation-absence, and the unsafe scan below both before
+  holistic review and after any holistic fix cycle as the canonical gate requires.
 - Failure-propagating owned-Rust unsafe scan (post-deletion scope):
   ```zsh
   (
@@ -261,15 +274,10 @@ runs before the separately authorized terminal diagnostic.
   Failure stops publication with no automatic rerun. A pass is terminal evidence;
   any later source/test/plan/lock/doc commit invalidates it and requires fresh
   affected review plus fresh user authority.
-- Publish only after that pass, following `$surgeist-agent` canonical-gate.md
-  “Automated landing and publication” exactly: resolve the authority remote from
-  `main@{upstream}` and require branch `main`; record/fetch the exact remote tip;
-  reconcile movement with the bounded safety-ref/rebase/re-review loop; push the
-  immutable candidate with the explicit proven-fast-forward lease; and perform
-  bounded fresh readback. Completion requires clean local `main` equal its
-  authority tracking ref and observed remote `main`, with the reviewed candidate
-  equal to or an ancestor of that observed tip. Preserve/report remote-history,
-  contention, ownership, or cleanup blockers rather than rewriting history.
+- Only after that pass, execute canonical-gate.md “Automated landing and
+  publication” without variation. Record its authority-upstream, immutable
+  candidate, reconciliation/re-review, leased push, ancestry, readback, equality,
+  cleanliness, and cleanup evidence in the C04 handoff.
 - Handoff records immutable candidate/published tips; reviewed planning SHAs;
   ordered task/fix ranges and verdicts; API/feature/dependency/policy/platform
   evidence; trust/profile/generation/publication behavior; preservation map and
