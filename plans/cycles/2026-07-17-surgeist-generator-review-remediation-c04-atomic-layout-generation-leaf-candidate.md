@@ -176,7 +176,10 @@ runs before the separately authorized terminal diagnostic.
     production caller; obsolete items are deferred to T02 removal.
 - Additional commands before the reusable gate:
   - `cargo generate-lockfile --offline`
-  - focused `cargo test --locked --offline -p surgeist-generator --features layout-browser --lib` filters for `layout_profile_`, `layout_browser_`, `layout_generate_`, and `layout_filter_`
+  - `cargo test --locked --offline -p surgeist-generator --features layout-browser --lib layout_profile_`
+  - `cargo test --locked --offline -p surgeist-generator --features layout-browser --lib layout_browser_`
+  - `cargo test --locked --offline -p surgeist-generator --features layout-browser --lib layout_generate_`
+  - `cargo test --locked --offline -p surgeist-generator --features layout-browser --lib layout_filter_`
   - `cargo test --locked --offline -p surgeist-generator --features layout-browser --test public_api`
   - `cargo test --locked --offline -p surgeist-generator --features layout-browser --test layout_cli`
   - `command -v cargo-deny && cargo deny --all-features --locked --offline check licenses`
@@ -208,8 +211,14 @@ runs before the separately authorized terminal diagnostic.
     production callers or are removed, with no no-op/test/lint substitute;
   - `test ! -e src/layout/legacy_generator.rs` and the reusable gate pass with
     the exact list-only 16 inventory.
-- Additional commands: `test ! -e src/layout/legacy_generator.rs`, then the
-  reusable task-clean gate.
+- Additional commands, in order before the reusable gate:
+  - before opening/deletion,
+    `test "$(wc -l < src/layout/legacy_generator.rs | tr -d ' ')" = 4626`
+  - before opening/deletion,
+    `test "$(shasum -a 256 src/layout/legacy_generator.rs | cut -d ' ' -f 1)" = d2f5ca87cea6b36826e9172e2d7ba7a99196c375e2ca53f8a84a075200e70a9f`
+  - after the responsibility map and deletion,
+    `test ! -e src/layout/legacy_generator.rs`
+  - then execute the reusable task-clean gate.
 - Dependencies: T01 and its fresh task review are clean.
 - Intended commit: `refactor(layout): retire preserved generator`.
 
