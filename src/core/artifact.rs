@@ -249,10 +249,7 @@ impl ArtifactPlan {
                 if entry.identity().kind() != NodeKind::Regular {
                     continue;
                 }
-                let preserve = match self.policy {
-                    PublicationPolicy::CleanFull => self.inventory.retained.contains(entry.path()),
-                    PublicationPolicy::DiagnosticFull | PublicationPolicy::Filtered => true,
-                };
+                let preserve = self.inventory.retained.contains(entry.path());
                 if preserve {
                     desired.insert(
                         entry.path().clone(),
@@ -535,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_full_preserves_stale_output() {
+    fn diagnostic_full_prunes_unretained_stale_output() {
         let fixture = Fixture::new();
         fixture.seed(&[("stale.xml", b"stale")]);
         let lease = fixture.lease();
@@ -558,7 +555,13 @@ mod tests {
         .expect("diagnostic plan")
         .install()
         .expect("install diagnostic plan");
-        assert_eq!(fixture.read("stale.xml"), b"stale");
+        assert!(
+            !fixture
+                .location
+                .corpus_root()
+                .join("xml/stale.xml")
+                .exists()
+        );
         assert_eq!(
             fixture.read("generation-reports/diagnostic.json"),
             b"diagnostic"
@@ -577,7 +580,7 @@ mod tests {
         let classification = || {
             inventory(
                 &["matched.xml", "stale.xml", "generation-reports/full.json"],
-                &[],
+                &["stale.xml", "generation-reports/full.json"],
                 &["generation-reports/full.json"],
             )
         };

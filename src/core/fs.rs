@@ -449,6 +449,50 @@ impl BoundPath {
         Ok(())
     }
 
+    /// Duplicates the exact held regular-file descriptor without resolving its path again.
+    #[cfg(feature = "layout-browser")]
+    pub(crate) fn held_regular_file(&self) -> Result<std::fs::File> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let identity = self.existing_identity();
+            if !self.remaining.is_empty()
+                || identity.kind() != NodeKind::Regular
+                || identity.link_count() != Some(1)
+            {
+                return Err(invalid_path(
+                    "open held protected regular file",
+                    format!(
+                        "path is not a single-link regular file: {}",
+                        self.requested.display()
+                    ),
+                ));
+            }
+            self.revalidate()?;
+            let descriptor = self.descriptors.last().ok_or_else(|| {
+                invalid_path(
+                    "open held protected regular file",
+                    format!(
+                        "path has no retained descriptor: {}",
+                        self.requested.display()
+                    ),
+                )
+            })?;
+            let duplicate = rustix::io::dup(descriptor).map_err(|source| {
+                namespace_io_error(
+                    "duplicate held protected regular file",
+                    &self.requested,
+                    source,
+                )
+            })?;
+            Ok(std::fs::File::from(duplicate))
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            MutationTarget::Unsupported.require_supported("open held protected regular file")?;
+            unreachable!("unsupported mutation target returned success")
+        }
+    }
+
     pub(crate) fn overlaps(&self, other: &Self) -> Result<bool> {
         if self.canonical_path == other.canonical_path
             || self.canonical_path.starts_with(&other.canonical_path)
@@ -1796,6 +1840,42 @@ impl RootedFs {
         self.remove_exact(relative, expected, true)
     }
 
+    /// Erases one browser-owned opaque directory without resolving a child through a path.
+    #[cfg(feature = "layout-browser")]
+    pub(crate) fn erase_opaque_directory(
+        &self,
+        relative: &str,
+        expected: &HeldIdentity,
+    ) -> Result<()> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let directory = self.open_dir(relative)?;
+            let actual = identity_from_fd(&directory, "inspect opaque directory root")?;
+            require_same_mount(&self.identity, &actual, "validate opaque directory mount")?;
+            if actual.kind != NodeKind::Directory || !expected.matches_recovery(&actual) {
+                return Err(transaction_error(
+                    "erase opaque directory",
+                    format!("opaque root identity changed: {relative}"),
+                ));
+            }
+            erase_opaque_children(self, &directory, relative)?;
+            let after = identity_from_fd(&directory, "reinspect opaque directory root")?;
+            if !expected.matches_recovery(&after) {
+                return Err(transaction_error(
+                    "erase opaque directory",
+                    format!("opaque root identity drifted: {relative}"),
+                ));
+            }
+            drop(directory);
+            self.remove_dir_exact(relative, expected)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (relative, expected);
+            MutationTarget::Unsupported.require_supported("erase opaque browser directory")
+        }
+    }
+
     fn remove_exact(&self, relative: &str, expected: &HeldIdentity, directory: bool) -> Result<()> {
         #[cfg(test)]
         let _phase = self.begin_default_observation_phase(DurabilityPhase::Rooted);
@@ -1928,6 +2008,174 @@ impl RootedFs {
         }
         Ok((current, name))
     }
+}
+
+#[cfg(all(
+    feature = "layout-browser",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+fn erase_opaque_children(
+    rooted: &RootedFs,
+    parent: &rustix::fd::OwnedFd,
+    relative: &str,
+) -> Result<()> {
+    use std::ffi::CString;
+
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, fsync, openat, statat, unlinkat};
+
+    let parent_identity = identity_from_fd(parent, "inspect opaque directory")?;
+    require_same_mount(
+        &rooted.identity,
+        &parent_identity,
+        "validate opaque directory mount",
+    )?;
+    let mut directory = rustix::fs::Dir::read_from(parent).map_err(|source| {
+        io_error(
+            "open opaque directory stream",
+            &rooted.canonical_root.join(relative),
+            source,
+        )
+    })?;
+    let mut names = Vec::new();
+    for entry in &mut directory {
+        let entry = entry.map_err(|source| {
+            io_error(
+                "read opaque directory",
+                &rooted.canonical_root.join(relative),
+                source,
+            )
+        })?;
+        let bytes = entry.file_name().to_bytes();
+        if bytes != b"." && bytes != b".." {
+            names.push(bytes.to_vec());
+        }
+    }
+    names.sort();
+    drop(directory);
+
+    for bytes in names {
+        let name = CString::new(bytes.clone()).map_err(|_| {
+            transaction_error(
+                "erase opaque directory",
+                "directory entry unexpectedly contains NUL",
+            )
+        })?;
+        let display_name = opaque_observation_name(&bytes);
+        let child_relative = format!("{relative}/{display_name}");
+        let before =
+            statat(parent, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW).map_err(|source| {
+                io_error(
+                    "inspect opaque directory entry",
+                    &rooted.canonical_root.join(&child_relative),
+                    source,
+                )
+            })?;
+        let file_type = FileType::from_raw_mode(before.st_mode);
+        let before_identity = if file_type == FileType::Directory {
+            let child = openat(
+                parent,
+                name.as_c_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|source| {
+                io_error(
+                    "open opaque child directory",
+                    &rooted.canonical_root.join(&child_relative),
+                    source,
+                )
+            })?;
+            let identity = identity_from_fd(&child, "inspect opaque child directory")?;
+            require_same_mount(
+                &rooted.identity,
+                &identity,
+                "validate opaque child directory mount",
+            )?;
+            erase_opaque_children(rooted, &child, &child_relative)?;
+            let after = identity_from_fd(&child, "reinspect opaque child directory")?;
+            if !identity.matches_recovery(&after) {
+                return Err(transaction_error(
+                    "erase opaque directory",
+                    format!("opaque child identity drifted: {child_relative}"),
+                ));
+            }
+            drop(child);
+            identity
+        } else {
+            let identity = identity_from_stat(&before, parent_identity.fsid)?;
+            require_same_mount(&rooted.identity, &identity, "validate opaque entry mount")?;
+            identity
+        };
+        let current =
+            statat(parent, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW).map_err(|source| {
+                io_error(
+                    "reinspect opaque directory entry",
+                    &rooted.canonical_root.join(&child_relative),
+                    source,
+                )
+            })?;
+        let current_identity = identity_from_stat(&current, parent_identity.fsid)?;
+        if !before_identity.matches_recovery(&current_identity)
+            || (file_type == FileType::Directory)
+                != (FileType::from_raw_mode(current.st_mode) == FileType::Directory)
+        {
+            return Err(transaction_error(
+                "erase opaque directory",
+                format!("opaque entry identity changed: {child_relative}"),
+            ));
+        }
+        let flags = if file_type == FileType::Directory {
+            AtFlags::REMOVEDIR
+        } else {
+            AtFlags::empty()
+        };
+        unlinkat(parent, name.as_c_str(), flags).map_err(|source| {
+            io_error(
+                "remove opaque directory entry",
+                &rooted.canonical_root.join(&child_relative),
+                source,
+            )
+        })?;
+        #[cfg(test)]
+        rooted.record_durability(
+            if file_type == FileType::Directory {
+                DurabilityPrimitive::RemoveDirectory
+            } else {
+                DurabilityPrimitive::RemoveFile
+            },
+            &child_relative,
+        );
+        fsync(parent).map_err(|source| {
+            io_error(
+                "sync opaque directory",
+                &rooted.canonical_root.join(relative),
+                source,
+            )
+        })?;
+        #[cfg(test)]
+        rooted.record_durability(DurabilityPrimitive::SyncDirectory, relative);
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "layout-browser",
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
+fn opaque_observation_name(bytes: &[u8]) -> String {
+    std::str::from_utf8(bytes).map_or_else(
+        |_| {
+            let mut encoded = String::new();
+            for byte in bytes {
+                use std::fmt::Write as _;
+                write!(&mut encoded, "%{byte:02x}").expect("writing to a String cannot fail");
+            }
+            encoded
+        },
+        str::to_owned,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

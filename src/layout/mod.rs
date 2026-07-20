@@ -1,4 +1,4 @@
-//! Browser-free Taffy import and checking over explicit corpus and checkout roots.
+//! Taffy maintenance and trusted-browser layout generation over explicit roots.
 //!
 //! Import verifies an existing clean checkout at the manifest-owned pin. It
 //! never downloads, installs, or executes the source:
@@ -13,35 +13,18 @@
 //! # }
 //! ```
 //!
-//! This browser-free capability set intentionally has no generation command,
-//! browser/filter payload, browser backend, or public core implementation type.
-//! Those shapes cannot be constructed through the public API:
+//! Generation accepts one existing executable below the manifest-declared cache
+//! root. It never downloads or installs a browser. The executable is a trusted
+//! capability whose path, identity, digest, and version are authenticated:
 //!
-//! ```compile_fail
-//! use surgeist_generator::layout::LayoutCommand;
-//! let _ = LayoutCommand::Generate;
-//! ```
-//!
-//! ```compile_fail
-//! use surgeist_generator::layout::LayoutRequest;
-//! fn browser_payload(request: &LayoutRequest) {
-//!     let _ = request.browser_path();
-//! }
-//! ```
-//!
-//! ```compile_fail
-//! use surgeist_generator::layout::LayoutRequest;
-//! fn filter_payload(request: &LayoutRequest) {
-//!     let _ = request.filter();
-//! }
-//! ```
-//!
-//! ```compile_fail
-//! use surgeist_generator::{CorpusLocation, RelativePath};
-//! use surgeist_generator::layout::LayoutRequest;
-//! fn generation_request(location: CorpusLocation, browser: RelativePath) {
-//!     let _ = LayoutRequest::generate(location, browser, None);
-//! }
+//! ```no_run
+//! # use surgeist_generator::{CorpusLocation, RelativePath, Result};
+//! # use surgeist_generator::layout::{self, LayoutRequest};
+//! # fn example(location: CorpusLocation) -> Result<()> {
+//! let browser = RelativePath::new("cache/chrome")?;
+//! let filter = Some(RelativePath::new("grid/case.html")?);
+//! layout::run(LayoutRequest::generate(location, browser, filter)?)
+//! # }
 //! ```
 //!
 //! ```compile_fail
@@ -101,7 +84,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, Result};
+use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, RelativePath, Result};
 
 // C04-only preservation handoff: add the Generate API/CLI payload atomically
 // with the chromiumoxide/futures/tokio/url edge; trusted executable validation
@@ -111,20 +94,29 @@ use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, Result};
 // serialization, filtering, and CleanFull/DiagnosticFull/Filtered publication;
 // then retire the preservation source, finish repository guidance/policy, and
 // execute the separately authorized ignored diagnostic body exactly once.
+mod browser;
 mod case;
 mod checker;
 mod cli;
+mod generation;
 mod importer;
 mod manifest;
+mod measurement;
+mod profile;
 mod report;
+mod selection;
 mod sidecar;
+mod supervisor;
+mod xml;
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod checker_tests;
 #[cfg(test)]
+mod profile_tests;
+#[cfg(test)]
 mod tests;
 
-/// Browser-free layout corpus operation available in this capability set.
+/// Layout corpus operation available in this capability set.
 ///
 /// Its exact trait contract excludes open-ended ordering, hashing, defaults,
 /// and serialization:
@@ -162,9 +154,11 @@ pub enum LayoutCommand {
     CheckTaffyCorpus,
     /// Import the manifest-pinned Taffy `test_fixtures` tree.
     ImportTaffy,
+    /// Generate complete or selected XML with a trusted existing browser.
+    Generate,
 }
 
-/// Checked request for one browser-free layout corpus operation.
+/// Checked request for one layout corpus operation.
 ///
 /// Its private payload and exact trait contract exclude copying, ordering,
 /// hashing, defaults, and serialization:
@@ -203,7 +197,17 @@ pub enum LayoutCommand {
 pub struct LayoutRequest {
     location: CorpusLocation,
     command: LayoutCommand,
-    source_root: Option<PathBuf>,
+    payload: LayoutPayload,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LayoutPayload {
+    None,
+    Source(PathBuf),
+    Generate {
+        browser_path: RelativePath,
+        filter: Option<RelativePath>,
+    },
 }
 
 impl LayoutRequest {
@@ -213,7 +217,7 @@ impl LayoutRequest {
         Self {
             location,
             command: LayoutCommand::CheckCorpus,
-            source_root: None,
+            payload: LayoutPayload::None,
         }
     }
 
@@ -243,6 +247,25 @@ impl LayoutRequest {
         )
     }
 
+    /// Constructs a trusted-browser generation request without filesystem access.
+    pub fn generate(
+        location: CorpusLocation,
+        browser_path: RelativePath,
+        filter: Option<RelativePath>,
+    ) -> Result<Self> {
+        if let Some(filter) = &filter {
+            selection::validate_request_filter(filter)?;
+        }
+        Ok(Self {
+            location,
+            command: LayoutCommand::Generate,
+            payload: LayoutPayload::Generate {
+                browser_path,
+                filter,
+            },
+        })
+    }
+
     /// Returns the explicit corpus location.
     #[must_use]
     pub const fn location(&self) -> &CorpusLocation {
@@ -258,20 +281,42 @@ impl LayoutRequest {
     /// Returns the source checkout supplied by this Taffy request.
     #[must_use]
     pub fn source_root(&self) -> Option<&Path> {
-        self.source_root.as_deref()
+        match &self.payload {
+            LayoutPayload::Source(path) => Some(path),
+            LayoutPayload::None | LayoutPayload::Generate { .. } => None,
+        }
+    }
+
+    /// Returns the owner-relative trusted-browser path for generation only.
+    #[must_use]
+    pub const fn browser_path(&self) -> Option<&RelativePath> {
+        match &self.payload {
+            LayoutPayload::Generate { browser_path, .. } => Some(browser_path),
+            LayoutPayload::None | LayoutPayload::Source(_) => None,
+        }
+    }
+
+    /// Returns the optional HTML-relative selection for generation only.
+    #[must_use]
+    pub const fn filter(&self) -> Option<&RelativePath> {
+        match &self.payload {
+            LayoutPayload::Generate { filter, .. } => filter.as_ref(),
+            LayoutPayload::None | LayoutPayload::Source(_) => None,
+        }
     }
 }
 
-/// Executes one browser-free layout operation synchronously.
+/// Executes one layout operation synchronously.
 pub fn run(request: LayoutRequest) -> Result<()> {
     match request.command() {
         LayoutCommand::CheckCorpus => checker::run(&request),
         LayoutCommand::CheckTaffyCorpus => importer::check(&request),
         LayoutCommand::ImportTaffy => importer::run(&request),
+        LayoutCommand::Generate => generation::run(request),
     }
 }
 
-/// Reads only `args_os` and executes one browser-free layout operation.
+/// Executes one interface invocation or authenticated internal supervisor.
 pub fn run_from_env() -> Result<()> {
     cli::run_from_env()
 }
@@ -295,6 +340,6 @@ fn source_request(
     Ok(LayoutRequest {
         location,
         command,
-        source_root: Some(source_root),
+        payload: LayoutPayload::Source(source_root),
     })
 }

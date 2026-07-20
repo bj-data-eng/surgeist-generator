@@ -327,13 +327,20 @@ fn run_impl(
         )?
     };
     pre_lease_hook();
-    let lease = GenerationLease::acquire_with_protected_source(
+    let lease = GenerationLease::acquire_with_revalidation(
         location,
         Domain::Layout,
         GENERATOR,
         &RunScope::Full,
         COMMAND,
-        &protection,
+        |rooted| {
+            let pending = super::profile::classify_pending(rooted)?;
+            protection.revalidate(rooted)?;
+            if let Some(pending) = pending {
+                pending.execute(rooted)?;
+            }
+            Ok(())
+        },
     )?;
 
     let binding = lease.bind(location, Domain::Layout)?;

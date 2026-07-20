@@ -10,6 +10,7 @@ use super::coordination::{
 #[cfg(test)]
 use super::coordination::{ExclusiveAcquisitionControl, acquire_exclusive_controlled};
 use super::fs::{HeldIdentity, RootedFs};
+#[cfg(any(feature = "css-corpus", test))]
 use super::protection::ProtectedSourceDisjointness;
 
 /// A live, exclusive mutation authority for one fixed corpus and domain.
@@ -46,6 +47,7 @@ impl GenerationLease {
 
     /// Acquires the domain mutex, then closes both source identity and the
     /// complete writable/protected namespace matrix before owner intent.
+    #[cfg(any(feature = "css-corpus", test))]
     pub(crate) fn acquire_with_protected_source(
         location: &CorpusLocation,
         domain: Domain,
@@ -85,6 +87,27 @@ impl GenerationLease {
             corpus_identity: state.corpus_identity().clone(),
             domain,
         })
+    }
+
+    /// Returns the exact acquisition token authenticated by private journals.
+    #[cfg(feature = "layout-browser")]
+    pub(crate) fn token(&self) -> &str {
+        self.guard
+            .state()
+            .token()
+            .expect("an exclusive generation lease always carries a token")
+    }
+
+    /// Returns the corpus/domain authority digest authenticated by private journals.
+    #[cfg(feature = "layout-browser")]
+    pub(crate) fn authority_key(&self) -> &str {
+        self.guard.state().authority_key()
+    }
+
+    /// Returns the held rooted corpus authority for private lifecycle records.
+    #[cfg(feature = "layout-browser")]
+    pub(crate) fn rooted(&self) -> &RootedFs {
+        self.guard.state().rooted()
     }
 
     #[cfg(test)]

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::Serialize;
 use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, Visitor};
 
 use crate::core::{CORPUS_FILE_MODE, Inventory, InventoryEntry, NodeKind, RootedFs};
@@ -444,7 +445,7 @@ fn validate_report_set(
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct LayoutReport {
     metadata: ReportMetadata,
     filter: Option<RelativePath>,
@@ -720,7 +721,7 @@ struct FixtureState<'a> {
     failed: Option<&'a DispositionEntry>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct ReportMetadata {
     schema_version: u8,
     generator: String,
@@ -755,7 +756,7 @@ impl ReportMetadata {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 struct ReportSummary {
     generated: usize,
     unsupported: usize,
@@ -764,7 +765,7 @@ struct ReportSummary {
     failed_to_generate: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct GeneratedEntry {
     name: String,
     source: RelativePath,
@@ -798,7 +799,7 @@ impl GeneratedEntry {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct UnsupportedEntry {
     name: String,
     source: RelativePath,
@@ -834,7 +835,7 @@ impl UnsupportedEntry {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct DispositionEntry {
     name: String,
     source: RelativePath,
@@ -1271,6 +1272,439 @@ fn parse_browser_provenance(metadata: &ReportMetadata, manifest: &LayoutManifest
     Ok(())
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct GenerationLedger {
+    generated: Vec<GeneratedEntry>,
+    unsupported: Vec<UnsupportedEntry>,
+    expected_fail: Vec<DispositionEntry>,
+    quarantined: Vec<DispositionEntry>,
+    failed_to_generate: Vec<DispositionEntry>,
+}
+
+impl GenerationLedger {
+    pub(super) fn generated(
+        &mut self,
+        name: String,
+        source: RelativePath,
+        output: RelativePath,
+        output_sha256: Sha256Digest,
+        variant: &str,
+    ) {
+        self.generated.push(GeneratedEntry {
+            name,
+            source,
+            output,
+            output_sha256: Some(output_sha256),
+            variant: variant.to_owned(),
+        });
+    }
+
+    pub(super) fn unsupported(
+        &mut self,
+        name: String,
+        source: RelativePath,
+        variant: &str,
+        reason: String,
+    ) {
+        self.unsupported.push(UnsupportedEntry {
+            name,
+            source,
+            variant: variant.to_owned(),
+            reason,
+        });
+    }
+
+    pub(super) fn expected_fail(&mut self, name: String, source: RelativePath, reason: String) {
+        self.expected_fail.push(DispositionEntry {
+            name,
+            source,
+            reason,
+        });
+    }
+
+    pub(super) fn quarantined(&mut self, name: String, source: RelativePath, reason: String) {
+        self.quarantined.push(DispositionEntry {
+            name,
+            source,
+            reason,
+        });
+    }
+
+    pub(super) fn failed(&mut self, name: String, source: RelativePath, reason: String) {
+        self.failed_to_generate.push(DispositionEntry {
+            name,
+            source,
+            reason,
+        });
+    }
+
+    pub(super) fn has_failures(&self) -> bool {
+        !self.failed_to_generate.is_empty()
+    }
+
+    pub(super) fn generated_artifacts(
+        &self,
+    ) -> impl Iterator<Item = (&RelativePath, &Sha256Digest)> {
+        self.generated.iter().map(|entry| {
+            (
+                &entry.output,
+                entry
+                    .output_sha256
+                    .as_ref()
+                    .expect("new generation entries always carry a digest"),
+            )
+        })
+    }
+
+    pub(super) fn unsupported_outputs(&self) -> Result<BTreeSet<RelativePath>> {
+        self.unsupported
+            .iter()
+            .filter(|entry| entry.variant != "manifest")
+            .map(|entry| output_for(&entry.source, &entry.variant))
+            .collect()
+    }
+
+    fn sort(&mut self) {
+        self.generated
+            .sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+        self.unsupported
+            .sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+        self.expected_fail
+            .sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+        self.quarantined
+            .sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+        self.failed_to_generate
+            .sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+    }
+
+    fn subset(&self, filter: &RelativePath) -> Self {
+        let mut subset = Self {
+            generated: self
+                .generated
+                .iter()
+                .filter(|entry| source_matches(&entry.source, filter))
+                .cloned()
+                .collect(),
+            unsupported: self
+                .unsupported
+                .iter()
+                .filter(|entry| source_matches(&entry.source, filter))
+                .cloned()
+                .collect(),
+            expected_fail: self
+                .expected_fail
+                .iter()
+                .filter(|entry| source_matches(&entry.source, filter))
+                .cloned()
+                .collect(),
+            quarantined: self
+                .quarantined
+                .iter()
+                .filter(|entry| source_matches(&entry.source, filter))
+                .cloned()
+                .collect(),
+            failed_to_generate: self
+                .failed_to_generate
+                .iter()
+                .filter(|entry| source_matches(&entry.source, filter))
+                .cloned()
+                .collect(),
+        };
+        subset.sort();
+        subset
+    }
+
+    fn summary(&self) -> ReportSummary {
+        ReportSummary {
+            generated: self.generated.len(),
+            unsupported: self.unsupported.len(),
+            expected_fail: self.expected_fail.len(),
+            quarantined: self.quarantined.len(),
+            failed_to_generate: self.failed_to_generate.len(),
+        }
+    }
+}
+
+pub(super) struct GenerationMetadata<'a> {
+    pub(super) manifest: &'a LayoutManifest,
+    pub(super) browser_provenance: &'a str,
+    pub(super) browser_executable_sha256: &'a Sha256Digest,
+    pub(super) helper_sha256: &'a Sha256Digest,
+    pub(super) base_style_sha256: &'a Sha256Digest,
+    pub(super) corpus_manifest_sha256: &'a Sha256Digest,
+    pub(super) taffy_sidecar_sha256: &'a Sha256Digest,
+}
+
+pub(super) fn render_generation_reports(
+    metadata: &GenerationMetadata<'_>,
+    mut ledger: GenerationLedger,
+) -> Result<Vec<(RelativePath, Vec<u8>)>> {
+    ledger.sort();
+    let manifest = metadata.manifest;
+    let report_metadata = ReportMetadata {
+        schema_version: 2,
+        generator: GENERATOR.to_owned(),
+        browser_source: metadata.manifest.browser.source.clone(),
+        browser_version: metadata.manifest.browser.version.clone(),
+        browser_provenance: metadata.browser_provenance.to_owned(),
+        browser_executable_sha256: metadata.browser_executable_sha256.clone(),
+        launch_profile_sha256: metadata.manifest.launch_digest.clone(),
+        helper_sha256: metadata.helper_sha256.clone(),
+        base_style_sha256: metadata.base_style_sha256.clone(),
+        corpus_manifest_sha256: metadata.corpus_manifest_sha256.clone(),
+        taffy_revision: metadata.manifest.revision.clone(),
+        taffy_sidecar_sha256: metadata.taffy_sidecar_sha256.clone(),
+    };
+    validate_expected_counts(manifest, &ledger)?;
+    let full = report_from_ledger(report_metadata.clone(), None, ledger.clone())?;
+    let mut reports = vec![(RelativePath::new(FULL_REPORT)?, serialize_report(&full)?)];
+    for scoped in &manifest.reports.scoped {
+        let subset = ledger.subset(&scoped.filter);
+        if (subset.failed_to_generate.is_empty() && subset.generated.len() != scoped.generated)
+            || subset.expected_fail.len()
+                != ledger
+                    .expected_fail
+                    .iter()
+                    .filter(|entry| source_matches(&entry.source, &scoped.filter))
+                    .count()
+            || subset.quarantined.len()
+                != ledger
+                    .quarantined
+                    .iter()
+                    .filter(|entry| source_matches(&entry.source, &scoped.filter))
+                    .count()
+        {
+            return Err(generation_error(format!(
+                "scoped layout report counts diverge for {}",
+                scoped.filter.as_str()
+            )));
+        }
+        let report =
+            report_from_ledger(report_metadata.clone(), Some(scoped.filter.clone()), subset)?;
+        reports.push((
+            RelativePath::new(format!("generation-reports/{}", scoped.file.as_str()))?,
+            serialize_report(&report)?,
+        ));
+    }
+    Ok(reports)
+}
+
+fn report_from_ledger(
+    metadata: ReportMetadata,
+    filter: Option<RelativePath>,
+    ledger: GenerationLedger,
+) -> Result<LayoutReport> {
+    let report = LayoutReport {
+        metadata,
+        filter,
+        summary: ledger.summary(),
+        generated: ledger.generated,
+        unsupported: ledger.unsupported,
+        expected_fail: ledger.expected_fail,
+        quarantined: ledger.quarantined,
+        failed_to_generate: ledger.failed_to_generate,
+    };
+    report
+        .validate_shape()
+        .map_err(|source| generation_source("validate generated layout report", source))?;
+    Ok(report)
+}
+
+fn serialize_report(report: &LayoutReport) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(report).map_err(|source| {
+        GeneratorError::with_source(
+            GeneratorErrorKind::Generation,
+            "serialize layout generation report",
+            source.to_string(),
+            source,
+        )
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn validate_expected_counts(manifest: &LayoutManifest, ledger: &GenerationLedger) -> Result<()> {
+    let expected = manifest.reports.full;
+    let summary = ledger.summary();
+    let valid = if ledger.has_failures() {
+        summary.expected_fail == expected.expected_fail
+            && summary.quarantined == expected.quarantined
+    } else {
+        summary.generated == expected.generated
+            && summary.unsupported == expected.unsupported
+            && summary.expected_fail == expected.expected_fail
+            && summary.quarantined == expected.quarantined
+            && summary.failed_to_generate == expected.failed_to_generate
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(generation_error(
+            "layout generation ledger diverges from manifest expectations",
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct HistoricalAuthority {
+    inventory: Option<Inventory>,
+    reports: BTreeMap<String, LayoutReport>,
+    classified: BTreeSet<RelativePath>,
+    generated_outputs: BTreeSet<RelativePath>,
+    current_schema: bool,
+}
+
+impl HistoricalAuthority {
+    pub(super) const fn classified_paths(&self) -> &BTreeSet<RelativePath> {
+        &self.classified
+    }
+
+    pub(super) fn require_filtered_ownership(
+        &self,
+        scheduled: &BTreeSet<RelativePath>,
+    ) -> Result<()> {
+        if self.inventory.is_none() {
+            return Err(verification(
+                "layout XML root is absent; run full generation first",
+            ));
+        }
+        if !self.current_schema {
+            return Err(verification(
+                "layout historical authority requires complete report migration",
+            ));
+        }
+        if let Some(unowned) = scheduled
+            .iter()
+            .find(|path| !self.generated_outputs.contains(*path))
+        {
+            return Err(verification(format!(
+                "layout filtered output is not historically owned: {}",
+                unowned.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_union(&self, desired: &BTreeSet<RelativePath>) -> Result<()> {
+        let Some(inventory) = &self.inventory else {
+            return Ok(());
+        };
+        let admitted = self
+            .classified
+            .union(desired)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for entry in inventory.entries() {
+            let path = RelativePath::new(format!("xml/{}", entry.path().as_str()))?;
+            let accepted = match entry.identity().kind() {
+                NodeKind::Regular => admitted.contains(&path),
+                NodeKind::Directory => {
+                    let prefix = format!("{}/", path.as_str());
+                    admitted
+                        .iter()
+                        .any(|candidate| candidate.as_str().starts_with(&prefix))
+                }
+                NodeKind::Symlink => false,
+            };
+            if !accepted {
+                return Err(invalid_inventory(format!(
+                    "unknown entry in layout XML root: {}",
+                    entry.path().as_str()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn inspect_historical(
+    rooted: &RootedFs,
+    manifest: &LayoutManifest,
+) -> Result<HistoricalAuthority> {
+    let inventory = Inventory::scan(rooted, "xml", crate::core::InventoryPolicy::FinalCorpus)?;
+    let Some(current) = inventory.as_ref() else {
+        return Ok(HistoricalAuthority {
+            inventory,
+            reports: BTreeMap::new(),
+            classified: BTreeSet::new(),
+            generated_outputs: BTreeSet::new(),
+            current_schema: true,
+        });
+    };
+    if current.entries().is_empty() {
+        return Ok(HistoricalAuthority {
+            inventory,
+            reports: BTreeMap::new(),
+            classified: BTreeSet::new(),
+            generated_outputs: BTreeSet::new(),
+            current_schema: true,
+        });
+    }
+    let entries = report_entries(current)?;
+    if !entries.contains_key(FULL_REPORT) {
+        return Err(invalid_inventory(
+            "nonempty layout XML root has no historical full-report authority",
+        ));
+    }
+    let mut reports = BTreeMap::new();
+    for path in entries.keys() {
+        let bytes = rooted.read_file(&format!("xml/{path}"), CORPUS_FILE_MODE)?;
+        reports.insert(path.clone(), LayoutReport::parse(&bytes)?);
+    }
+    let full = reports
+        .get(FULL_REPORT)
+        .expect("required historical full report was parsed");
+    if full.filter.is_some() {
+        return Err(invalid_inventory(
+            "historical full report filter must be null",
+        ));
+    }
+    let mode = validate_report_set(full, &reports)?;
+    parse_browser_provenance(&full.metadata, manifest)?;
+    let generated_outputs = full
+        .generated
+        .iter()
+        .map(|entry| entry.output.clone())
+        .collect::<BTreeSet<_>>();
+    let mut classified = generated_outputs.clone();
+    classified.extend(reports.keys().map(|path| {
+        RelativePath::new(format!("xml/{path}"))
+            .expect("validated historical report path remains strict")
+    }));
+    Ok(HistoricalAuthority {
+        inventory,
+        reports,
+        classified,
+        generated_outputs,
+        current_schema: mode == ReportMode::Current,
+    })
+}
+
+fn generation_error(detail: impl Into<String>) -> GeneratorError {
+    GeneratorError::new(
+        GeneratorErrorKind::Generation,
+        "derive layout generation report",
+        detail,
+    )
+}
+
+fn generation_source(operation: &str, source: GeneratorError) -> GeneratorError {
+    GeneratorError::with_source(
+        GeneratorErrorKind::Generation,
+        operation,
+        source.to_string(),
+        source,
+    )
+}
+
+fn verification(detail: impl Into<String>) -> GeneratorError {
+    GeneratorError::new(
+        GeneratorErrorKind::Verification,
+        "validate layout filtered ownership",
+        detail,
+    )
+}
+
 struct CanonicalJson<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -1643,4 +2077,92 @@ fn invalid_inventory(detail: impl Into<String>) -> GeneratorError {
         "validate layout XML/report inventory",
         detail,
     )
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use std::path::Path;
+
+    use super::{GenerationLedger, GenerationMetadata, LayoutReport, render_generation_reports};
+    use crate::layout::{manifest, tests};
+    use crate::{GeneratorErrorKind, RelativePath, Sha256Digest};
+
+    fn parsed_manifest() -> manifest::LayoutManifest {
+        let text = tests::manifest_text(tests::SHA1_REVISION, 1, "");
+        manifest::parse(text.as_bytes(), Path::new("corpus.toml")).expect("manifest")
+    }
+
+    fn metadata<'a>(
+        manifest: &'a manifest::LayoutManifest,
+        zero: &'a Sha256Digest,
+    ) -> GenerationMetadata<'a> {
+        GenerationMetadata {
+            manifest,
+            browser_provenance: "Chrome 123.0.1 browser-cache/chrome",
+            browser_executable_sha256: zero,
+            helper_sha256: zero,
+            base_style_sha256: zero,
+            corpus_manifest_sha256: zero,
+            taffy_sidecar_sha256: zero,
+        }
+    }
+
+    #[test]
+    fn layout_generate_report_generated_digests_are_exact() {
+        let manifest = parsed_manifest();
+        let zero = Sha256Digest::from_text("0".repeat(64)).expect("digest");
+        let source = RelativePath::new("html/grid/case.html").expect("source");
+        let mut ledger = GenerationLedger::default();
+        for variant in [
+            "border_box_ltr",
+            "border_box_rtl",
+            "content_box_ltr",
+            "content_box_rtl",
+        ] {
+            ledger.generated(
+                format!("case__{variant}"),
+                source.clone(),
+                RelativePath::new(format!("xml/grid/case__{variant}.xml")).expect("output"),
+                zero.clone(),
+                variant,
+            );
+        }
+        let reports = render_generation_reports(&metadata(&manifest, &zero), ledger)
+            .expect("complete reports");
+        assert_eq!(reports.len(), 2);
+        let full: LayoutReport = LayoutReport::parse(&reports[0].1).expect("parse full report");
+        assert_eq!(full.generated.len(), 4);
+        assert!(
+            full.generated
+                .iter()
+                .all(|entry| { entry.output_sha256.as_ref() == Some(&zero) })
+        );
+    }
+
+    #[test]
+    fn layout_generate_diagnostic_summary_is_actual_bucket_lengths() {
+        let manifest = parsed_manifest();
+        let zero = Sha256Digest::from_text("0".repeat(64)).expect("digest");
+        let mut ledger = GenerationLedger::default();
+        ledger.failed(
+            "case".to_owned(),
+            RelativePath::new("html/grid/case.html").expect("source"),
+            "retry exhausted".to_owned(),
+        );
+        let reports = render_generation_reports(&metadata(&manifest, &zero), ledger)
+            .expect("diagnostic reports");
+        let full = LayoutReport::parse(&reports[0].1).expect("parse diagnostic report");
+        assert_eq!(full.summary.generated, 0);
+        assert_eq!(full.summary.failed_to_generate, 1);
+    }
+
+    #[test]
+    fn layout_generate_incomplete_clean_ledger_is_generation_error() {
+        let manifest = parsed_manifest();
+        let zero = Sha256Digest::from_text("0".repeat(64)).expect("digest");
+        let error =
+            render_generation_reports(&metadata(&manifest, &zero), GenerationLedger::default())
+                .expect_err("incomplete clean ledger");
+        assert_eq!(error.kind(), GeneratorErrorKind::Generation);
+    }
 }

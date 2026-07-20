@@ -28,7 +28,11 @@ pub(crate) use case::validate_disposition_reason;
 #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 pub(crate) use coordination::Domain;
 #[cfg(feature = "layout-browser")]
-pub(crate) use fs::HeldIdentity;
+pub(crate) use coordination::{
+    authenticate_layout_supervisor_owner, corpus_authority_key, new_token,
+};
+#[cfg(feature = "layout-browser")]
+pub(crate) use fs::{BoundPath, HeldIdentity, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE};
 #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 pub(crate) use fs::{CORPUS_FILE_MODE, NodeKind, RootedFs};
 #[cfg(feature = "layout-browser")]
@@ -39,7 +43,7 @@ pub(crate) use inventory::{Inventory, InventoryPolicy};
 pub(crate) use lease::GenerationCheck;
 #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 pub(crate) use lease::GenerationLease;
-#[cfg(feature = "css-corpus")]
+#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 pub(crate) use protection::NamespaceDisjointness;
 #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 pub(crate) use protection::ProtectedSourceDisjointness;
@@ -66,12 +70,12 @@ fn private_front_doors_are_linked() {
     {
         let _ = artifact::ArtifactPlan::new;
         let _ = artifact::PublicationInventory::new;
-        let _ = lease::GenerationLease::acquire_with_protected_source;
         let _ = lease::GenerationCheck::acquire;
         let _ = lease::GenerationCheck::finish;
         let _ = inventory::InventoryEntry::digest;
         let _ = inventory::Inventory::find;
         let _ = protection::ProtectedSourceDisjointness::for_mutation;
+        let _ = protection::ProtectedSourceDisjointness::revalidate;
         let _ = source::ProtectedSource::snapshot;
     }
     // C04-only linkage inventory: atomic generation will replace this exact

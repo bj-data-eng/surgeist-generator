@@ -145,11 +145,12 @@ fn run_impl(
         .union(&desired)
         .cloned()
         .collect::<Vec<_>>();
-    let inventory = PublicationInventory::new(
-        classified,
-        desired.iter().cloned().collect(),
-        vec![report_relative],
-    )?;
+    let retained = if selection.is_filtered() {
+        classified.clone()
+    } else {
+        desired.iter().cloned().collect()
+    };
+    let inventory = PublicationInventory::new(classified, retained, vec![report_relative])?;
     let plan = ArtifactPlan::new(
         location,
         Domain::Css,

@@ -36,8 +36,18 @@ pub(super) struct LayoutManifest {
 pub(super) struct BrowserManifest {
     pub(super) source: String,
     pub(super) version: String,
+    pub(super) version_output: String,
     pub(super) cache_root: RelativePath,
     pub(super) provenance_format: String,
+    pub(super) launch: BrowserLaunchManifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct BrowserLaunchManifest {
+    pub(super) batch_size: usize,
+    pub(super) navigation_timeout_ms: u64,
+    pub(super) dom_poll_interval_ms: u64,
+    pub(super) arguments: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,6 +192,18 @@ fn parse_complete(bytes: &[u8], path: &Path) -> Result<(LayoutManifest, Sha256Di
     validate_reports(&raw.generation_reports)?;
     validate_source_roots(&raw.source_roots)?;
     let launch_digest = launch_digest(&raw.browser.launch)?;
+    let launch = BrowserLaunchManifest {
+        batch_size: positive_usize(raw.browser.launch.batch_size, "browser.launch.batch_size")?,
+        navigation_timeout_ms: raw.browser.launch.navigation_timeout_ms,
+        dom_poll_interval_ms: raw.browser.launch.dom_poll_interval_ms,
+        arguments: raw
+            .browser
+            .launch
+            .arguments
+            .iter()
+            .map(|argument| argument.strip_prefix("--").unwrap_or(argument).to_owned())
+            .collect(),
+    };
     let cases = case::validate(raw.cases)?;
     let authored_files = cases.authored_files;
     let import = raw.imports.taffy;
@@ -228,8 +250,10 @@ fn parse_complete(bytes: &[u8], path: &Path) -> Result<(LayoutManifest, Sha256Di
             browser: BrowserManifest {
                 source: raw.browser.source,
                 version: raw.browser.version,
+                version_output: raw.browser.version_output,
                 cache_root: raw.browser.cache_root,
                 provenance_format: raw.browser.provenance_format,
+                launch,
             },
             reports: report_manifest(raw.generation_reports)?,
             launch_digest: launch_digest.clone(),

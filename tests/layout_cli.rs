@@ -34,10 +34,6 @@ impl Drop for TestRoot {
 fn layout_binary() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_surgeist-layout-generate"));
     command
-        .env(
-            "SURGEIST_LAYOUT_LAUNCH_CAPSULE",
-            "operator environment must be ignored in the browser-free capability set",
-        )
         .env("SURGEIST_LAYOUT_BROWSER_PATH", "ignored/browser")
         .env("SURGEIST_LAYOUT_FILTER", "ignored/filter");
     command
@@ -114,7 +110,7 @@ fn layout_cli_taffy_option_matrix_precedes_io() {
                 "--filter",
                 "grid",
             ],
-            "unknown flag: --filter",
+            "import-taffy forbids --filter",
         ),
         (
             vec![
@@ -150,7 +146,7 @@ fn layout_cli_taffy_option_matrix_precedes_io() {
                 "--filter",
                 "grid",
             ],
-            "unknown flag: --filter",
+            "check-taffy-corpus forbids --filter",
         ),
         (
             vec![
@@ -160,7 +156,7 @@ fn layout_cli_taffy_option_matrix_precedes_io() {
                 "does-not-exist",
                 "generate",
             ],
-            "unknown layout command: generate",
+            "missing --browser-path",
         ),
         (
             vec![
@@ -172,7 +168,7 @@ fn layout_cli_taffy_option_matrix_precedes_io() {
                 "--browser-path",
                 "cache/chrome",
             ],
-            "unknown flag: --browser-path",
+            "check-corpus forbids --browser-path",
         ),
         (
             vec![
@@ -236,6 +232,69 @@ fn layout_cli_taffy_option_matrix_precedes_io() {
         String::from_utf8(accepted.stderr).expect("UTF-8 diagnostic"),
         "surgeist-layout-generate: canonicalize owner root: unresolvable path: does-not-exist\n"
     );
+
+    let accepted = layout_binary()
+        .args([
+            "--owner-root",
+            "does-not-exist",
+            "--corpus-root",
+            "does-not-exist",
+            "generate",
+            "--browser-path",
+            "cache/chrome",
+            "--filter",
+            "grid/case.html",
+        ])
+        .output()
+        .expect("run packaged layout generation");
+    assert_eq!(accepted.status.code(), Some(1));
+    assert!(accepted.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(accepted.stderr).expect("UTF-8 diagnostic"),
+        "surgeist-layout-generate: canonicalize owner root: unresolvable path: does-not-exist\n"
+    );
+
+    for (arguments, diagnostic) in [
+        (
+            vec![
+                "--owner-root",
+                "does-not-exist",
+                "--corpus-root",
+                "does-not-exist",
+                "generate",
+                "--browser-path",
+                "cache/chrome",
+                "--source-root",
+                "checkout",
+            ],
+            "generate forbids --source-root",
+        ),
+        (
+            vec![
+                "--owner-root",
+                "does-not-exist",
+                "--corpus-root",
+                "does-not-exist",
+                "generate",
+                "--browser-path",
+                "cache/chrome",
+                "--filter",
+                ".surgeist-taffy-source.json",
+            ],
+            "generation filter uses the reserved Taffy sidecar path",
+        ),
+    ] {
+        let output = layout_binary()
+            .args(arguments)
+            .output()
+            .expect("run rejected packaged generation");
+        assert_eq!(output.status.code(), Some(64));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("UTF-8 diagnostic"),
+            format!("surgeist-layout-generate: parse layout command line: {diagnostic}\n")
+        );
+    }
 }
 
 #[cfg(unix)]

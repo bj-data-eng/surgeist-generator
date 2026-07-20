@@ -403,7 +403,7 @@ fn portable_count_bounds_and_structural_report_counts_are_enforced() {
 
 #[cfg(feature = "layout-browser")]
 #[test]
-fn layout_browser_free_public_requests_are_io_free_and_accessors_are_exact() {
+fn layout_public_requests_are_io_free_and_accessors_are_exact() {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -436,15 +436,23 @@ fn layout_browser_free_public_requests_are_io_free_and_accessors_are_exact() {
         LayoutCommand::CheckCorpus,
         LayoutCommand::CheckTaffyCorpus,
         LayoutCommand::ImportTaffy,
+        LayoutCommand::Generate,
     ];
     let _: fn(CorpusLocation) -> LayoutRequest = LayoutRequest::check_corpus;
     let _: fn(CorpusLocation, PathBuf) -> surgeist_generator::Result<LayoutRequest> =
         LayoutRequest::check_taffy_corpus;
     let _: fn(CorpusLocation, PathBuf) -> surgeist_generator::Result<LayoutRequest> =
         LayoutRequest::import_taffy;
+    let _: fn(
+        CorpusLocation,
+        RelativePath,
+        Option<RelativePath>,
+    ) -> surgeist_generator::Result<LayoutRequest> = LayoutRequest::generate;
     let _: fn(&LayoutRequest) -> &CorpusLocation = LayoutRequest::location;
     let _: fn(&LayoutRequest) -> LayoutCommand = LayoutRequest::command;
     let _: fn(&LayoutRequest) -> Option<&std::path::Path> = LayoutRequest::source_root;
+    let _: fn(&LayoutRequest) -> Option<&RelativePath> = LayoutRequest::browser_path;
+    let _: fn(&LayoutRequest) -> Option<&RelativePath> = LayoutRequest::filter;
     let _: fn(LayoutRequest) -> surgeist_generator::Result<()> = surgeist_generator::layout::run;
     let _: fn() -> surgeist_generator::Result<()> = surgeist_generator::layout::run_from_env;
 
@@ -453,17 +461,43 @@ fn layout_browser_free_public_requests_are_io_free_and_accessors_are_exact() {
     assert_eq!(request.location(), &location);
     assert_eq!(request.command(), LayoutCommand::ImportTaffy);
     assert_eq!(request.source_root(), Some(source.as_path()));
+    assert_eq!(request.browser_path(), None);
+    assert_eq!(request.filter(), None);
 
     let check = LayoutRequest::check_taffy_corpus(location.clone(), source.clone())
         .expect("I/O-free Taffy check request");
     assert_eq!(check.location(), &location);
     assert_eq!(check.command(), LayoutCommand::CheckTaffyCorpus);
     assert_eq!(check.source_root(), Some(source.as_path()));
+    assert_eq!(check.browser_path(), None);
+    assert_eq!(check.filter(), None);
 
     let corpus_check = LayoutRequest::check_corpus(location.clone());
     assert_eq!(corpus_check.location(), &location);
     assert_eq!(corpus_check.command(), LayoutCommand::CheckCorpus);
     assert_eq!(corpus_check.source_root(), None);
+    assert_eq!(corpus_check.browser_path(), None);
+    assert_eq!(corpus_check.filter(), None);
+
+    let browser = RelativePath::new("cache/chrome").expect("browser path");
+    let filter = RelativePath::new("grid/case.html").expect("filter");
+    let generation =
+        LayoutRequest::generate(location.clone(), browser.clone(), Some(filter.clone()))
+            .expect("I/O-free generation request");
+    assert_eq!(generation.location(), &location);
+    assert_eq!(generation.command(), LayoutCommand::Generate);
+    assert_eq!(generation.source_root(), None);
+    assert_eq!(generation.browser_path(), Some(&browser));
+    assert_eq!(generation.filter(), Some(&filter));
+
+    let error = LayoutRequest::generate(
+        location.clone(),
+        browser,
+        Some(RelativePath::new(".surgeist-taffy-source.json").unwrap()),
+    )
+    .expect_err("reserved generation filter");
+    assert_eq!(error.kind(), GeneratorErrorKind::Cli);
+    assert_eq!(error.exit_code(), 64);
 
     #[cfg(unix)]
     {

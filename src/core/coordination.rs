@@ -1478,6 +1478,7 @@ fn validate_coordination_tree_inner(rooted: &RootedFs, domain: Domain) -> Result
         "leases",
         "transactions",
         "probes",
+        "profiles",
     ];
     for name in rooted.list_dir(COORDINATION_ROOT)? {
         if !allowed.contains(&name.as_str()) {
@@ -1511,10 +1512,17 @@ fn validate_coordination_tree_inner(rooted: &RootedFs, domain: Domain) -> Result
         ".surgeist-generator/leases",
         ".surgeist-generator/transactions",
         ".surgeist-generator/probes",
+        ".surgeist-generator/profiles",
     ] {
         if rooted.exists(parent)? {
             validate_private_directory(rooted, parent)?;
         }
+    }
+    if rooted.exists(".surgeist-generator/profiles")? {
+        validate_exact_children(rooted, ".surgeist-generator/profiles", &["layout"])?;
+    }
+    if rooted.exists(".surgeist-generator/profiles/layout")? {
+        validate_private_directory(rooted, ".surgeist-generator/profiles/layout")?;
     }
     let lease = format!(".surgeist-generator/leases/{}", domain.as_str());
     if rooted.exists(&lease)? {
@@ -1696,6 +1704,18 @@ fn inspect_read_only_residue(rooted: &RootedFs, domain: Domain) -> Result<()> {
                 format!("unresolved durable state: {parent}"),
             ));
         }
+    }
+    let profiles = format!(".surgeist-generator/profiles/{}", domain.as_str());
+    if rooted.exists(&profiles).map_err(verification_from)?
+        && !rooted
+            .list_dir(&profiles)
+            .map_err(verification_from)?
+            .is_empty()
+    {
+        return Err(verification_error(
+            "inspect generation coordination",
+            format!("unresolved durable state: {profiles}"),
+        ));
     }
     let owner = owner_path(domain);
     if rooted.exists(&owner).map_err(verification_from)? {
@@ -5195,7 +5215,7 @@ fn validate_owner_cleanup_intent(
     Ok(())
 }
 
-fn corpus_authority_key(rooted: &RootedFs, domain: Domain) -> String {
+pub(crate) fn corpus_authority_key(rooted: &RootedFs, domain: Domain) -> String {
     Sha256Digest::from_bytes(format!(
         "surgeist-corpus-authority-v1\0{}\0{}\0{}\0{}\0{}",
         rooted.canonical_root().display(),
@@ -5205,6 +5225,44 @@ fn corpus_authority_key(rooted: &RootedFs, domain: Domain) -> String {
         domain.as_str()
     ))
     .to_string()
+}
+
+#[cfg(feature = "layout-browser")]
+pub(crate) fn authenticate_layout_supervisor_owner(
+    rooted: &RootedFs,
+    location: &CorpusLocation,
+    parent_pid: u32,
+) -> Result<()> {
+    let path = owner_path(Domain::Layout);
+    let bytes = rooted.read_file(&path, PRIVATE_FILE_MODE)?;
+    validate_owner_record_bytes(
+        rooted,
+        &bytes,
+        "authenticate layout supervisor owner",
+        "visible owner record",
+    )?;
+    let owner: OwnerRecord = serde_json::from_slice(&bytes).map_err(|source| {
+        GeneratorError::with_source(
+            GeneratorErrorKind::ArtifactTransaction,
+            "authenticate layout supervisor owner",
+            "visible owner record cannot be decoded",
+            source,
+        )
+    })?;
+    if owner.schema_version != 1
+        || owner.generator != "surgeist-layout-generate"
+        || owner.command != "generate"
+        || owner.pid != parent_pid
+        || owner.owner_root != location.owner_root().display().to_string()
+        || owner.corpus_root != location.corpus_root().display().to_string()
+        || !(owner.scope == "full" || owner.scope.starts_with("filtered:"))
+    {
+        return Err(transaction_error(
+            "authenticate layout supervisor owner",
+            "visible owner record does not identify the capsule parent generation",
+        ));
+    }
+    Ok(())
 }
 
 fn mutex_path(domain: Domain) -> String {
