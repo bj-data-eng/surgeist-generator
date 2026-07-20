@@ -34,6 +34,9 @@ impl Drop for TestRoot {
 fn layout_binary() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_surgeist-layout-generate"));
     command
+        .env("SURGEIST_LAYOUT_OWNER_ROOT", "ignored/owner")
+        .env("SURGEIST_LAYOUT_CORPUS_ROOT", "ignored/corpus")
+        .env("SURGEIST_LAYOUT_SOURCE_ROOT", "ignored/source")
         .env("SURGEIST_LAYOUT_BROWSER_PATH", "ignored/browser")
         .env("SURGEIST_LAYOUT_FILTER", "ignored/filter");
     command
@@ -58,7 +61,7 @@ fn run_git(directory: &Path, arguments: &[&OsStr]) -> String {
 }
 
 #[test]
-fn layout_cli_invalid_syntax_prints_exact_prefix_and_exits_64() {
+fn layout_cli_ignores_operator_environment_and_invalid_syntax_exits_64() {
     let output = layout_binary()
         .output()
         .expect("run packaged layout binary");
@@ -327,7 +330,7 @@ fn layout_cli_forwards_os_native_root_arguments_to_domain_validation() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn layout_cli_all_three_commands_execute_real_public_paths() {
+fn layout_cli_taffy_adoption_and_offline_checks_execute_real_public_paths() {
     let root = TestRoot::new();
     let owner = root.0.join("owner");
     let corpus = owner.join("corpus");

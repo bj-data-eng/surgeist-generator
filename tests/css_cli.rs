@@ -48,8 +48,12 @@ fn run_git(directory: &Path, arguments: &[&OsStr]) -> String {
 }
 
 #[test]
-fn css_cli_invalid_syntax_prints_exact_prefix_and_exits_64() {
+fn css_cli_ignores_operator_environment_and_invalid_syntax_exits_64() {
     let output = Command::new(env!("CARGO_BIN_EXE_surgeist-css-generate"))
+        .env("SURGEIST_CSS_OWNER_ROOT", "ignored/owner")
+        .env("SURGEIST_CSS_CORPUS_ROOT", "ignored/corpus")
+        .env("SURGEIST_CSS_SOURCE_ROOT", "ignored/source")
+        .env("SURGEIST_CSS_FILTER", "ignored/filter")
         .output()
         .expect("run packaged CSS binary");
 

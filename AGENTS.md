@@ -49,10 +49,26 @@ silently update another document, or widen the task to reconcile them.
 
 ## Crate Boundary
 
-`surgeist-generator` owns Surgeist generator tooling and generation contracts. It
-is intended to receive the current layout-owned generator in a later, separately
-planned migration. No generator code, fixtures, scripts, corpus data, generated
-XML, or other generated artifacts have moved in this scaffold.
+`surgeist-generator` owns the shared generation core and the two completed,
+feature-gated CSS and layout drivers. `css-corpus` exposes the synchronous
+CSSTree/neutral-expectation API and `surgeist-css-generate`; `layout-browser`
+exposes Taffy maintenance, trusted-browser XML/report generation, and
+`surgeist-layout-generate`. The default feature set exposes only shared value and
+read contracts. `Cargo.toml`, `src/lib.rs`, and the public module rustdoc own the
+exact current target and API facts.
+
+Callers supply explicit owner/corpus roots and, for imports/source checks, an
+existing source checkout. Corpus manifests own mutable source pins, counts,
+artifact roots, and browser settings. This repository owns the parser,
+verification, transaction, generation, and focused synthetic/process evidence;
+it does not own or commit production corpora, source checkouts, browsers, XML,
+expectation trees, or sibling adoption changes.
+
+Mutation support is Apple-Silicon macOS. The default value/read library remains
+native/wasm portable. Source/browser acquisition is not a crate capability:
+imports verify existing checkouts and generation authenticates one existing
+trusted browser executable. README and rustdoc define the operator-facing trust,
+offline-attestation, profile-recovery, and Taffy-adoption boundaries.
 
 The root `surgeist` repository continues to own cross-crate integration, this
 leaf's gitlink, and the root API generator and generated API audit artifacts.
@@ -72,11 +88,31 @@ determines the exact gate, order, feature matrix, and whether already-present
 tooling can run without unauthorized acquisition.
 
 ```sh
-cargo check -p surgeist-generator
-cargo test -p surgeist-generator
-cargo clippy -p surgeist-generator --all-targets -- -F unsafe-code -D warnings
+cargo generate-lockfile --offline
+RUSTFLAGS="-D warnings" cargo check --locked --offline -p surgeist-generator --no-default-features
+RUSTFLAGS="-D warnings" cargo check --locked --offline -p surgeist-generator --features layout-browser
+RUSTFLAGS="-D warnings" cargo check --locked --offline -p surgeist-generator --features css-corpus
+RUSTFLAGS="-D warnings" cargo check --locked --offline -p surgeist-generator --all-features
+cargo test --locked --offline -p surgeist-generator --no-default-features
+cargo test --locked --offline -p surgeist-generator --features layout-browser
+cargo test --locked --offline -p surgeist-generator --features css-corpus
+cargo test --locked --offline -p surgeist-generator --all-features
+cargo test --locked --offline -p surgeist-generator --all-features -- --ignored --list
+cargo clippy --locked --offline -p surgeist-generator --no-default-features --all-targets -- -F unsafe-code -D warnings
+cargo clippy --locked --offline -p surgeist-generator --features layout-browser --all-targets -- -F unsafe-code -D warnings
+cargo clippy --locked --offline -p surgeist-generator --features css-corpus --all-targets -- -F unsafe-code -D warnings
+cargo clippy --locked --offline -p surgeist-generator --all-features --all-targets -- -F unsafe-code -D warnings
+RUSTFLAGS="-D warnings" cargo check --locked --offline -p surgeist-generator --target wasm32-unknown-unknown --no-default-features --lib
+cargo metadata --locked --offline --no-deps --format-version 1
 cargo fmt --check
+cargo deny --all-features --locked --offline check licenses
+cargo audit --no-fetch --stale
 ```
+
+The ignored invocation is list-only inventory evidence; never remove `--list`
+without the separate explicit authorization required by `$surgeist-agent` and
+the active cycle contract. Offline/no-fetch flags prove use of already-present
+artifacts; they do not authorize installing or downloading missing software.
 
 Discovery is complete when the owning repository, public front door, dependency
 and feature facts, verification sources, API-artifact owner, and applicable

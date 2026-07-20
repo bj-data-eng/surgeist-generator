@@ -1,4 +1,24 @@
 //! Checked, domain-neutral contracts for Surgeist corpus generators.
+//!
+//! The default feature set exposes only shared value, provenance, rooted-path,
+//! and report contracts. The two executable drivers are opt-in:
+//!
+//! - `css-corpus` exposes `css` and builds `surgeist-css-generate`.
+//! - `layout-browser` exposes `layout` and builds
+//!   `surgeist-layout-generate`.
+//!
+//! Callers supply an existing owner root and a contained corpus root through
+//! [`CorpusLocation`]. Corpus manifests, not this crate, own mutable source pins,
+//! inventory counts, artifact roots, and browser provenance. The drivers contain
+//! no downloader or installer: source imports verify caller-supplied checkouts,
+//! while layout generation authenticates and executes one caller-selected,
+//! already-present browser as a trusted external capability.
+//!
+//! Mutation is supported on Apple-Silicon macOS. The default value/read library
+//! remains free of driver dependencies and is checked for native and
+//! `wasm32-unknown-unknown` targets. Production Surgeist crates do not normally
+//! depend on this tooling crate; root `surgeist` owns cross-crate composition,
+//! gitlinks, and generated API audit artifacts.
 
 #![forbid(unsafe_code)]
 

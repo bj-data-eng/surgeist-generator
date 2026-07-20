@@ -1,5 +1,12 @@
 //! Synchronous CSSTree corpus operations over caller-supplied roots.
 //!
+//! `surgeist-css-generate` is built only with `css-corpus` and accepts exactly
+//! `import-csstree`, `generate`, and `check-corpus`. Every command requires
+//! explicit `--owner-root` and `--corpus-root` values. Import alone requires a
+//! caller-supplied `--source-root`; generation alone permits `--filter`.
+//! The corpus manifest owns the mutable CSSTree pin, expected file/case counts,
+//! import root, expectation root, and report path.
+//!
 //! Import uses an existing, clean checkout at the manifest's exact pin; this
 //! interface never downloads or installs the source:
 //!
@@ -19,6 +26,24 @@
 //! css::run(request)?;
 //! let check = CssRequest::new(location, CssCommand::CheckCorpus, None, None)?;
 //! css::run(check)
+//! # }
+//! ```
+//!
+//! Import verifies the existing checkout and writes its canonical sidecar; it
+//! does not clone, download, install, repair, or execute CSSTree. Once imported,
+//! `check-corpus` validates the persisted source attestation, neutral
+//! expectations, and report entirely from the corpus root:
+//!
+//! ```no_run
+//! # use surgeist_generator::{CorpusLocation, Result};
+//! # use surgeist_generator::css::{self, CssCommand, CssRequest};
+//! # fn example(location: CorpusLocation) -> Result<()> {
+//! css::run(CssRequest::new(
+//!     location,
+//!     CssCommand::CheckCorpus,
+//!     None,
+//!     None,
+//! )?)
 //! # }
 //! ```
 

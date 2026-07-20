@@ -1,5 +1,12 @@
 //! Taffy maintenance and trusted-browser layout generation over explicit roots.
 //!
+//! `surgeist-layout-generate` is built only with `layout-browser`. Its public CLI
+//! accepts exactly `generate`, `check-corpus`, `check-taffy-corpus`, and
+//! `import-taffy`, always with explicit `--owner-root` and `--corpus-root` values.
+//! Taffy commands additionally require `--source-root`; generation instead
+//! requires one owner-relative `--browser-path` and permits one HTML-relative
+//! `--filter`. The checked constructors below encode the same payload boundary.
+//!
 //! Import verifies an existing clean checkout at the manifest-owned pin. It
 //! never downloads, installs, or executes the source:
 //!
@@ -12,6 +19,13 @@
 //! layout::run(request)
 //! # }
 //! ```
+//!
+//! The corpus manifest owns the mutable Taffy pin and pre-exclusion source count.
+//! A first adoption run atomically adds
+//! `html/.surgeist-taffy-source.json` to a valid sidecar-free schema-2 corpus
+//! while preserving manifest-authored HTML. `check-taffy-corpus` then compares an
+//! explicit checkout with that attestation; `check-corpus` needs neither the
+//! checkout nor a browser and validates the persisted attestation offline.
 //!
 //! Generation accepts one existing executable below the manifest-declared cache
 //! root. It never downloads or installs a browser. The executable is a trusted
@@ -26,6 +40,23 @@
 //! layout::run(LayoutRequest::generate(location, browser, filter)?)
 //! # }
 //! ```
+//!
+//! Authentication is not sandboxing. The executable and pinned Chromium switches
+//! may write or spawn outside generator-owned roots, and lifecycle guarantees
+//! cover only the recorded process group; a malicious executable could replace
+//! itself or detach work. The operator must trust the exact executable and pinned
+//! configuration. Version and measurement processes receive a fixed,
+//! inheritance-free environment rooted in a private attempt profile, with fixed
+//! locale/timezone/path values and proxy variables disabled.
+//!
+//! Profiles and durable journals live only below
+//! `<corpus>/.surgeist-generator/profiles/layout`. Every ordinary return
+//! terminalizes the recorded group before artifact planning. On the next mutation,
+//! a provably dead orphan journal is recovered after protected-input
+//! revalidation; a live or inconclusive recorded group returns
+//! [`GeneratorErrorKind::LeaseActive`] without signaling or deleting evidence.
+//! The operator must terminate that orphaned trusted-browser group and retry.
+//! Recovery itself never sends a signal.
 //!
 //! ```compile_fail
 //! use std::path::PathBuf;
