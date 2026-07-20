@@ -19,9 +19,9 @@ use crate::{
 use super::browser::TrustedBrowser;
 use super::measurement::{TestBrowserPlan, TestGenerationHost};
 use super::profile::{
-    PROFILE_PARENT, ProfileAttempt, ProfileCreateContext, ProfileJournal, classify_pending,
-    force_kill_group, resolve_terminalization, test_cleanup_path, test_group_is_dead,
-    test_validate_journal_name,
+    OwnedSupervisorChild, PROFILE_PARENT, ProfileAttempt, ProfileCreateContext, ProfileJournal,
+    SUPERVISOR_EXIT_BOUND, SupervisorTermination, classify_pending, force_kill_group,
+    resolve_terminalization, test_cleanup_path, test_group_is_dead, test_validate_journal_name,
 };
 use super::supervisor::TestBrowserMode;
 use super::{LayoutRequest, generation, manifest, sidecar, supervisor, tests};
@@ -308,6 +308,85 @@ fn layout_profile_launch_failure_is_terminal() {
     harness.assert_terminal();
 }
 
+struct ReapObservingChild<'a> {
+    child: &'a mut Child,
+    rooted: &'a RootedFs,
+    journal: &'a str,
+    reaped: bool,
+    journal_present_when_reaped: bool,
+}
+
+impl<'a> ReapObservingChild<'a> {
+    fn new(child: &'a mut Child, rooted: &'a RootedFs, journal: &'a str) -> Self {
+        Self {
+            child,
+            rooted,
+            journal,
+            reaped: false,
+            journal_present_when_reaped: false,
+        }
+    }
+}
+
+impl OwnedSupervisorChild for ReapObservingChild<'_> {
+    fn id(&self) -> Option<u32> {
+        Some(self.child.id())
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.reaped = true;
+            self.journal_present_when_reaped = self
+                .rooted
+                .exists(self.journal)
+                .expect("observe journal state at child reap");
+        }
+        Ok(status)
+    }
+}
+
+#[test]
+fn layout_profile_graceful_delayed_exit_is_reaped_without_signal_before_cleanup() {
+    let harness = GenerationHarness::new();
+    let lease = harness.lease();
+    let journal = harness.version_journal(&lease);
+    let path = journal.journal_path().to_owned();
+    let mut child = harness.spawn_supervisor(&journal, TestBrowserMode::DelayedSupervisorExit);
+    let group = child.id();
+    wait_for_running(lease.rooted(), &path);
+    wait_for_group(group, false);
+
+    let (termination, reaped, journal_present_when_reaped) = {
+        let mut observed = ReapObservingChild::new(&mut child, lease.rooted(), &path);
+        let termination = journal
+            .terminalize_owned_supervisor(lease.rooted(), Some(&mut observed))
+            .expect("graceful delayed terminalization");
+        (
+            termination,
+            observed.reaped,
+            observed.journal_present_when_reaped,
+        )
+    };
+    assert_eq!(termination, SupervisorTermination::Graceful);
+    assert!(reaped, "terminalization must reap the supervisor");
+    assert!(
+        journal_present_when_reaped,
+        "profile cleanup must begin only after the child is reaped"
+    );
+    assert!(
+        child
+            .try_wait()
+            .expect("probe gracefully reaped supervisor")
+            .expect("graceful terminalization reaps its owned supervisor")
+            .success(),
+        "a supervisor that exits within the graceful bound must not be killed"
+    );
+    wait_for_group(group, true);
+    drop(lease);
+    harness.assert_terminal();
+}
+
 #[test]
 fn layout_profile_forced_group_kill_is_terminal() {
     let harness = GenerationHarness::new();
@@ -318,9 +397,28 @@ fn layout_profile_forced_group_kill_is_terminal() {
     let group = child.id();
     wait_for_running(lease.rooted(), &path);
     wait_for_group(group, false);
-    journal
-        .terminalize_with_forced_group_kill(lease.rooted(), Some(&mut child))
-        .expect("forced terminalization");
+    let started = Instant::now();
+    let (termination, reaped, journal_present_when_reaped) = {
+        let mut observed = ReapObservingChild::new(&mut child, lease.rooted(), &path);
+        let termination = journal
+            .terminalize_owned_supervisor(lease.rooted(), Some(&mut observed))
+            .expect("forced terminalization");
+        (
+            termination,
+            observed.reaped,
+            observed.journal_present_when_reaped,
+        )
+    };
+    assert_eq!(termination, SupervisorTermination::Forced);
+    assert!(
+        started.elapsed() >= SUPERVISOR_EXIT_BOUND,
+        "forced signaling must follow the five-second graceful exit bound"
+    );
+    assert!(reaped, "forced terminalization must reap the supervisor");
+    assert!(
+        journal_present_when_reaped,
+        "profile cleanup must begin only after forced reaping"
+    );
     assert!(
         !child
             .try_wait()
@@ -329,6 +427,45 @@ fn layout_profile_forced_group_kill_is_terminal() {
             .success()
     );
     wait_for_group(group, true);
+    drop(lease);
+    harness.assert_terminal();
+}
+
+#[test]
+fn layout_profile_dead_group_without_retained_reap_proof_preserves_evidence() {
+    let harness = GenerationHarness::new();
+    let lease = harness.lease();
+    let journal = harness.version_journal(&lease);
+    let path = journal.journal_path().to_owned();
+    let mut child = harness.spawn_supervisor(&journal, TestBrowserMode::Success);
+    let group = child.id();
+    wait_for_running(lease.rooted(), &path);
+    assert!(child.wait().expect("reap successful supervisor").success());
+    wait_for_group(group, true);
+
+    let error = journal
+        .terminalize_owned_supervisor(lease.rooted(), None)
+        .expect_err("dead group without retained child proof must preserve evidence");
+    assert_eq!(error.kind(), GeneratorErrorKind::Process);
+    assert!(
+        error
+            .to_string()
+            .contains("no retained owned supervisor child"),
+        "{error}"
+    );
+    assert!(
+        lease
+            .rooted()
+            .exists(&path)
+            .expect("profile evidence state"),
+        "active profile evidence must remain"
+    );
+
+    classify_pending(lease.rooted())
+        .expect("classify retained dead profile")
+        .expect("retained dead profile is recoverable")
+        .execute(lease.rooted())
+        .expect("recover retained dead profile");
     drop(lease);
     harness.assert_terminal();
 }
@@ -344,7 +481,7 @@ fn layout_profile_unverified_group_is_not_signaled_and_preserves_evidence() {
     wait_for_running(lease.rooted(), &path);
     wait_for_group(group, false);
 
-    let result = journal.terminalize_with_forced_group_kill(lease.rooted(), None);
+    let result = journal.terminalize_owned_supervisor(lease.rooted(), None);
     let group_was_signaled = child
         .try_wait()
         .expect("probe unverified supervisor")
@@ -365,7 +502,7 @@ fn layout_profile_unverified_group_is_not_signaled_and_preserves_evidence() {
             "synthetic primary generation failure",
             "primary context",
         )),
-        result,
+        result.map(|_| ()),
     )
     .expect_err("unverified cleanup failure must override the primary failure");
     assert_eq!(error.kind(), GeneratorErrorKind::Process);
@@ -395,8 +532,7 @@ fn layout_profile_reused_group_identity_is_not_signaled_and_preserves_evidence()
     wait_for_running(unrelated_lease.rooted(), &unrelated_path);
     wait_for_group(unrelated_group, false);
 
-    let result =
-        journal.terminalize_with_forced_group_kill(lease.rooted(), Some(&mut unrelated_child));
+    let result = journal.terminalize_owned_supervisor(lease.rooted(), Some(&mut unrelated_child));
     let recorded_group_remained_live =
         !test_group_is_dead(recorded_group).expect("probe reused recorded group");
     let unrelated_group_remained_live =
@@ -1260,11 +1396,19 @@ fn snapshot_xml(corpus: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 }
 
 fn wait_for_running(rooted: &RootedFs, journal: &str) {
-    let running = format!("{journal}/running.json");
+    let running = rooted.canonical_root().join(journal).join("running.json");
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if rooted.exists(&running).expect("running record state") {
-            return;
+        match fs::symlink_metadata(&running) {
+            Ok(metadata) => {
+                assert!(
+                    metadata.file_type().is_file(),
+                    "running record is not a file"
+                );
+                return;
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => panic!("inspect running record state: {source}"),
         }
         assert!(
             Instant::now() < deadline,

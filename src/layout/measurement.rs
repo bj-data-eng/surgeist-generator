@@ -18,7 +18,7 @@ use super::browser::{TrustedBrowser, chromium_config, effective_switches};
 use super::manifest::LayoutManifest;
 use super::profile::{
     OwnedSupervisorChild, ProfileAttempt, ProfileCreateContext, ProfileJournal,
-    resolve_terminalization,
+    SupervisorTermination, resolve_terminalization,
 };
 use super::selection::Fixture;
 use super::xml::{MeasuredLayout, Variant};
@@ -139,14 +139,19 @@ impl AttemptSupervisor {
 }
 
 struct AttemptExecution {
-    result: Result<AttemptOutcomes>,
+    completion: AttemptCompletion,
     supervisor: Option<AttemptSupervisor>,
+}
+
+enum AttemptCompletion {
+    Result(Result<AttemptOutcomes>),
+    Panic(Box<dyn std::any::Any + Send>),
 }
 
 impl AttemptExecution {
     fn without_supervisor(result: Result<AttemptOutcomes>) -> Self {
         Self {
-            result,
+            completion: AttemptCompletion::Result(result),
             supervisor: None,
         }
     }
@@ -312,7 +317,7 @@ async fn run_attempt(
     let (_capsule, config) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
-            journal.terminalize_with_forced_group_kill(context.lease.rooted(), None)?;
+            journal.terminalize_owned_supervisor(context.lease.rooted(), None)?;
             return Err(error);
         }
     };
@@ -345,7 +350,7 @@ async fn run_attempt(
     };
     match outcome {
         Ok(mut execution) => {
-            let terminal = journal.terminalize_with_forced_group_kill(
+            let terminal = journal.terminalize_owned_supervisor(
                 context.lease.rooted(),
                 execution
                     .supervisor
@@ -353,14 +358,31 @@ async fn run_attempt(
                     .and_then(AttemptSupervisor::child),
             );
             let terminal_succeeded = terminal.is_ok();
-            let AttemptExecution { result, supervisor } = execution;
+            let termination = terminal.as_ref().copied().ok();
+            let terminal = terminal.map(|_| ());
+            let AttemptExecution {
+                completion,
+                supervisor,
+            } = execution;
             if let Some(supervisor) = supervisor {
                 supervisor.finish_terminalization(terminal_succeeded);
             }
-            resolve_terminalization(result, terminal)
+            match completion {
+                AttemptCompletion::Result(result) => {
+                    let result = match termination {
+                        Some(termination) => apply_supervisor_termination(result, termination),
+                        None => result,
+                    };
+                    resolve_terminalization(result, terminal)
+                }
+                AttemptCompletion::Panic(payload) => {
+                    let _ = terminal;
+                    std::panic::resume_unwind(payload)
+                }
+            }
         }
         Err(payload) => {
-            let _ = journal.terminalize_with_forced_group_kill(context.lease.rooted(), None);
+            let _ = journal.terminalize_owned_supervisor(context.lease.rooted(), None);
             std::panic::resume_unwind(payload)
         }
     }
@@ -387,7 +409,7 @@ async fn test_browser_attempt(
     let TestSupervisorRun { result, child } = supervisor;
     if let Err(error) = result {
         return AttemptExecution {
-            result: Err(error),
+            completion: AttemptCompletion::Result(Err(error)),
             supervisor: Some(AttemptSupervisor::Test(child)),
         };
     }
@@ -399,22 +421,25 @@ async fn test_browser_attempt(
         )
     {
         return AttemptExecution {
-            result: Err(error),
+            completion: AttemptCompletion::Result(Err(error)),
             supervisor: Some(AttemptSupervisor::Test(child)),
         };
     }
     match host.plan() {
         TestBrowserPlan::DependencyPanic => {
             return AttemptExecution {
-                result: Err(dependency_panic(
+                completion: AttemptCompletion::Result(Err(dependency_panic(
                     "crate-owned fake browser dependency",
                     Box::new("synthetic dependency panic"),
-                )),
+                ))),
                 supervisor: Some(AttemptSupervisor::Test(child)),
             };
         }
         TestBrowserPlan::OwnedPanic | TestBrowserPlan::OwnedPanicWithCleanupFailure => {
-            std::panic::panic_any("synthetic owned generation panic");
+            return AttemptExecution {
+                completion: AttemptCompletion::Panic(Box::new("synthetic owned generation panic")),
+                supervisor: Some(AttemptSupervisor::Test(child)),
+            };
         }
         _ => {}
     }
@@ -437,7 +462,7 @@ async fn test_browser_attempt(
         })
         .collect());
     AttemptExecution {
-        result,
+        completion: AttemptCompletion::Result(result),
         supervisor: Some(AttemptSupervisor::Test(child)),
     }
 }
@@ -505,14 +530,15 @@ async fn browser_attempt(
                     Err(payload) => Err(dependency_panic("Chromiumoxide handler", payload)),
                 }
             });
-            let measured = measure_pages(
+            let measured = AssertUnwindSafe(measure_pages(
                 browser.browser(),
                 location,
                 manifest,
                 helper,
                 base_style,
                 fixtures,
-            )
+            ))
+            .catch_unwind()
             .await;
             let close = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -533,9 +559,14 @@ async fn browser_attempt(
                     Ok(Err(source)) => Err(process_source(source)),
                     Err(source) => Err(process_timeout("join Chromiumoxide handler", source)),
                 };
-            let result = close_result.and(handler_result).and(measured);
+            let completion = match measured {
+                Ok(measured) => {
+                    AttemptCompletion::Result(close_result.and(handler_result).and(measured))
+                }
+                Err(payload) => AttemptCompletion::Panic(payload),
+            };
             AttemptExecution {
-                result,
+                completion,
                 supervisor: Some(AttemptSupervisor::Production(Box::new(browser))),
             }
         }
@@ -700,6 +731,24 @@ fn process_timeout(operation: &str, source: tokio::time::error::Elapsed) -> Gene
     )
 }
 
+fn supervisor_timeout() -> GeneratorError {
+    GeneratorError::new(
+        GeneratorErrorKind::Process,
+        "wait for layout browser supervisor",
+        "supervisor exceeded the five-second graceful exit bound and required SIGKILL",
+    )
+}
+
+fn apply_supervisor_termination<T>(
+    primary: Result<T>,
+    termination: SupervisorTermination,
+) -> Result<T> {
+    match (primary, termination) {
+        (Ok(_), SupervisorTermination::Forced) => Err(supervisor_timeout()),
+        (primary, _) => primary,
+    }
+}
+
 fn generation_source<E>(source: E) -> GeneratorError
 where
     E: std::error::Error + Send + Sync + 'static,
@@ -730,13 +779,42 @@ fn json_string(value: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::dependency_panic;
-    use crate::GeneratorErrorKind;
+    use super::{apply_supervisor_termination, dependency_panic};
+    use crate::{GeneratorError, GeneratorErrorKind};
+
+    use super::SupervisorTermination;
 
     #[test]
     fn layout_generate_dependency_panic_maps_to_process() {
         let error = dependency_panic("test", Box::new("boom"));
         assert_eq!(error.kind(), GeneratorErrorKind::Process);
         assert!(error.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn layout_generate_forced_supervisor_exit_is_process() {
+        let error = apply_supervisor_termination(Ok(()), SupervisorTermination::Forced)
+            .expect_err("forced exit must fail an otherwise successful measurement");
+        assert_eq!(error.kind(), GeneratorErrorKind::Process);
+        assert!(
+            error
+                .to_string()
+                .contains("five-second graceful exit bound")
+        );
+    }
+
+    #[test]
+    fn layout_generate_forced_supervisor_exit_preserves_primary_failure() {
+        let error = apply_supervisor_termination::<()>(
+            Err(GeneratorError::new(
+                GeneratorErrorKind::Generation,
+                "synthetic measurement failure",
+                "primary context",
+            )),
+            SupervisorTermination::Forced,
+        )
+        .expect_err("primary failure remains authoritative after successful terminalization");
+        assert_eq!(error.kind(), GeneratorErrorKind::Generation);
+        assert!(error.to_string().contains("primary context"));
     }
 }

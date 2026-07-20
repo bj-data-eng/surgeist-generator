@@ -2,8 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
-use std::time::Duration;
+use std::process::Stdio;
 
 use futures::FutureExt;
 use tokio::io::AsyncReadExt;
@@ -19,7 +18,8 @@ use crate::{GeneratorError, GeneratorErrorKind, RelativePath, Result, Sha256Dige
 use super::browser::TrustedBrowser;
 use super::measurement::{BrowserExecution, MeasurementResults, VariantOutcome};
 use super::profile::{
-    ProfileAttempt, ProfileCreateContext, ProfileJournal, classify_pending, resolve_terminalization,
+    ProfileAttempt, ProfileCreateContext, ProfileJournal, SupervisorTermination, classify_pending,
+    resolve_terminalization,
 };
 use super::report::{GenerationLedger, GenerationMetadata, HistoricalAuthority};
 use super::selection::{CurrentInputs, Fixture, FixtureDisposition, SelectionLedger};
@@ -426,7 +426,7 @@ async fn run_version_supervisor(
     })() {
         Ok(capsule) => capsule,
         Err(error) => {
-            journal.terminalize_with_forced_group_kill(lease.rooted(), None)?;
+            journal.terminalize_owned_supervisor(lease.rooted(), None)?;
             return Err(error);
         }
     };
@@ -437,23 +437,26 @@ async fn run_version_supervisor(
                 .await;
             match outcome {
                 Ok(Ok(mut execution)) => {
-                    let terminal = journal.terminalize_with_forced_group_kill(
-                        lease.rooted(),
-                        Some(&mut execution.child),
-                    );
+                    let terminal = tokio::task::block_in_place(|| {
+                        journal.terminalize_owned_supervisor(
+                            lease.rooted(),
+                            Some(&mut execution.child),
+                        )
+                    });
+                    let forced = matches!(&terminal, Ok(SupervisorTermination::Forced));
                     let primary = if terminal.is_ok() {
-                        execution.finish().await
+                        execution.finish(forced).await
                     } else {
                         execution.abort_output().await
                     };
-                    resolve_terminalization(primary, terminal)
+                    resolve_terminalization(primary, terminal.map(|_| ()))
                 }
                 Ok(Err(error)) => {
-                    let terminal = journal.terminalize_with_forced_group_kill(lease.rooted(), None);
-                    resolve_terminalization::<String>(Err(error), terminal)
+                    let terminal = journal.terminalize_owned_supervisor(lease.rooted(), None);
+                    resolve_terminalization::<String>(Err(error), terminal.map(|_| ()))
                 }
                 Err(payload) => {
-                    let _ = journal.terminalize_with_forced_group_kill(lease.rooted(), None);
+                    let _ = journal.terminalize_owned_supervisor(lease.rooted(), None);
                     std::panic::resume_unwind(payload)
                 }
             }
@@ -474,21 +477,19 @@ async fn run_version_supervisor(
             .await;
             match outcome {
                 Ok(Ok(mut execution)) => {
-                    let terminal = journal.terminalize_with_forced_group_kill(
-                        lease.rooted(),
-                        Some(&mut execution.child),
-                    );
+                    let terminal = journal
+                        .terminalize_owned_supervisor(lease.rooted(), Some(&mut execution.child));
                     let primary = execution
                         .result
                         .map(|()| manifest.browser.version_output.clone());
-                    resolve_terminalization(primary, terminal)
+                    resolve_terminalization(primary, terminal.map(|_| ()))
                 }
                 Ok(Err(error)) => {
-                    let terminal = journal.terminalize_with_forced_group_kill(lease.rooted(), None);
-                    resolve_terminalization::<String>(Err(error), terminal)
+                    let terminal = journal.terminalize_owned_supervisor(lease.rooted(), None);
+                    resolve_terminalization::<String>(Err(error), terminal.map(|_| ()))
                 }
                 Err(payload) => {
-                    let _ = journal.terminalize_with_forced_group_kill(lease.rooted(), None);
+                    let _ = journal.terminalize_owned_supervisor(lease.rooted(), None);
                     std::panic::resume_unwind(payload)
                 }
             }
@@ -497,7 +498,6 @@ async fn run_version_supervisor(
 }
 
 struct VersionProcessCompletion {
-    status: Result<ExitStatus>,
     stdout_task: tokio::task::JoinHandle<Result<Vec<u8>>>,
     stderr_task: tokio::task::JoinHandle<Result<Vec<u8>>>,
 }
@@ -519,14 +519,12 @@ impl VersionProcessRun {
 
     fn completed(
         child: tokio::process::Child,
-        status: Result<ExitStatus>,
         stdout_task: tokio::task::JoinHandle<Result<Vec<u8>>>,
         stderr_task: tokio::task::JoinHandle<Result<Vec<u8>>>,
     ) -> Self {
         Self {
             child,
             completion: Some(VersionProcessCompletion {
-                status,
                 stdout_task,
                 stderr_task,
             }),
@@ -534,17 +532,31 @@ impl VersionProcessRun {
         }
     }
 
-    async fn finish(mut self) -> Result<String> {
+    async fn finish(mut self, forced: bool) -> Result<String> {
         if let Some(error) = self.immediate_error.take() {
             return Err(error);
         }
+        let status = self
+            .child
+            .try_wait()
+            .map_err(process_source)?
+            .ok_or_else(|| {
+                process_error(
+                    "trusted browser version supervisor was not reaped before output validation",
+                )
+            })?;
         let completion = self
             .completion
             .take()
             .expect("version process completion is present");
         let stdout = completion.stdout_task.await.map_err(process_source)??;
         let stderr = completion.stderr_task.await.map_err(process_source)??;
-        let status = completion.status?;
+        if forced {
+            return Err(process_error(format!(
+                "trusted browser version command exceeded the five-second graceful exit bound and required SIGKILL; stderr={}",
+                String::from_utf8_lossy(&stderr)
+            )));
+        }
         if !status.success() {
             return Err(process_error(format!(
                 "trusted browser version command failed: {status}; stderr={}",
@@ -568,7 +580,7 @@ impl VersionProcessRun {
         completion.stderr_task.abort();
         let _ = completion.stdout_task.await;
         let _ = completion.stderr_task.await;
-        completion.status.map(|_| String::new())
+        Ok(String::new())
     }
 }
 
@@ -601,19 +613,8 @@ async fn run_version_process(executable: &Path, capsule: String) -> Result<Versi
     };
     let stdout_task = tokio::spawn(read_capped(stdout));
     let stderr_task = tokio::spawn(read_capped(stderr));
-    let waited = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-    let status = match waited {
-        Ok(result) => result.map_err(process_source),
-        Err(source) => Err(GeneratorError::with_source(
-            GeneratorErrorKind::Process,
-            "wait for trusted browser version",
-            "version command timed out",
-            source,
-        )),
-    };
     Ok(VersionProcessRun::completed(
         child,
-        status,
         stdout_task,
         stderr_task,
     ))

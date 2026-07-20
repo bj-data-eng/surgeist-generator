@@ -23,7 +23,9 @@ use super::browser::TrustedBrowser;
 use super::manifest::LayoutManifest;
 
 pub(super) const PROFILE_PARENT: &str = ".surgeist-generator/profiles/layout";
+pub(super) const SUPERVISOR_EXIT_BOUND: Duration = Duration::from_secs(5);
 const LOCK_HEADER: &[u8] = b"surgeist-generator-lock-v1\n";
+const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const INTENT_TEMPORARY: &str = "intent.json.temporary";
 const TRANSITION_TEMPORARY: &str = "transition.lock.temporary";
 const PROFILE_TEMPORARY: &str = "profile.json.temporary";
@@ -132,6 +134,12 @@ pub(super) struct RunningRecord {
 pub(super) trait OwnedSupervisorChild {
     fn id(&self) -> Option<u32>;
     fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SupervisorTermination {
+    Graceful,
+    Forced,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -365,6 +373,7 @@ impl ProfileJournal {
         &self.path
     }
 
+    #[cfg(test)]
     pub(super) fn terminalize(self, rooted: &RootedFs) -> Result<()> {
         #[cfg(test)]
         let _observation = rooted.begin_observation_phase(DurabilityPhase::ProfileTerminalization);
@@ -396,51 +405,32 @@ impl ProfileJournal {
         rooted.sync_dir(PROFILE_PARENT)
     }
 
-    pub(super) fn terminalize_with_forced_group_kill(
+    pub(super) fn terminalize_owned_supervisor(
         self,
         rooted: &RootedFs,
         owned_supervisor: Option<&mut dyn OwnedSupervisorChild>,
-    ) -> Result<()> {
+    ) -> Result<SupervisorTermination> {
         #[cfg(test)]
         let _observation = rooted.begin_observation_phase(DurabilityPhase::ProfileTerminalization);
-        let _verified_snapshot = snapshot_tree(rooted, &self.path, &self.identity)?;
+        let verified_snapshot = snapshot_tree(rooted, &self.path, &self.identity)?;
+        let mut termination = SupervisorTermination::Graceful;
         if let Some(running) =
             read_optional_record::<RunningRecord>(rooted, &self.path, "running.json")?
         {
             validate_running(&running)?;
-            match probe_group(running.process_group_id)? {
-                GroupState::Dead => {}
-                GroupState::Inconclusive => {
-                    return Err(process_error(
-                        "terminalize layout browser profile",
-                        "recorded browser process group ownership is inconclusive; no signal was sent",
-                    ));
-                }
-                GroupState::Live => {
-                    let child = owned_supervisor.ok_or_else(|| {
-                        process_error(
-                            "terminalize layout browser profile",
-                            "recorded browser process group has no retained owned supervisor child; no signal was sent",
-                        )
-                    })?;
-                    match verify_owned_supervisor(&running, child)? {
-                        OwnedSupervisorState::LiveGroupLeader => {
-                            force_kill_group(running.process_group_id)?;
-                            wait_for_owned_group_exit(running.process_group_id, child)?;
-                        }
-                        OwnedSupervisorState::Reaped
-                            if probe_group(running.process_group_id)? == GroupState::Dead => {}
-                        OwnedSupervisorState::Reaped => {
-                            return Err(process_error(
-                                "verify owned layout browser supervisor",
-                                "retained supervisor child exited while its recorded process group remained live or inconclusive; no signal was sent",
-                            ));
-                        }
-                    }
-                }
+            let child = owned_supervisor.ok_or_else(|| {
+                process_error(
+                    "terminalize layout browser profile",
+                    "recorded browser process group has no retained owned supervisor child; no signal was sent",
+                )
+            })?;
+            if wait_for_graceful_supervisor_exit(&running, child)? == GracefulExit::TimedOut {
+                force_owned_supervisor_exit(&running, child)?;
+                termination = SupervisorTermination::Forced;
             }
         }
-        self.terminalize(rooted)
+        self.finish_terminalization(rooted, verified_snapshot)?;
+        Ok(termination)
     }
 
     pub(super) fn validates_prefix(&self, rooted: &RootedFs) -> Result<()> {
@@ -975,18 +965,7 @@ fn verify_owned_supervisor(
     running: &RunningRecord,
     child: &mut dyn OwnedSupervisorChild,
 ) -> Result<OwnedSupervisorState> {
-    let owned_pid = child.id().ok_or_else(|| {
-        process_error(
-            "verify owned layout browser supervisor",
-            "owned supervisor child has no live process identity; no signal was sent",
-        )
-    })?;
-    if owned_pid != running.supervisor_pid || owned_pid != running.process_group_id {
-        return Err(process_error(
-            "verify owned layout browser supervisor",
-            "running record differs from the retained owned supervisor child; no signal was sent",
-        ));
-    }
+    let owned_pid = verify_owned_pid(running, child)?;
     if child
         .try_wait()
         .map_err(|source| {
@@ -1019,28 +998,140 @@ fn verify_owned_supervisor(
     Ok(OwnedSupervisorState::LiveGroupLeader)
 }
 
-fn wait_for_owned_group_exit(group: u32, child: &mut dyn OwnedSupervisorChild) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GracefulExit {
+    ReapedAndAbsent,
+    TimedOut,
+}
+
+fn wait_for_graceful_supervisor_exit(
+    running: &RunningRecord,
+    child: &mut dyn OwnedSupervisorChild,
+) -> Result<GracefulExit> {
+    verify_owned_pid(running, child)?;
+    let deadline = Instant::now() + SUPERVISOR_EXIT_BOUND;
+    let mut group_was_inconclusive = false;
     loop {
-        child.try_wait().map_err(|source| {
+        let reaped = child.try_wait().map_err(|source| {
             GeneratorError::with_source(
                 GeneratorErrorKind::Process,
                 "reap owned layout browser supervisor",
-                "failed to reap the retained supervisor child after SIGKILL",
+                "failed to observe the retained supervisor child during its graceful exit bound; no signal was sent",
                 source,
             )
         })?;
-        if probe_group(group)? == GroupState::Dead {
+        match (reaped.is_some(), probe_group(running.process_group_id)?) {
+            (true, GroupState::Dead) => return Ok(GracefulExit::ReapedAndAbsent),
+            (true, GroupState::Inconclusive) if Instant::now() >= deadline => {
+                return Err(process_error(
+                    "terminalize layout browser profile",
+                    "the supervisor was reaped but recorded group absence is inconclusive; no signal was sent",
+                ));
+            }
+            (true, GroupState::Live) if Instant::now() >= deadline => {
+                return Err(process_error(
+                    "terminalize layout browser profile",
+                    "the supervisor was reaped but its recorded process group remained live; no signal was sent",
+                ));
+            }
+            (false, GroupState::Dead) => {
+                return Err(process_error(
+                    "terminalize layout browser profile",
+                    "the recorded process group is absent but the retained supervisor child was not reaped; no signal was sent",
+                ));
+            }
+            (false, GroupState::Inconclusive) if Instant::now() >= deadline => {
+                return Err(process_error(
+                    "terminalize layout browser profile",
+                    "recorded browser process group ownership is inconclusive; no signal was sent",
+                ));
+            }
+            (false, GroupState::Live) if Instant::now() >= deadline => {
+                if group_was_inconclusive {
+                    return Err(process_error(
+                        "terminalize layout browser profile",
+                        "recorded browser process group ownership was inconclusive during the graceful bound; no signal was sent",
+                    ));
+                }
+                return Ok(GracefulExit::TimedOut);
+            }
+            (true, GroupState::Inconclusive) | (false, GroupState::Inconclusive) => {
+                group_was_inconclusive = true;
+            }
+            (true, GroupState::Live) | (false, GroupState::Live) => {}
+        }
+        std::thread::sleep(SUPERVISOR_POLL_INTERVAL);
+    }
+}
+
+fn force_owned_supervisor_exit(
+    running: &RunningRecord,
+    child: &mut dyn OwnedSupervisorChild,
+) -> Result<()> {
+    match verify_owned_supervisor(running, child)? {
+        OwnedSupervisorState::LiveGroupLeader => {
+            force_kill_group(running.process_group_id)?;
+            wait_for_owned_group_exit(running.process_group_id, child)
+        }
+        OwnedSupervisorState::Reaped => require_group_absent_after_reap(running.process_group_id),
+    }
+}
+
+fn require_group_absent_after_reap(group: u32) -> Result<()> {
+    if probe_group(group)? == GroupState::Dead {
+        Ok(())
+    } else {
+        Err(process_error(
+            "terminalize layout browser profile",
+            "the retained supervisor child was reaped but recorded group absence is not proven; no signal was sent",
+        ))
+    }
+}
+
+fn wait_for_owned_group_exit(group: u32, child: &mut dyn OwnedSupervisorChild) -> Result<()> {
+    let deadline = Instant::now() + SUPERVISOR_EXIT_BOUND;
+    let mut reaped = false;
+    loop {
+        reaped |= child
+            .try_wait()
+            .map_err(|source| {
+                GeneratorError::with_source(
+                    GeneratorErrorKind::Process,
+                    "reap owned layout browser supervisor",
+                    "failed to reap the retained supervisor child after SIGKILL",
+                    source,
+                )
+            })?
+            .is_some();
+        if reaped && probe_group(group)? == GroupState::Dead {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(process_error(
-                "terminalize layout browser profile",
-                "recorded browser process group remained live or inconclusive after SIGKILL",
-            ));
+            let detail = if reaped {
+                "recorded browser process group remained live or inconclusive after SIGKILL"
+            } else {
+                "retained supervisor child was not reaped after SIGKILL"
+            };
+            return Err(process_error("terminalize layout browser profile", detail));
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(SUPERVISOR_POLL_INTERVAL);
     }
+}
+
+fn verify_owned_pid(running: &RunningRecord, child: &dyn OwnedSupervisorChild) -> Result<u32> {
+    let owned_pid = child.id().ok_or_else(|| {
+        process_error(
+            "verify owned layout browser supervisor",
+            "owned supervisor child has no live process identity; no signal was sent",
+        )
+    })?;
+    if owned_pid != running.supervisor_pid || owned_pid != running.process_group_id {
+        return Err(process_error(
+            "verify owned layout browser supervisor",
+            "running record differs from the retained owned supervisor child; no signal was sent",
+        ));
+    }
+    Ok(owned_pid)
 }
 
 fn process_pid(value: u32, operation: &str) -> Result<rustix::process::Pid> {

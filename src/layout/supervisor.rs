@@ -28,6 +28,7 @@ enum SupervisorMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TestBrowserMode {
     Success,
+    DelayedSupervisorExit,
     Failure,
     Hang,
     HoldTransition,
@@ -38,6 +39,7 @@ impl TestBrowserMode {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
+            Self::DelayedSupervisorExit => "delayed-supervisor-exit",
             Self::Failure => "failure",
             Self::Hang => "hang",
             Self::HoldTransition => "hold-transition",
@@ -47,6 +49,7 @@ impl TestBrowserMode {
     fn parse(value: &str) -> Result<Self> {
         match value {
             "success" => Ok(Self::Success),
+            "delayed-supervisor-exit" => Ok(Self::DelayedSupervisorExit),
             "failure" => Ok(Self::Failure),
             "hang" => Ok(Self::Hang),
             "hold-transition" => Ok(Self::HoldTransition),
@@ -57,6 +60,7 @@ impl TestBrowserMode {
     const fn browser_test(self) -> Option<&'static str> {
         match self {
             Self::Success => Some("layout::profile_tests::layout_fake_browser_success_process"),
+            Self::DelayedSupervisorExit => None,
             Self::Failure => Some("layout::profile_tests::layout_fake_browser_failure_process"),
             Self::Hang => Some("layout::profile_tests::layout_fake_browser_hang_process"),
             Self::HoldTransition => None,
@@ -163,6 +167,24 @@ fn run(capsule: LaunchCapsule, mode: SupervisorMode) -> Result<()> {
         return Err(process_error(
             "crate-owned transition-race supervisor was not interrupted",
         ));
+    }
+
+    #[cfg(test)]
+    if matches!(
+        mode,
+        SupervisorMode::Test(TestBrowserMode::DelayedSupervisorExit)
+    ) {
+        transition.unlock().map_err(|source| {
+            GeneratorError::with_source(
+                GeneratorErrorKind::ArtifactTransaction,
+                "release layout profile transition lock",
+                journal.to_owned(),
+                source,
+            )
+        })?;
+        drop(transition);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        return Ok(());
     }
 
     let mut command = Command::new(browser.absolute_path());
