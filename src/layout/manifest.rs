@@ -28,6 +28,8 @@ pub(super) struct LayoutManifest {
     pub(super) browser: BrowserManifest,
     pub(super) reports: GenerationReportManifest,
     pub(super) launch_digest: Sha256Digest,
+    #[cfg(test)]
+    pub(super) effective_launch_keys: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -231,9 +233,24 @@ fn parse_complete(bytes: &[u8], path: &Path) -> Result<(LayoutManifest, Sha256Di
             },
             reports: report_manifest(raw.generation_reports)?,
             launch_digest: launch_digest.clone(),
+            #[cfg(test)]
+            effective_launch_keys: effective_launch_keys(&raw.browser.launch),
         },
         launch_digest,
     ))
+}
+
+#[cfg(test)]
+fn effective_launch_keys(launch: &RawLaunch) -> BTreeSet<String> {
+    launch
+        .arguments
+        .iter()
+        .map(|argument| {
+            normalized_launch_key(argument)
+                .expect("launch arguments were validated before representation")
+                .to_owned()
+        })
+        .collect()
 }
 
 fn report_manifest(raw: RawGenerationReports) -> Result<GenerationReportManifest> {

@@ -70,6 +70,8 @@ fn private_front_doors_are_linked() {
         let _ = protection::ProtectedSourceDisjointness::for_mutation;
         let _ = source::ProtectedSource::snapshot;
     }
+    // C04-only linkage inventory: atomic generation will replace this exact
+    // retained set together with this artificial front-door caller.
     let _ = artifact::ArtifactPlan::install;
     let _ = artifact::ArtifactPlan::artifact_digest;
     let _ = artifact::PublicationPolicy::DiagnosticFull;

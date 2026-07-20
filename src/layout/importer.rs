@@ -234,6 +234,13 @@ fn run_impl(
     let manifest_path = location.corpus_root().join(MANIFEST_FILE);
     let manifest_bytes = super::manifest::read_file(&manifest_path)?;
     let manifest = super::manifest::parse(&manifest_bytes, &manifest_path)?;
+    let inspection = scan_html(RootedFs::open_corpus(location)?)?;
+    let initial_html = if inspection.sidecar.is_some() {
+        let (existing, authored) = classify_html(inspection, &manifest, &BTreeSet::new())?;
+        InitialHtml::SidecarMode { existing, authored }
+    } else {
+        InitialHtml::SidecarFree(inspection)
+    };
     let pin = PinnedSource::new(
         "taffy",
         TAFFY_REPOSITORY,
@@ -264,9 +271,12 @@ fn run_impl(
         .map(|entry| entry.path.clone())
         .collect::<BTreeSet<_>>();
     prove_partition_sets(&manifest.authored_files, &desired_taffy)?;
-
-    let rooted = RootedFs::open_corpus(location)?;
-    let (existing, authored) = inspect_html(rooted, &manifest, &desired_taffy)?;
+    let (existing, authored) = match initial_html {
+        InitialHtml::SidecarMode { existing, authored } => (existing, authored),
+        InitialHtml::SidecarFree(inspection) => {
+            classify_html(inspection, &manifest, &desired_taffy)?
+        }
+    };
     let reservation = ArtifactReservation::new(Domain::Layout)?;
     let html_root = location.corpus_root().join(HTML_ROOT);
     let external_stage = reservation.external_stage().join(location.corpus_root());
@@ -589,6 +599,14 @@ struct HtmlInspection {
     rooted: RootedFs,
     inventory: Option<Inventory>,
     sidecar: Option<TaffyImportSidecar>,
+}
+
+enum InitialHtml {
+    SidecarMode {
+        existing: ExistingHtml,
+        authored: AuthoredPartition,
+    },
+    SidecarFree(HtmlInspection),
 }
 
 fn scan_html(rooted: RootedFs) -> Result<HtmlInspection> {

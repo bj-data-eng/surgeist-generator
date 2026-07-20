@@ -202,8 +202,6 @@ pub struct CorpusLocation {
 
 impl CorpusLocation {
     pub fn new(owner_root: impl AsRef<Path>, corpus_root: impl AsRef<Path>) -> Result<Self> {
-        reject_non_utf8(owner_root.as_ref(), "owner root")?;
-        reject_non_utf8(corpus_root.as_ref(), "corpus root")?;
         let owner_root = canonical_directory(owner_root.as_ref(), "canonicalize owner root")?;
         let corpus_root = canonical_directory(corpus_root.as_ref(), "canonicalize corpus root")?;
         require_contained(&owner_root, &corpus_root, "validate corpus root")?;
@@ -422,16 +420,6 @@ where
     Ok(())
 }
 
-fn reject_non_utf8(path: &Path, label: &str) -> Result<()> {
-    if path.to_str().is_none() {
-        return Err(invalid_path(
-            "validate corpus location",
-            format!("non-UTF-8 {label}"),
-        ));
-    }
-    Ok(())
-}
-
 fn canonical_directory(path: &Path, operation: &str) -> Result<PathBuf> {
     let canonical = fs::canonicalize(path)
         .map_err(|_| invalid_path(operation, format!("unresolvable path: {}", path.display())))?;
@@ -627,13 +615,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn corpus_location_rejects_non_utf8_cli_input() {
+    fn corpus_location_forwards_os_native_paths_to_canonicalization() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
         let owner = TestDirectory::new("non-utf-owner");
         let invalid = PathBuf::from(OsString::from_vec(vec![b'b', 0xff]));
-        assert!(CorpusLocation::new(owner.path(), invalid).is_err());
+        let error = CorpusLocation::new(owner.path(), &invalid).expect_err("missing native path");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "canonicalize corpus root: unresolvable path: {}",
+                invalid.display()
+            )
+        );
     }
 
     #[cfg(unix)]

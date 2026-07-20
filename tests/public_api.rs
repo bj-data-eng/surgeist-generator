@@ -326,9 +326,28 @@ fn public_constructor_grammars_and_exit_codes_are_exact() {
     .unwrap_err();
     assert_eq!(report_error.kind(), GeneratorErrorKind::SourceVerification);
 
-    let cli = parse_manifest::<ManifestVersion>("not = [valid", "manifest.toml").unwrap_err();
-    assert_eq!(cli.exit_code(), 1);
-    assert_eq!(GeneratorErrorKind::Cli as u8, GeneratorErrorKind::Cli as u8);
+    let manifest = parse_manifest::<ManifestVersion>("not = [valid", "manifest.toml").unwrap_err();
+    assert_eq!(manifest.exit_code(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn corpus_location_forwards_os_native_root_bytes_to_the_filesystem() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::path::PathBuf;
+
+    let owner = PathBuf::from(OsString::from_vec(b"owner-\x80-native".to_vec()));
+    let corpus = owner.join(OsString::from_vec(b"corpus-\x81-native".to_vec()));
+    let error = CorpusLocation::new(&owner, &corpus).expect_err("missing OS-native roots");
+    assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "canonicalize owner root: unresolvable path: {}",
+            owner.display()
+        )
+    );
 }
 
 #[test]
@@ -413,6 +432,19 @@ fn layout_browser_free_public_requests_are_io_free_and_accessors_are_exact() {
 
     assert_copy_debug_eq::<LayoutCommand>();
     assert_clone_debug_eq::<LayoutRequest>();
+    let _ = [
+        LayoutCommand::CheckCorpus,
+        LayoutCommand::CheckTaffyCorpus,
+        LayoutCommand::ImportTaffy,
+    ];
+    let _: fn(CorpusLocation) -> LayoutRequest = LayoutRequest::check_corpus;
+    let _: fn(CorpusLocation, PathBuf) -> surgeist_generator::Result<LayoutRequest> =
+        LayoutRequest::check_taffy_corpus;
+    let _: fn(CorpusLocation, PathBuf) -> surgeist_generator::Result<LayoutRequest> =
+        LayoutRequest::import_taffy;
+    let _: fn(&LayoutRequest) -> &CorpusLocation = LayoutRequest::location;
+    let _: fn(&LayoutRequest) -> LayoutCommand = LayoutRequest::command;
+    let _: fn(&LayoutRequest) -> Option<&std::path::Path> = LayoutRequest::source_root;
     let _: fn(LayoutRequest) -> surgeist_generator::Result<()> = surgeist_generator::layout::run;
     let _: fn() -> surgeist_generator::Result<()> = surgeist_generator::layout::run_from_env;
 
@@ -433,13 +465,40 @@ fn layout_browser_free_public_requests_are_io_free_and_accessors_are_exact() {
     assert_eq!(corpus_check.command(), LayoutCommand::CheckCorpus);
     assert_eq!(corpus_check.source_root(), None);
 
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let native_source = PathBuf::from(OsString::from_vec(b"checkout-\x80".to_vec()));
+        let native = LayoutRequest::import_taffy(location.clone(), native_source.clone())
+            .expect("OS-native source payload is retained without I/O");
+        assert_eq!(
+            native
+                .source_root()
+                .expect("native source root")
+                .as_os_str(),
+            native_source.as_os_str()
+        );
+    }
+
     let error = LayoutRequest::import_taffy(location, PathBuf::new())
         .expect_err("empty import source root");
     assert_eq!(error.kind(), GeneratorErrorKind::Cli);
+    assert_eq!(error.exit_code(), 64);
+    assert_eq!(
+        error.to_string(),
+        "construct layout request: import-taffy requires a nonempty source root"
+    );
 
     let error = LayoutRequest::check_taffy_corpus(check.location().clone(), PathBuf::new())
         .expect_err("empty check source root");
     assert_eq!(error.kind(), GeneratorErrorKind::Cli);
+    assert_eq!(error.exit_code(), 64);
+    assert_eq!(
+        error.to_string(),
+        "construct layout request: check-taffy-corpus requires a nonempty source root"
+    );
 }
 
 #[cfg(feature = "css-corpus")]

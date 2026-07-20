@@ -5,6 +5,397 @@ use crate::{GeneratorErrorKind, PinnedSource, RelativePath, Sha256Digest, Source
 
 use super::{manifest, sidecar};
 
+mod preserved_schema2 {
+    use std::collections::BTreeSet;
+
+    use serde::Deserialize;
+    use sha2::{Digest, Sha256};
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(super) struct EffectiveCase {
+        pub(super) id: String,
+        pub(super) source: String,
+        pub(super) status: String,
+        pub(super) reason: String,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(super) struct CompatibilityRecord {
+        pub(super) id: String,
+        pub(super) source: String,
+        pub(super) status: String,
+        pub(super) reason: Option<String>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(super) struct Contract {
+        pub(super) revision: String,
+        pub(super) expected_count: usize,
+        pub(super) authored_cases: Vec<EffectiveCase>,
+        pub(super) compatibility_records: Vec<CompatibilityRecord>,
+        pub(super) launch_digest: String,
+        pub(super) effective_launch_keys: BTreeSet<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawManifest {
+        schema_version: u64,
+        browser: RawBrowser,
+        generation_reports: RawGenerationReports,
+        source_roots: RawSourceRoots,
+        imports: RawImports,
+        #[serde(default)]
+        cases: Vec<RawCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawBrowser {
+        source: String,
+        version: String,
+        version_output: String,
+        cache_root: String,
+        provenance_format: String,
+        launch: RawLaunch,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawLaunch {
+        batch_size: u64,
+        navigation_timeout_ms: u64,
+        dom_poll_interval_ms: u64,
+        retry_count: u64,
+        job_order: String,
+        retry_error_class: String,
+        profile_scope: String,
+        page_scope: String,
+        disable_default_args: bool,
+        disable_cache: bool,
+        arguments: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawGenerationReports {
+        full: RawFullReport,
+        #[serde(default)]
+        scoped: Vec<RawScopedReport>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawFullReport {
+        file: String,
+        generated: u64,
+        unsupported: u64,
+        expected_fail: u64,
+        quarantined: u64,
+        failed_to_generate: u64,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawScopedReport {
+        filter: String,
+        file: String,
+        generated: u64,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawSourceRoots {
+        taffy: RawSourceRoot,
+        surgeist: RawSourceRoot,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawSourceRoot {
+        kind: String,
+        path: String,
+        #[serde(default)]
+        upstream_commit: Option<String>,
+        description: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawImports {
+        taffy: RawTaffyImport,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawTaffyImport {
+        repo: String,
+        commit: String,
+        source_dir: String,
+        destination: String,
+        expected_count: u64,
+        excluded_destination_dirs: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawCase {
+        id: String,
+        source_root: String,
+        source: String,
+        generator: String,
+        status: String,
+        reason: Option<String>,
+    }
+
+    pub(super) fn parse(text: &str) -> Result<Contract, String> {
+        let raw: RawManifest = toml::from_str(text).map_err(|error| error.to_string())?;
+        if raw.schema_version != 2 {
+            return Err("schema_version must be 2".to_owned());
+        }
+        validate_browser(&raw.browser)?;
+        validate_reports(&raw.generation_reports)?;
+        validate_source_roots(&raw.source_roots)?;
+        let imported = &raw.imports.taffy;
+        if imported.repo != "https://github.com/DioxusLabs/taffy.git"
+            || imported.source_dir != "test_fixtures"
+            || imported.destination != "html"
+            || imported.expected_count == 0
+            || !valid_revision(&imported.commit)
+        {
+            return Err("invalid Taffy import contract".to_owned());
+        }
+        if raw.source_roots.taffy.upstream_commit.as_deref() != Some(&imported.commit) {
+            return Err("Taffy revision fields differ".to_owned());
+        }
+        if imported
+            .excluded_destination_dirs
+            .iter()
+            .any(|path| !strict_relative(path))
+        {
+            return Err("invalid legacy exclusion path".to_owned());
+        }
+
+        let mut ids = BTreeSet::new();
+        let mut sources = BTreeSet::new();
+        let mut authored_cases = Vec::new();
+        let mut compatibility_records = Vec::new();
+        for case in raw.cases {
+            if !ids.insert(case.id.clone()) || case.generator != "constrained-html" {
+                return Err("invalid or duplicate case identity".to_owned());
+            }
+            let source = legacy_case_source(&case.source)?;
+            if !sources.insert(source.clone()) {
+                return Err("duplicate normalized case source".to_owned());
+            }
+            if !matches!(
+                case.status.as_str(),
+                "active" | "expected-fail" | "unsupported" | "quarantined"
+            ) {
+                return Err("invalid case status".to_owned());
+            }
+            match case.source_root.as_str() {
+                "taffy" => compatibility_records.push(CompatibilityRecord {
+                    id: case.id,
+                    source,
+                    status: case.status,
+                    reason: case.reason,
+                }),
+                "surgeist" => {
+                    if case.id.is_empty() || case.id.trim() != case.id || !source.ends_with(".html")
+                    {
+                        return Err("invalid authored case".to_owned());
+                    }
+                    let reason = if case.status == "active" {
+                        String::new()
+                    } else {
+                        case.reason
+                            .unwrap_or_else(|| format!("manifest marks case {}", case.status))
+                    };
+                    authored_cases.push(EffectiveCase {
+                        id: case.id,
+                        source,
+                        status: case.status,
+                        reason,
+                    });
+                }
+                _ => return Err("invalid case source root".to_owned()),
+            }
+        }
+        authored_cases.sort_by(|left, right| left.source.cmp(&right.source));
+
+        let launch_bytes = serde_json::to_vec(&(
+            1_u8,
+            raw.browser.launch.batch_size,
+            raw.browser.launch.navigation_timeout_ms,
+            raw.browser.launch.dom_poll_interval_ms,
+            raw.browser.launch.retry_count,
+            &raw.browser.launch.job_order,
+            &raw.browser.launch.retry_error_class,
+            &raw.browser.launch.profile_scope,
+            &raw.browser.launch.page_scope,
+            raw.browser.launch.disable_default_args,
+            raw.browser.launch.disable_cache,
+            &raw.browser.launch.arguments,
+        ))
+        .map_err(|error| error.to_string())?;
+        let launch_digest = format!("{:x}", Sha256::digest(launch_bytes));
+        let effective_launch_keys = raw
+            .browser
+            .launch
+            .arguments
+            .iter()
+            .map(|argument| {
+                let normalized = argument.strip_prefix("--").unwrap_or(argument);
+                normalized
+                    .split_once('=')
+                    .map_or(normalized, |(key, _)| key)
+                    .to_owned()
+            })
+            .collect();
+        let expected_count = usize::try_from(imported.expected_count)
+            .map_err(|_| "expected_count overflows usize".to_owned())?;
+        Ok(Contract {
+            revision: imported.commit.clone(),
+            expected_count,
+            authored_cases,
+            compatibility_records,
+            launch_digest,
+            effective_launch_keys,
+        })
+    }
+
+    fn validate_browser(browser: &RawBrowser) -> Result<(), String> {
+        if browser.source != "chrome-for-testing"
+            || !trimmed(&browser.version)
+            || !trimmed(&browser.version_output)
+            || !strict_relative(&browser.cache_root)
+            || browser
+                .cache_root
+                .split('/')
+                .any(|part| part == ".surgeist-generator" || part.starts_with("._surgeist-"))
+            || !browser.provenance_format.contains("{version}")
+            || !browser
+                .provenance_format
+                .contains("{repository_relative_executable}")
+        {
+            return Err("invalid preserved browser contract".to_owned());
+        }
+        let launch = &browser.launch;
+        if launch.batch_size == 0
+            || launch.navigation_timeout_ms == 0
+            || launch.dom_poll_interval_ms == 0
+            || launch.retry_count != 1
+            || launch.job_order != "sorted-sequential"
+            || launch.retry_error_class != "open-load-reset-timeout"
+            || launch.profile_scope != "per-batch-and-retry"
+            || launch.page_scope != "per-job"
+            || !launch.disable_default_args
+            || !launch.disable_cache
+            || launch.arguments.len() != 28
+            || !launch
+                .arguments
+                .iter()
+                .any(|argument| argument == "use-mock-keychain")
+        {
+            return Err("invalid preserved launch contract".to_owned());
+        }
+        Ok(())
+    }
+
+    fn validate_reports(reports: &RawGenerationReports) -> Result<(), String> {
+        if reports.full.file != "all.json" {
+            return Err("invalid full report file".to_owned());
+        }
+        let _ = (
+            reports.full.generated,
+            reports.full.unsupported,
+            reports.full.expected_fail,
+            reports.full.quarantined,
+            reports.full.failed_to_generate,
+        );
+        let mut filters = BTreeSet::new();
+        let mut files = BTreeSet::from(["all.json".to_owned()]);
+        for scoped in &reports.scoped {
+            let _ = scoped.generated;
+            if !strict_relative(&scoped.filter)
+                || !strict_relative(&scoped.file)
+                || scoped.file.contains('/')
+                || scoped.file == "all.json"
+                || scoped.file == ".json"
+                || !scoped.file.ends_with(".json")
+                || !filters.insert(scoped.filter.clone())
+                || !files.insert(scoped.file.clone())
+            {
+                return Err("invalid scoped report contract".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_source_roots(roots: &RawSourceRoots) -> Result<(), String> {
+        if roots.taffy.kind != "taffy"
+            || roots.taffy.path != "html"
+            || !roots
+                .taffy
+                .upstream_commit
+                .as_deref()
+                .is_some_and(valid_revision)
+            || !trimmed(&roots.taffy.description)
+            || roots.surgeist.kind != "surgeist"
+            || roots.surgeist.path != "html"
+            || roots.surgeist.upstream_commit.is_some()
+            || !trimmed(&roots.surgeist.description)
+        {
+            return Err("invalid source roots".to_owned());
+        }
+        Ok(())
+    }
+
+    fn valid_revision(value: &str) -> bool {
+        matches!(value.len(), 40 | 64)
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    fn trimmed(value: &str) -> bool {
+        !value.is_empty() && value.trim() == value && !value.chars().any(char::is_control)
+    }
+
+    fn strict_relative(value: &str) -> bool {
+        !value.is_empty()
+            && !value.starts_with('/')
+            && !value.ends_with('/')
+            && !value.contains('\\')
+            && value
+                .split('/')
+                .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
+    }
+
+    fn legacy_case_source(value: &str) -> Result<String, String> {
+        if value.is_empty()
+            || value.starts_with('/')
+            || value.ends_with('/')
+            || value.contains('\\')
+        {
+            return Err("invalid legacy case source".to_owned());
+        }
+        let mut components = Vec::new();
+        for component in value.split('/') {
+            match component {
+                "." => {}
+                "" | ".." => return Err("invalid legacy case source".to_owned()),
+                component => components.push(component),
+            }
+        }
+        if components.is_empty() {
+            return Err("invalid legacy case source".to_owned());
+        }
+        Ok(components.join("/"))
+    }
+}
+
 pub(super) const SHA1_REVISION: &str = "1111111111111111111111111111111111111111";
 pub(super) const SHA256_REVISION: &str =
     "1111111111111111111111111111111111111111111111111111111111111111";
@@ -150,24 +541,97 @@ fn layout_schema2_full_field_golden_is_accepted() {
 #[test]
 fn layout_schema2_accepts_manifest_owned_taffy_pin_and_count() {
     for (revision, count) in [(SHA1_REVISION, 1), (SHA256_REVISION, 17)] {
-        let parsed = manifest::parse(
-            manifest_text(revision, count, "").as_bytes(),
-            Path::new("corpus.toml"),
-        )
-        .expect("manifest-owned pin and count");
+        let text = manifest_text(revision, count, "");
+        let preserved =
+            preserved_schema2::parse(&text).expect("preserved manifest-owned pin and count");
+        let parsed = manifest::parse(text.as_bytes(), Path::new("corpus.toml"))
+            .expect("new manifest-owned pin and count");
+        assert_eq!(preserved.revision, revision);
+        assert_eq!(preserved.expected_count, count);
         assert_eq!(parsed.revision.as_str(), revision);
         assert_eq!(parsed.expected_source_files, count);
     }
 }
 
 #[test]
-fn layout_schema2_preserves_taffy_compatibility_records_and_raw_reasons() {
-    let parsed = manifest::parse(
-        manifest_text(SHA1_REVISION, 1, authored_cases()).as_bytes(),
-        Path::new("corpus.toml"),
-    )
-    .expect("compatibility case records");
+fn layout_schema2_preserves_taffy_compatibility_records() {
+    let text = manifest_text(SHA1_REVISION, 1, authored_cases());
+    let preserved = preserved_schema2::parse(&text).expect("preserved compatibility contract");
+    let parsed = manifest::parse(text.as_bytes(), Path::new("corpus.toml"))
+        .expect("new compatibility representation");
+    assert_eq!(preserved.compatibility_records.len(), 1);
+    assert_eq!(preserved.compatibility_records[0].id, "");
+    assert_eq!(
+        preserved.compatibility_records[0].source,
+        "compatibility/record.any"
+    );
+    assert_eq!(preserved.compatibility_records[0].status, "quarantined");
+    assert_eq!(
+        preserved.compatibility_records[0].reason.as_deref(),
+        Some("")
+    );
     assert_eq!(parsed.authored_files.len(), 2);
+    assert_eq!(parsed.authored_cases.len(), 2);
+}
+
+#[test]
+fn layout_schema2_preserves_raw_ids_and_reason_defaults() {
+    let cases = r#"[[cases]]
+id = "raw-active"
+source_root = "surgeist"
+source = "authored/active.html"
+generator = "constrained-html"
+status = "active"
+reason = "ignored active reason"
+
+[[cases]]
+id = "raw-expected"
+source_root = "surgeist"
+source = "authored/expected.html"
+generator = "constrained-html"
+status = "expected-fail"
+
+[[cases]]
+id = "raw-unsupported"
+source_root = "surgeist"
+source = "authored/unsupported.html"
+generator = "constrained-html"
+status = "unsupported"
+reason = ""
+
+[[cases]]
+id = "raw-quarantined"
+source_root = "surgeist"
+source = "authored/quarantined.html"
+generator = "constrained-html"
+status = "quarantined"
+reason = " padded reason "
+"#;
+    let text = manifest_text(SHA1_REVISION, 1, cases);
+    let preserved = preserved_schema2::parse(&text).expect("preserved reason contract");
+    let parsed = manifest::parse(text.as_bytes(), Path::new("corpus.toml"))
+        .expect("new reason representation");
+    let actual = parsed
+        .authored_cases
+        .iter()
+        .map(|case| preserved_schema2::EffectiveCase {
+            id: case.id.clone(),
+            source: case.source.as_str().to_owned(),
+            status: match case.status {
+                super::case::LayoutCaseStatus::Active => "active",
+                super::case::LayoutCaseStatus::ExpectedFail => "expected-fail",
+                super::case::LayoutCaseStatus::Unsupported => "unsupported",
+                super::case::LayoutCaseStatus::Quarantined => "quarantined",
+            }
+            .to_owned(),
+            reason: case.reason.clone(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, preserved.authored_cases);
+    assert_eq!(actual[0].reason, "");
+    assert_eq!(actual[1].reason, "manifest marks case expected-fail");
+    assert_eq!(actual[2].reason, " padded reason ");
+    assert_eq!(actual[3].reason, "");
 }
 
 #[test]
@@ -177,6 +641,7 @@ fn layout_schema2_rejects_mismatched_taffy_revision_fields() {
         &format!("commit = \"{}\"", "2".repeat(40)),
         1,
     );
+    assert!(preserved_schema2::parse(&text).is_err());
     let error = manifest::parse(text.as_bytes(), Path::new("corpus.toml"))
         .expect_err("mismatched revisions");
     assert_eq!(error.kind(), GeneratorErrorKind::InvalidManifest);
@@ -191,10 +656,20 @@ fn layout_schema2_rejects_noncanonical_retry_count() {
 }
 
 #[test]
-fn layout_schema2_rejects_html_source_root_and_duplicate_ids_or_sources() {
+fn layout_schema2_rejects_html_source_root() {
+    let cases =
+        authored_cases().replacen("source_root = \"surgeist\"", "source_root = \"html\"", 1);
+    let text = manifest_text(SHA1_REVISION, 1, &cases);
+    assert!(preserved_schema2::parse(&text).is_err());
+    let error = manifest::parse(text.as_bytes(), Path::new("corpus.toml"))
+        .expect_err("invalid source root");
+    assert_eq!(error.kind(), GeneratorErrorKind::InvalidManifest);
+}
+
+#[test]
+fn layout_schema2_rejects_duplicate_ids_and_sources() {
     let base = authored_cases();
     for cases in [
-        base.replacen("source_root = \"surgeist\"", "source_root = \"html\"", 1),
         format!(
             "{base}\n[[cases]]\nid = \"authored/first\"\nsource_root = \"taffy\"\nsource = \"other.html\"\ngenerator = \"constrained-html\"\nstatus = \"active\"\n"
         ),
@@ -202,43 +677,104 @@ fn layout_schema2_rejects_html_source_root_and_duplicate_ids_or_sources() {
             "{base}\n[[cases]]\nid = \"other\"\nsource_root = \"taffy\"\nsource = \"authored/first.html\"\ngenerator = \"constrained-html\"\nstatus = \"active\"\n"
         ),
     ] {
-        let error = manifest::parse(
-            manifest_text(SHA1_REVISION, 1, &cases).as_bytes(),
-            Path::new("corpus.toml"),
-        )
-        .expect_err("invalid source root or duplicate case identity");
+        let text = manifest_text(SHA1_REVISION, 1, &cases);
+        assert!(preserved_schema2::parse(&text).is_err());
+        let error = manifest::parse(text.as_bytes(), Path::new("corpus.toml"))
+            .expect_err("duplicate case identity");
         assert_eq!(error.kind(), GeneratorErrorKind::InvalidManifest);
     }
 }
 
 #[test]
-fn layout_schema2_rejects_only_declared_tightening_shapes() {
+fn layout_schema2_rejects_only_declared_tightenings() {
     let valid = manifest_text(SHA1_REVISION, 1, authored_cases());
-    let invalid = [
-        valid.replace(
-            "source = \"authored/first.html\"",
-            "source = \"authored/./first.html\"",
+    let declared_divergences = [
+        (
+            "strict case source",
+            valid.replace(
+                "source = \"authored/first.html\"",
+                "source = \"authored/./first.html\"",
+            ),
         ),
-        valid.replace(
-            "excluded_destination_dirs = [\"grid-lanes\", \"subgrid\"]",
-            "excluded_destination_dirs = [\"grid-lanes\", \"grid-lanes\"]",
+        (
+            "exact exclusion set",
+            valid.replace(
+                "excluded_destination_dirs = [\"grid-lanes\", \"subgrid\"]",
+                "excluded_destination_dirs = [\"grid-lanes\", \"grid-lanes\"]",
+            ),
         ),
-        valid.replace("  \"headless\",", "  \"--use-mock-keychain\","),
-        valid.replace("  \"use-mock-keychain\",", "  \"use-mock-keychain=value\","),
-        valid.replace("  \"headless\",", "  \"path/bearing\","),
-        valid.replace(
-            "Chrome {version} {repository_relative_executable}",
-            "Chrome {version} {version} {repository_relative_executable}",
+        (
+            "exact exclusion set",
+            valid.replace(
+                "excluded_destination_dirs = [\"grid-lanes\", \"subgrid\"]",
+                "excluded_destination_dirs = [\"grid-lanes\", \"grid-lanes\", \"subgrid\"]",
+            ),
         ),
-        valid.replace(
-            "Chrome {version} {repository_relative_executable}",
-            "Chrome {version} {repository_relative_executable} {unknown}",
+        (
+            "normalized launch switch set",
+            valid.replace("  \"headless\",", "  \"--use-mock-keychain\","),
+        ),
+        (
+            "normalized launch switch set",
+            valid.replace("  \"headless\",", "  \"use-mock-keychain=value\","),
+        ),
+        (
+            "normalized launch switch set",
+            valid.replace("  \"headless\",", "  \"path/bearing\","),
+        ),
+        (
+            "normalized launch switch set",
+            valid.replace("  \"headless\",", "  \"remote-debugging-port=1\","),
+        ),
+        (
+            "normalized launch switch set",
+            valid.replace("  \"headless\",", "  \"---headless\","),
+        ),
+        (
+            "normalized launch switch set",
+            valid.replace("  \"headless\",", "  \"headless\\u007f\","),
+        ),
+        (
+            "unambiguous provenance placeholders",
+            valid.replace(
+                "Chrome {version} {repository_relative_executable}",
+                "Chrome {version} {version} {repository_relative_executable}",
+            ),
+        ),
+        (
+            "unambiguous provenance placeholders",
+            valid.replace(
+                "Chrome {version} {repository_relative_executable}",
+                "Chrome {version} {repository_relative_executable} {unknown}",
+            ),
         ),
     ];
-    for text in invalid {
+    for (tightening, text) in declared_divergences {
+        preserved_schema2::parse(&text)
+            .unwrap_or_else(|error| panic!("preserved contract rejected {tightening}: {error}"));
         let error = manifest::parse(text.as_bytes(), Path::new("corpus.toml"))
             .expect_err("declared tightening");
-        assert_eq!(error.kind(), GeneratorErrorKind::InvalidManifest, "{text}");
+        assert_eq!(
+            error.kind(),
+            GeneratorErrorKind::InvalidManifest,
+            "{tightening}"
+        );
+    }
+
+    for compatible in [
+        valid.replace(
+            "excluded_destination_dirs = [\"grid-lanes\", \"subgrid\"]",
+            "excluded_destination_dirs = [\"subgrid\", \"grid-lanes\"]",
+        ),
+        valid.replace(
+            "  \"headless\",\n  \"no-sandbox\",",
+            "  \"no-sandbox\",\n  \"headless\",",
+        ),
+        manifest_text(SHA256_REVISION, 17, authored_cases()),
+    ] {
+        preserved_schema2::parse(&compatible).expect("preserved compatible manifest");
+        manifest::parse(compatible.as_bytes(), Path::new("corpus.toml"))
+            .expect("new compatible manifest");
     }
 }
 
@@ -271,13 +807,48 @@ fn layout_schema2_launch_digest_preserves_manifest_order() {
         "  \"headless\",\n  \"no-sandbox\",",
         "  \"no-sandbox\",\n  \"headless\",",
     );
+    let preserved_original = preserved_schema2::parse(&original).expect("preserved original");
+    let preserved_reordered = preserved_schema2::parse(&reordered).expect("preserved reordered");
     let (_, original_digest) =
         manifest::parse_with_launch_digest(original.as_bytes(), Path::new("corpus.toml"))
             .expect("original launch");
     let (_, reordered_digest) =
         manifest::parse_with_launch_digest(reordered.as_bytes(), Path::new("corpus.toml"))
             .expect("reordered launch");
+    assert_eq!(preserved_original.launch_digest, original_digest.as_str());
+    assert_eq!(preserved_reordered.launch_digest, reordered_digest.as_str());
+    assert_ne!(
+        preserved_original.launch_digest,
+        preserved_reordered.launch_digest
+    );
     assert_ne!(original_digest, reordered_digest);
+}
+
+#[test]
+fn layout_schema2_launch_switch_set_is_order_independent() {
+    let original = manifest_text(SHA1_REVISION, 1, "");
+    let reordered = original.replace(
+        "  \"headless\",\n  \"no-sandbox\",",
+        "  \"no-sandbox\",\n  \"headless\",",
+    );
+    let preserved_original = preserved_schema2::parse(&original).expect("preserved original");
+    let preserved_reordered = preserved_schema2::parse(&reordered).expect("preserved reordered");
+    let parsed_original = manifest::parse(original.as_bytes(), Path::new("corpus.toml"))
+        .expect("new original representation");
+    let parsed_reordered = manifest::parse(reordered.as_bytes(), Path::new("corpus.toml"))
+        .expect("new reordered representation");
+    assert_eq!(
+        preserved_original.effective_launch_keys,
+        preserved_reordered.effective_launch_keys
+    );
+    assert_eq!(
+        parsed_original.effective_launch_keys,
+        preserved_original.effective_launch_keys
+    );
+    assert_eq!(
+        parsed_reordered.effective_launch_keys,
+        preserved_reordered.effective_launch_keys
+    );
 }
 
 fn snapshot(object_format: ObjectFormat, object_id: &str) -> VerifiedSourceSnapshot {
@@ -795,6 +1366,29 @@ mod imports {
         let before = snapshot_tree(&fixture.corpus.join("html"));
         let error = fixture.import().expect_err("malformed sidecar");
         assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert_eq!(snapshot_tree(&fixture.corpus.join("html")), before);
+    }
+
+    #[test]
+    fn layout_import_unknown_inventory_precedes_dirty_source_verification() {
+        let fixture = Fixture::new(vec![("grid/current.html", b"current\n", false)]);
+        fixture.import().expect("seed sidecar-owned import");
+        write_corpus_file(&fixture.corpus.join("html/unknown.html"), b"unknown\n");
+        fs::write(
+            fixture.source.join("test_fixtures/grid/current.html"),
+            b"dirty source bytes\n",
+        )
+        .expect("drift source snapshot");
+        let before = snapshot_tree(&fixture.corpus.join("html"));
+
+        let error = fixture
+            .import()
+            .expect_err("unknown current inventory must precede source drift");
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
+        assert_eq!(
+            error.to_string(),
+            "validate layout Taffy import inventory: unknown entry in layout HTML root: unknown.html"
+        );
         assert_eq!(snapshot_tree(&fixture.corpus.join("html")), before);
     }
 

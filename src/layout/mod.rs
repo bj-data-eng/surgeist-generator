@@ -13,6 +13,67 @@
 //! # }
 //! ```
 //!
+//! This browser-free capability set intentionally has no generation command,
+//! browser/filter payload, browser backend, or public core implementation type.
+//! Those shapes cannot be constructed through the public API:
+//!
+//! ```compile_fail
+//! use surgeist_generator::layout::LayoutCommand;
+//! let _ = LayoutCommand::Generate;
+//! ```
+//!
+//! ```compile_fail
+//! use surgeist_generator::layout::LayoutRequest;
+//! fn browser_payload(request: &LayoutRequest) {
+//!     let _ = request.browser_path();
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use surgeist_generator::layout::LayoutRequest;
+//! fn filter_payload(request: &LayoutRequest) {
+//!     let _ = request.filter();
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use surgeist_generator::{CorpusLocation, RelativePath};
+//! use surgeist_generator::layout::LayoutRequest;
+//! fn generation_request(location: CorpusLocation, browser: RelativePath) {
+//!     let _ = LayoutRequest::generate(location, browser, None);
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use std::path::PathBuf;
+//! use surgeist_generator::CorpusLocation;
+//! use surgeist_generator::layout::{LayoutCommand, LayoutRequest};
+//! fn mismatched_payload(location: CorpusLocation, source: PathBuf) {
+//!     let _ = LayoutRequest::new(location, LayoutCommand::CheckCorpus, Some(source));
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use std::path::PathBuf;
+//! use surgeist_generator::CorpusLocation;
+//! use surgeist_generator::layout::{LayoutCommand, LayoutRequest};
+//! fn forged_payload(location: CorpusLocation, source: PathBuf) {
+//!     let _ = LayoutRequest {
+//!         location,
+//!         command: LayoutCommand::CheckCorpus,
+//!         source_root: Some(source),
+//!     };
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use surgeist_generator::layout::LayoutManifest;
+//! ```
+//!
+//! ```compile_fail
+//! use surgeist_generator::layout::ArtifactPlan;
+//! ```
+//!
 //! Checking verifies the checkout, persisted sidecar, and imported files without
 //! acquiring a mutation lease or repairing coordination:
 //!
@@ -42,6 +103,14 @@ use std::path::{Path, PathBuf};
 
 use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, Result};
 
+// C04-only preservation handoff: add the Generate API/CLI payload atomically
+// with the chromiumoxide/futures/tokio/url edge; trusted executable validation
+// and the cleared launch environment; supervisor, process-group, profile,
+// cleanup, recovery, timeout, and panic lifecycles; helper/HTML injection,
+// batching, retry, four-variant measurement, XML rendering, report
+// serialization, filtering, and CleanFull/DiagnosticFull/Filtered publication;
+// then retire the preservation source, finish repository guidance/policy, and
+// execute the separately authorized ignored diagnostic body exactly once.
 mod case;
 mod checker;
 mod cli;
@@ -56,6 +125,34 @@ mod checker_tests;
 mod tests;
 
 /// Browser-free layout corpus operation available in this capability set.
+///
+/// Its exact trait contract excludes open-ended ordering, hashing, defaults,
+/// and serialization:
+///
+/// ```compile_fail
+/// use std::hash::Hash;
+/// use surgeist_generator::layout::LayoutCommand;
+/// fn require<T: Hash>() {}
+/// require::<LayoutCommand>();
+/// ```
+///
+/// ```compile_fail
+/// use surgeist_generator::layout::LayoutCommand;
+/// fn require<T: Ord>() {}
+/// require::<LayoutCommand>();
+/// ```
+///
+/// ```compile_fail
+/// use surgeist_generator::layout::LayoutCommand;
+/// fn require<T: Default>() {}
+/// require::<LayoutCommand>();
+/// ```
+///
+/// ```compile_fail
+/// use surgeist_generator::layout::LayoutCommand;
+/// fn require<T: serde::Serialize>() {}
+/// require::<LayoutCommand>();
+/// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum LayoutCommand {
@@ -68,6 +165,40 @@ pub enum LayoutCommand {
 }
 
 /// Checked request for one browser-free layout corpus operation.
+///
+/// Its private payload and exact trait contract exclude copying, ordering,
+/// hashing, defaults, and serialization:
+///
+/// ```compile_fail
+/// use surgeist_generator::layout::LayoutRequest;
+/// fn require<T: Copy>() {}
+/// require::<LayoutRequest>();
+/// ```
+///
+/// ```compile_fail
+/// use std::hash::Hash;
+/// use surgeist_generator::layout::LayoutRequest;
+/// fn require<T: Hash>() {}
+/// require::<LayoutRequest>();
+/// ```
+///
+/// ```compile_fail
+/// use surgeist_generator::layout::LayoutRequest;
+/// fn require<T: Ord>() {}
+/// require::<LayoutRequest>();
+/// ```
+///
+/// ```compile_fail
+/// use surgeist_generator::layout::LayoutRequest;
+/// fn require<T: Default>() {}
+/// require::<LayoutRequest>();
+/// ```
+///
+/// ```compile_fail
+/// use surgeist_generator::layout::LayoutRequest;
+/// fn require<T: serde::Serialize>() {}
+/// require::<LayoutRequest>();
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LayoutRequest {
     location: CorpusLocation,

@@ -752,14 +752,31 @@ fn layout_historical_inventory_rejects_malformed_authority_and_unknown_entries()
 }
 
 #[test]
-fn layout_historical_inventory_membership_delta_is_classifiable_stale() {
-    let fixture = Fixture::current();
-    fixture.write_manifest(2);
-    fixture.write_import(&[
+fn layout_authored_and_taffy_membership_changes_are_classifiable_stale() {
+    let taffy = Fixture::current();
+    taffy.write_manifest(2);
+    taffy.write_import(&[
         ("grid/basic.html", SOURCE),
         ("grid/new.html", b"<div>new</div>\n"),
     ]);
-    fixture.assert_preserved(Some(GeneratorErrorKind::Verification));
+    taffy.assert_preserved(Some(GeneratorErrorKind::Verification));
+
+    let authored = Fixture::current();
+    let cases = r#"[[cases]]
+id = "authored/new"
+source_root = "surgeist"
+source = "authored/new.html"
+generator = "constrained-html"
+status = "active"
+"#;
+    let manifest =
+        manifest_text(SHA1_REVISION, 1, cases).replacen("generated = 4", "generated = 8", 1);
+    write_file(&authored.corpus.join("corpus.toml"), manifest.as_bytes());
+    write_file(
+        &authored.corpus.join("html/authored/new.html"),
+        b"<div>new authored fixture</div>\n",
+    );
+    authored.assert_preserved(Some(GeneratorErrorKind::Verification));
 }
 
 #[test]
@@ -1096,4 +1113,33 @@ fn layout_read_only_corpus_coordination_states_are_verification_and_byte_identic
         b"malformed coordination\n",
     );
     malformed.assert_preserved(Some(GeneratorErrorKind::Verification));
+}
+
+#[test]
+fn layout_stale_freshness_precedes_active_coordination() {
+    let fixture = Fixture::current();
+    let lease = GenerationLease::acquire(
+        &fixture.location,
+        Domain::Layout,
+        "surgeist-layout-generate",
+        &RunScope::Full,
+        "generate",
+    )
+    .expect("hold exclusive lease");
+    write_file(
+        &fixture.corpus.join("scripts/gentest/test_helper.js"),
+        b"stale helper while coordination is active\n",
+    );
+    let before = snapshot(&fixture.root);
+
+    let error = fixture
+        .check()
+        .expect_err("freshness must be classified before coordination");
+    assert_eq!(error.kind(), GeneratorErrorKind::Verification);
+    assert_eq!(
+        error.to_string(),
+        "check layout corpus: layout corpus is absent, stale, diagnostic, or migration-only; run a clean full generation"
+    );
+    assert_eq!(snapshot(&fixture.root), before);
+    drop(lease);
 }

@@ -31,6 +31,18 @@ impl Drop for TestRoot {
     }
 }
 
+fn layout_binary() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_surgeist-layout-generate"));
+    command
+        .env(
+            "SURGEIST_LAYOUT_LAUNCH_CAPSULE",
+            "operator environment must be ignored in the browser-free capability set",
+        )
+        .env("SURGEIST_LAYOUT_BROWSER_PATH", "ignored/browser")
+        .env("SURGEIST_LAYOUT_FILTER", "ignored/filter");
+    command
+}
+
 fn run_git(directory: &Path, arguments: &[&OsStr]) -> String {
     let output = Command::new("/usr/bin/git")
         .arg("-C")
@@ -51,7 +63,7 @@ fn run_git(directory: &Path, arguments: &[&OsStr]) -> String {
 
 #[test]
 fn layout_cli_invalid_syntax_prints_exact_prefix_and_exits_64() {
-    let output = Command::new(env!("CARGO_BIN_EXE_surgeist-layout-generate"))
+    let output = layout_binary()
         .output()
         .expect("run packaged layout binary");
 
@@ -65,87 +77,130 @@ fn layout_cli_invalid_syntax_prints_exact_prefix_and_exits_64() {
 
 #[test]
 fn layout_cli_taffy_option_matrix_precedes_io() {
-    for arguments in [
-        vec![
-            "--owner-root",
-            "does-not-exist",
-            "--corpus-root",
-            "does-not-exist",
-            "import-taffy",
-        ],
-        vec![
-            "--owner-root",
-            "does-not-exist",
-            "--corpus-root",
-            "does-not-exist",
-            "import-taffy",
-            "--source-root",
-            "checkout",
-            "--source-root",
-            "other",
-        ],
-        vec![
-            "--owner-root",
-            "does-not-exist",
-            "--corpus-root",
-            "does-not-exist",
-            "import-taffy",
-            "--source-root",
-            "checkout",
-            "--filter",
-            "grid",
-        ],
-        vec![
-            "--owner-root",
-            "does-not-exist",
-            "--corpus-root",
-            "does-not-exist",
-            "check-corpus",
-            "--source-root",
-            "checkout",
-        ],
-        vec![
-            "--owner-root",
-            "does-not-exist",
-            "--corpus-root",
-            "does-not-exist",
-            "check-taffy-corpus",
-        ],
-        vec![
-            "--owner-root",
-            "does-not-exist",
-            "--corpus-root",
-            "does-not-exist",
-            "check-taffy-corpus",
-            "--source-root",
-            "checkout",
-            "--filter",
-            "grid",
-        ],
-        vec![
-            "--owner-root",
-            "does-not-exist",
-            "--corpus-root",
-            "does-not-exist",
-            "generate",
-        ],
+    for (arguments, diagnostic) in [
+        (
+            vec![
+                "--owner-root",
+                "does-not-exist",
+                "--corpus-root",
+                "does-not-exist",
+                "import-taffy",
+            ],
+            "missing --source-root",
+        ),
+        (
+            vec![
+                "--owner-root",
+                "does-not-exist",
+                "--corpus-root",
+                "does-not-exist",
+                "import-taffy",
+                "--source-root",
+                "checkout",
+                "--source-root",
+                "other",
+            ],
+            "duplicate --source-root",
+        ),
+        (
+            vec![
+                "--owner-root",
+                "does-not-exist",
+                "--corpus-root",
+                "does-not-exist",
+                "import-taffy",
+                "--source-root",
+                "checkout",
+                "--filter",
+                "grid",
+            ],
+            "unknown flag: --filter",
+        ),
+        (
+            vec![
+                "--owner-root",
+                "does-not-exist",
+                "--corpus-root",
+                "does-not-exist",
+                "check-corpus",
+                "--source-root",
+                "checkout",
+            ],
+            "check-corpus forbids --source-root",
+        ),
+        (
+            vec![
+                "--owner-root",
+                "does-not-exist",
+                "--corpus-root",
+                "does-not-exist",
+                "check-taffy-corpus",
+            ],
+            "missing --source-root",
+        ),
+        (
+            vec![
+                "--owner-root",
+                "does-not-exist",
+                "--corpus-root",
+                "does-not-exist",
+                "check-taffy-corpus",
+                "--source-root",
+                "checkout",
+                "--filter",
+                "grid",
+            ],
+            "unknown flag: --filter",
+        ),
+        (
+            vec![
+                "--owner-root",
+                "does-not-exist",
+                "--corpus-root",
+                "does-not-exist",
+                "generate",
+            ],
+            "unknown layout command: generate",
+        ),
+        (
+            vec![
+                "--owner-root",
+                "does-not-exist",
+                "--corpus-root",
+                "does-not-exist",
+                "check-corpus",
+                "--browser-path",
+                "cache/chrome",
+            ],
+            "unknown flag: --browser-path",
+        ),
+        (
+            vec![
+                "--owner-root",
+                "does-not-exist",
+                "--corpus-root",
+                "does-not-exist",
+                "check-corpus",
+                "check-corpus",
+            ],
+            "duplicate layout command",
+        ),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_surgeist-layout-generate"))
+        let output = layout_binary()
             .args(arguments)
             .output()
             .expect("run packaged layout binary");
 
         assert_eq!(output.status.code(), Some(64));
         assert!(output.stdout.is_empty());
-        assert!(
-            String::from_utf8(output.stderr)
-                .expect("UTF-8 diagnostic")
-                .starts_with("surgeist-layout-generate: parse layout command line:")
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("UTF-8 diagnostic"),
+            format!("surgeist-layout-generate: parse layout command line: {diagnostic}\n")
         );
     }
 
     for command in ["import-taffy", "check-taffy-corpus"] {
-        let accepted = Command::new(env!("CARGO_BIN_EXE_surgeist-layout-generate"))
+        let accepted = layout_binary()
             .args([
                 "--owner-root",
                 "does-not-exist",
@@ -159,14 +214,13 @@ fn layout_cli_taffy_option_matrix_precedes_io() {
             .expect("run packaged layout binary");
         assert_eq!(accepted.status.code(), Some(1));
         assert!(accepted.stdout.is_empty());
-        assert!(
-            String::from_utf8(accepted.stderr)
-                .expect("UTF-8 diagnostic")
-                .starts_with("surgeist-layout-generate: canonicalize owner root:")
+        assert_eq!(
+            String::from_utf8(accepted.stderr).expect("UTF-8 diagnostic"),
+            "surgeist-layout-generate: canonicalize owner root: unresolvable path: does-not-exist\n"
         );
     }
 
-    let accepted = Command::new(env!("CARGO_BIN_EXE_surgeist-layout-generate"))
+    let accepted = layout_binary()
         .args([
             "--owner-root",
             "does-not-exist",
@@ -178,16 +232,43 @@ fn layout_cli_taffy_option_matrix_precedes_io() {
         .expect("run packaged layout corpus check");
     assert_eq!(accepted.status.code(), Some(1));
     assert!(accepted.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(accepted.stderr).expect("UTF-8 diagnostic"),
+        "surgeist-layout-generate: canonicalize owner root: unresolvable path: does-not-exist\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn layout_cli_forwards_os_native_root_arguments_to_domain_validation() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let owner = OsString::from_vec(b"missing-owner-\x80".to_vec());
+    let corpus = OsString::from_vec(b"missing-corpus-\x81".to_vec());
+    let output = layout_binary()
+        .arg("--owner-root")
+        .arg(owner)
+        .arg("--corpus-root")
+        .arg(corpus)
+        .arg("check-corpus")
+        .output()
+        .expect("run packaged layout binary with OS-native roots");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
     assert!(
-        String::from_utf8(accepted.stderr)
-            .expect("UTF-8 diagnostic")
-            .starts_with("surgeist-layout-generate: canonicalize owner root:")
+        String::from_utf8_lossy(&output.stderr).starts_with(
+            "surgeist-layout-generate: canonicalize owner root: unresolvable path: missing-owner-",
+        ),
+        "unexpected diagnostic: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
-fn layout_cli_import_and_check_taffy_execute_real_public_paths() {
+fn layout_cli_all_three_commands_execute_real_public_paths() {
     let root = TestRoot::new();
     let owner = root.0.join("owner");
     let corpus = owner.join("corpus");
@@ -227,9 +308,15 @@ fn layout_cli_import_and_check_taffy_execute_real_public_paths() {
         ],
     );
     let revision = run_git(&checkout, &[OsStr::new("rev-parse"), OsStr::new("HEAD")]);
-    fs::write(corpus.join("corpus.toml"), manifest_text(&revision)).expect("write layout manifest");
+    fs::write(corpus.join("corpus.toml"), manifest_text(&revision, 1))
+        .expect("write layout manifest");
+    let legacy_fixture = corpus.join("html/grid/basic.html");
+    fs::create_dir_all(legacy_fixture.parent().expect("legacy fixture parent"))
+        .expect("create sidecar-free legacy partition");
+    fs::write(&legacy_fixture, b"<div>stale legacy fixture</div>\n")
+        .expect("write sidecar-free legacy fixture");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_surgeist-layout-generate"))
+    let output = layout_binary()
         .arg("--owner-root")
         .arg(&owner)
         .arg("--corpus-root")
@@ -260,7 +347,7 @@ fn layout_cli_import_and_check_taffy_execute_real_public_paths() {
     let imported_path = corpus.join("html/grid/basic.html");
     let imported_identity = path_identity(&imported_path);
     let sidecar_identity = path_identity(&corpus.join("html/.surgeist-taffy-source.json"));
-    let output = Command::new(env!("CARGO_BIN_EXE_surgeist-layout-generate"))
+    let output = layout_binary()
         .arg("--owner-root")
         .arg(&owner)
         .arg("--corpus-root")
@@ -293,7 +380,7 @@ fn layout_cli_import_and_check_taffy_execute_real_public_paths() {
 
     write_current_layout_state(&corpus, &sidecar);
     let before = snapshot_tree(&root.0);
-    let output = Command::new(env!("CARGO_BIN_EXE_surgeist-layout-generate"))
+    let output = layout_binary()
         .arg("--owner-root")
         .arg(&owner)
         .arg("--corpus-root")
@@ -309,6 +396,169 @@ fn layout_cli_import_and_check_taffy_execute_real_public_paths() {
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
     assert_eq!(snapshot_tree(&root.0), before);
+
+    let unchanged_import = layout_binary()
+        .arg("--owner-root")
+        .arg(&owner)
+        .arg("--corpus-root")
+        .arg(&corpus)
+        .arg("import-taffy")
+        .arg("--source-root")
+        .arg(&checkout)
+        .output()
+        .expect("rerun unchanged packaged layout import");
+    assert!(
+        unchanged_import.status.success(),
+        "unchanged import failed: {}",
+        String::from_utf8_lossy(&unchanged_import.stderr)
+    );
+    assert!(unchanged_import.stdout.is_empty());
+    assert!(unchanged_import.stderr.is_empty());
+    assert_eq!(
+        fs::read(corpus.join("html/.surgeist-taffy-source.json")).unwrap(),
+        sidecar
+    );
+    let unchanged_check = layout_binary()
+        .arg("--owner-root")
+        .arg(&owner)
+        .arg("--corpus-root")
+        .arg(&corpus)
+        .arg("check-corpus")
+        .output()
+        .expect("check downstream freshness after unchanged import");
+    assert!(
+        unchanged_check.status.success(),
+        "unchanged import manufactured staleness: {}",
+        String::from_utf8_lossy(&unchanged_check.stderr)
+    );
+
+    let excluded = checkout.join("test_fixtures/grid-lanes/excluded.html");
+    fs::create_dir_all(excluded.parent().expect("excluded fixture parent"))
+        .expect("create excluded fixture parent");
+    fs::write(&excluded, b"<div>excluded from import</div>\n").expect("write excluded fixture");
+    run_git(&checkout, &[OsStr::new("add"), OsStr::new("test_fixtures")]);
+    run_git(
+        &checkout,
+        &[
+            OsStr::new("commit"),
+            OsStr::new("--quiet"),
+            OsStr::new("-m"),
+            OsStr::new("advance pin and pre-exclusion count"),
+        ],
+    );
+    let updated_revision = run_git(&checkout, &[OsStr::new("rev-parse"), OsStr::new("HEAD")]);
+    fs::write(
+        corpus.join("corpus.toml"),
+        manifest_text(&updated_revision, 2),
+    )
+    .expect("update manifest-owned pin and count");
+
+    let stale_source_check = layout_binary()
+        .arg("--owner-root")
+        .arg(&owner)
+        .arg("--corpus-root")
+        .arg(&corpus)
+        .arg("check-taffy-corpus")
+        .arg("--source-root")
+        .arg(&checkout)
+        .output()
+        .expect("check stale import after manifest pin update");
+    assert_eq!(stale_source_check.status.code(), Some(1));
+    assert!(stale_source_check.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(stale_source_check.stderr).expect("UTF-8 stale-source diagnostic"),
+        "surgeist-layout-generate: check Taffy corpus: Taffy import sidecar is stale against the manifest and named source\n"
+    );
+
+    let updated_import = layout_binary()
+        .arg("--owner-root")
+        .arg(&owner)
+        .arg("--corpus-root")
+        .arg(&corpus)
+        .arg("import-taffy")
+        .arg("--source-root")
+        .arg(&checkout)
+        .output()
+        .expect("reimport updated manifest-owned pin and count");
+    assert!(
+        updated_import.status.success(),
+        "updated import failed: {}",
+        String::from_utf8_lossy(&updated_import.stderr)
+    );
+    let updated_sidecar =
+        fs::read(corpus.join("html/.surgeist-taffy-source.json")).expect("updated sidecar");
+    let updated_value: serde_json::Value =
+        serde_json::from_slice(&updated_sidecar).expect("updated sidecar JSON");
+    assert_ne!(updated_sidecar, sidecar);
+    assert_eq!(updated_value["source"]["revision"], updated_revision);
+    assert_eq!(updated_value["source_file_count"], 2);
+    assert_eq!(updated_value["imported_file_count"], 1);
+
+    let updated_source_check = layout_binary()
+        .arg("--owner-root")
+        .arg(&owner)
+        .arg("--corpus-root")
+        .arg(&corpus)
+        .arg("check-taffy-corpus")
+        .arg("--source-root")
+        .arg(&checkout)
+        .output()
+        .expect("check updated Taffy import");
+    assert!(
+        updated_source_check.status.success(),
+        "updated source check failed: {}",
+        String::from_utf8_lossy(&updated_source_check.stderr)
+    );
+
+    let stale_corpus_check = layout_binary()
+        .arg("--owner-root")
+        .arg(&owner)
+        .arg("--corpus-root")
+        .arg(&corpus)
+        .arg("check-corpus")
+        .output()
+        .expect("check downstream freshness after changed import");
+    assert_eq!(stale_corpus_check.status.code(), Some(1));
+    assert!(stale_corpus_check.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(stale_corpus_check.stderr).expect("UTF-8 stale-corpus diagnostic"),
+        "surgeist-layout-generate: check layout corpus: layout corpus is absent, stale, diagnostic, or migration-only; run a clean full generation\n"
+    );
+
+    write_current_layout_state(&corpus, &updated_sidecar);
+    let refreshed_corpus_check = layout_binary()
+        .arg("--owner-root")
+        .arg(&owner)
+        .arg("--corpus-root")
+        .arg(&corpus)
+        .arg("check-corpus")
+        .output()
+        .expect("check synthetically refreshed corpus");
+    assert!(
+        refreshed_corpus_check.status.success(),
+        "refreshed corpus check failed: {}",
+        String::from_utf8_lossy(&refreshed_corpus_check.stderr)
+    );
+
+    fs::write(corpus.join("html/unknown.html"), b"unknown inventory\n")
+        .expect("write unknown current inventory");
+    fs::write(&fixture, b"<div>dirty checkout</div>\n").expect("dirty explicit checkout");
+    let precedence = layout_binary()
+        .arg("--owner-root")
+        .arg(&owner)
+        .arg("--corpus-root")
+        .arg(&corpus)
+        .arg("import-taffy")
+        .arg("--source-root")
+        .arg(&checkout)
+        .output()
+        .expect("run import precedence sequence");
+    assert_eq!(precedence.status.code(), Some(1));
+    assert!(precedence.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(precedence.stderr).expect("UTF-8 precedence diagnostic"),
+        "surgeist-layout-generate: validate layout Taffy import inventory: unknown entry in layout HTML root: unknown.html\n"
+    );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -475,7 +725,7 @@ fn path_identity(path: &Path) -> (u64, u64) {
     (metadata.dev(), metadata.ino())
 }
 
-fn manifest_text(revision: &str) -> String {
+fn manifest_text(revision: &str, expected_count: usize) -> String {
     format!(
         r#"schema_version = 2
 
@@ -552,7 +802,7 @@ repo = "{TAFFY_REPOSITORY}"
 commit = "{revision}"
 source_dir = "test_fixtures"
 destination = "html"
-expected_count = 1
+expected_count = {expected_count}
 excluded_destination_dirs = ["grid-lanes", "subgrid"]
 "#
     )
