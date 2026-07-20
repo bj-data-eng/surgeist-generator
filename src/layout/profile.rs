@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -124,6 +125,39 @@ pub(super) struct RunningRecord {
     parent_pid: u32,
     supervisor_pid: u32,
     process_group_id: u32,
+}
+
+// A live, unwaited child pins its PID against reuse while the parent verifies
+// that the recorded process group is still led by that exact child.
+pub(super) trait OwnedSupervisorChild {
+    fn id(&self) -> Option<u32>;
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnedSupervisorState {
+    LiveGroupLeader,
+    Reaped,
+}
+
+impl OwnedSupervisorChild for std::process::Child {
+    fn id(&self) -> Option<u32> {
+        Some(std::process::Child::id(self))
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        std::process::Child::try_wait(self)
+    }
+}
+
+impl OwnedSupervisorChild for tokio::process::Child {
+    fn id(&self) -> Option<u32> {
+        tokio::process::Child::id(self)
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        tokio::process::Child::try_wait(self)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -344,6 +378,10 @@ impl ProfileJournal {
                 "recorded browser process group remains live or inconclusive",
             ));
         }
+        self.finish_terminalization(rooted, snapshot)
+    }
+
+    fn finish_terminalization(self, rooted: &RootedFs, snapshot: TreeSnapshot) -> Result<()> {
         let _transition = lock_transition(rooted, &self.path, false)?;
         let cleanup = cleanup_path(&self.path)?;
         rooted.rename_exclusive_bound(&self.path, &cleanup, &self.identity)?;
@@ -358,25 +396,47 @@ impl ProfileJournal {
         rooted.sync_dir(PROFILE_PARENT)
     }
 
-    pub(super) fn terminalize_with_forced_group_kill(self, rooted: &RootedFs) -> Result<()> {
+    pub(super) fn terminalize_with_forced_group_kill(
+        self,
+        rooted: &RootedFs,
+        owned_supervisor: Option<&mut dyn OwnedSupervisorChild>,
+    ) -> Result<()> {
+        #[cfg(test)]
+        let _observation = rooted.begin_observation_phase(DurabilityPhase::ProfileTerminalization);
+        let _verified_snapshot = snapshot_tree(rooted, &self.path, &self.identity)?;
         if let Some(running) =
             read_optional_record::<RunningRecord>(rooted, &self.path, "running.json")?
         {
             validate_running(&running)?;
-            if probe_group(running.process_group_id)? != GroupState::Dead {
-                force_kill_group(running.process_group_id)?;
-                let deadline = Instant::now() + Duration::from_secs(5);
-                loop {
-                    if probe_group(running.process_group_id)? == GroupState::Dead {
-                        break;
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(process_error(
+            match probe_group(running.process_group_id)? {
+                GroupState::Dead => {}
+                GroupState::Inconclusive => {
+                    return Err(process_error(
+                        "terminalize layout browser profile",
+                        "recorded browser process group ownership is inconclusive; no signal was sent",
+                    ));
+                }
+                GroupState::Live => {
+                    let child = owned_supervisor.ok_or_else(|| {
+                        process_error(
                             "terminalize layout browser profile",
-                            "recorded browser process group remained live after SIGKILL",
-                        ));
+                            "recorded browser process group has no retained owned supervisor child; no signal was sent",
+                        )
+                    })?;
+                    match verify_owned_supervisor(&running, child)? {
+                        OwnedSupervisorState::LiveGroupLeader => {
+                            force_kill_group(running.process_group_id)?;
+                            wait_for_owned_group_exit(running.process_group_id, child)?;
+                        }
+                        OwnedSupervisorState::Reaped
+                            if probe_group(running.process_group_id)? == GroupState::Dead => {}
+                        OwnedSupervisorState::Reaped => {
+                            return Err(process_error(
+                                "verify owned layout browser supervisor",
+                                "retained supervisor child exited while its recorded process group remained live or inconclusive; no signal was sent",
+                            ));
+                        }
                     }
-                    std::thread::sleep(Duration::from_millis(10));
                 }
             }
         }
@@ -909,6 +969,85 @@ fn probe_group(group: u32) -> Result<GroupState> {
             source,
         )),
     }
+}
+
+fn verify_owned_supervisor(
+    running: &RunningRecord,
+    child: &mut dyn OwnedSupervisorChild,
+) -> Result<OwnedSupervisorState> {
+    let owned_pid = child.id().ok_or_else(|| {
+        process_error(
+            "verify owned layout browser supervisor",
+            "owned supervisor child has no live process identity; no signal was sent",
+        )
+    })?;
+    if owned_pid != running.supervisor_pid || owned_pid != running.process_group_id {
+        return Err(process_error(
+            "verify owned layout browser supervisor",
+            "running record differs from the retained owned supervisor child; no signal was sent",
+        ));
+    }
+    if child
+        .try_wait()
+        .map_err(|source| {
+            GeneratorError::with_source(
+                GeneratorErrorKind::Process,
+                "verify owned layout browser supervisor",
+                "cannot prove the retained supervisor child is still live; no signal was sent",
+                source,
+            )
+        })?
+        .is_some()
+    {
+        return Ok(OwnedSupervisorState::Reaped);
+    }
+    let pid = process_pid(owned_pid, "verify owned layout browser supervisor")?;
+    let actual_group = rustix::process::getpgid(Some(pid)).map_err(|source| {
+        GeneratorError::with_source(
+            GeneratorErrorKind::Process,
+            "verify owned layout browser supervisor",
+            "cannot prove the retained supervisor child still leads the recorded process group; no signal was sent",
+            source,
+        )
+    })?;
+    if actual_group != pid {
+        return Err(process_error(
+            "verify owned layout browser supervisor",
+            "retained supervisor child no longer leads the recorded process group; no signal was sent",
+        ));
+    }
+    Ok(OwnedSupervisorState::LiveGroupLeader)
+}
+
+fn wait_for_owned_group_exit(group: u32, child: &mut dyn OwnedSupervisorChild) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        child.try_wait().map_err(|source| {
+            GeneratorError::with_source(
+                GeneratorErrorKind::Process,
+                "reap owned layout browser supervisor",
+                "failed to reap the retained supervisor child after SIGKILL",
+                source,
+            )
+        })?;
+        if probe_group(group)? == GroupState::Dead {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(process_error(
+                "terminalize layout browser profile",
+                "recorded browser process group remained live or inconclusive after SIGKILL",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn process_pid(value: u32, operation: &str) -> Result<rustix::process::Pid> {
+    let raw =
+        i32::try_from(value).map_err(|_| process_error(operation, "process ID exceeds i32"))?;
+    rustix::process::Pid::from_raw(raw)
+        .ok_or_else(|| process_error(operation, "process ID is zero"))
 }
 
 pub(super) fn force_kill_group(group: u32) -> Result<()> {

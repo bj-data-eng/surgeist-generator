@@ -12,15 +12,16 @@ use crate::core::{
     PRIVATE_FILE_MODE, RootedFs, RootedObserver, SnapshotEntry, VerifiedSourceSnapshot,
 };
 use crate::{
-    CorpusLocation, GeneratorErrorKind, PinnedSource, RelativePath, RunScope, Sha256Digest,
-    SourceRevision,
+    CorpusLocation, GeneratorError, GeneratorErrorKind, PinnedSource, RelativePath, RunScope,
+    Sha256Digest, SourceRevision,
 };
 
 use super::browser::TrustedBrowser;
 use super::measurement::{TestBrowserPlan, TestGenerationHost};
 use super::profile::{
     PROFILE_PARENT, ProfileAttempt, ProfileCreateContext, ProfileJournal, classify_pending,
-    force_kill_group, test_cleanup_path, test_group_is_dead, test_validate_journal_name,
+    force_kill_group, resolve_terminalization, test_cleanup_path, test_group_is_dead,
+    test_validate_journal_name,
 };
 use super::supervisor::TestBrowserMode;
 use super::{LayoutRequest, generation, manifest, sidecar, supervisor, tests};
@@ -313,21 +314,120 @@ fn layout_profile_forced_group_kill_is_terminal() {
     let lease = harness.lease();
     let journal = harness.version_journal(&lease);
     let path = journal.journal_path().to_owned();
-    let child = harness.spawn_supervisor(&journal, TestBrowserMode::Hang);
+    let mut child = harness.spawn_supervisor(&journal, TestBrowserMode::Hang);
     let group = child.id();
     wait_for_running(lease.rooted(), &path);
     wait_for_group(group, false);
-    let waiter = std::thread::spawn(move || {
-        let mut child = child;
-        child.wait().expect("reap killed test supervisor")
-    });
     journal
-        .terminalize_with_forced_group_kill(lease.rooted())
+        .terminalize_with_forced_group_kill(lease.rooted(), Some(&mut child))
         .expect("forced terminalization");
-    assert!(!waiter.join().expect("join supervisor waiter").success());
+    assert!(
+        !child
+            .try_wait()
+            .expect("probe reaped test supervisor")
+            .expect("forced terminalization reaps its owned supervisor")
+            .success()
+    );
     wait_for_group(group, true);
     drop(lease);
     harness.assert_terminal();
+}
+
+#[test]
+fn layout_profile_unverified_group_is_not_signaled_and_preserves_evidence() {
+    let harness = GenerationHarness::new();
+    let lease = harness.lease();
+    let journal = harness.version_journal(&lease);
+    let path = journal.journal_path().to_owned();
+    let mut child = harness.spawn_supervisor(&journal, TestBrowserMode::Hang);
+    let group = child.id();
+    wait_for_running(lease.rooted(), &path);
+    wait_for_group(group, false);
+
+    let result = journal.terminalize_with_forced_group_kill(lease.rooted(), None);
+    let group_was_signaled = child
+        .try_wait()
+        .expect("probe unverified supervisor")
+        .is_some();
+    let evidence_remains = lease
+        .rooted()
+        .exists(&path)
+        .expect("profile evidence state");
+    if !group_was_signaled {
+        force_kill_group(group).expect("stop crate-owned unverified group");
+        child.wait().expect("reap unverified test supervisor");
+    }
+    wait_for_group(group, true);
+
+    let error = resolve_terminalization::<()>(
+        Err(GeneratorError::new(
+            GeneratorErrorKind::Generation,
+            "synthetic primary generation failure",
+            "primary context",
+        )),
+        result,
+    )
+    .expect_err("unverified cleanup failure must override the primary failure");
+    assert_eq!(error.kind(), GeneratorErrorKind::Process);
+    assert!(error.to_string().contains("primary failure"), "{error}");
+    assert!(error.to_string().contains("cleanup failure"), "{error}");
+    assert!(!group_was_signaled, "unverified group must not be signaled");
+    assert!(evidence_remains, "active profile evidence must be retained");
+}
+
+#[test]
+fn layout_profile_reused_group_identity_is_not_signaled_and_preserves_evidence() {
+    let harness = GenerationHarness::new();
+    let lease = harness.lease();
+    let journal = harness.version_journal(&lease);
+    let path = journal.journal_path().to_owned();
+    let mut recorded_child = harness.spawn_supervisor(&journal, TestBrowserMode::Hang);
+    let recorded_group = recorded_child.id();
+    wait_for_running(lease.rooted(), &path);
+    wait_for_group(recorded_group, false);
+
+    let unrelated = GenerationHarness::new();
+    let unrelated_lease = unrelated.lease();
+    let unrelated_journal = unrelated.version_journal(&unrelated_lease);
+    let unrelated_path = unrelated_journal.journal_path().to_owned();
+    let mut unrelated_child = unrelated.spawn_supervisor(&unrelated_journal, TestBrowserMode::Hang);
+    let unrelated_group = unrelated_child.id();
+    wait_for_running(unrelated_lease.rooted(), &unrelated_path);
+    wait_for_group(unrelated_group, false);
+
+    let result =
+        journal.terminalize_with_forced_group_kill(lease.rooted(), Some(&mut unrelated_child));
+    let recorded_group_remained_live =
+        !test_group_is_dead(recorded_group).expect("probe reused recorded group");
+    let unrelated_group_remained_live =
+        !test_group_is_dead(unrelated_group).expect("probe unrelated owned group");
+    let evidence_remains = lease
+        .rooted()
+        .exists(&path)
+        .expect("profile evidence state");
+
+    force_kill_group(recorded_group).expect("stop crate-owned recorded group");
+    recorded_child
+        .wait()
+        .expect("reap recorded test supervisor");
+    wait_for_group(recorded_group, true);
+    force_kill_group(unrelated_group).expect("stop crate-owned unrelated group");
+    unrelated_child
+        .wait()
+        .expect("reap unrelated test supervisor");
+    wait_for_group(unrelated_group, true);
+
+    let error = result.expect_err("reused process identity must block forced signaling");
+    assert_eq!(error.kind(), GeneratorErrorKind::Process);
+    assert!(
+        error
+            .to_string()
+            .contains("running record differs from the retained owned supervisor child"),
+        "{error}"
+    );
+    assert!(recorded_group_remained_live);
+    assert!(unrelated_group_remained_live);
+    assert!(evidence_remains, "active profile evidence must be retained");
 }
 
 #[test]

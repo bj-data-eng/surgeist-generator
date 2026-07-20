@@ -17,7 +17,8 @@ use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, RelativePath, Re
 use super::browser::{TrustedBrowser, chromium_config, effective_switches};
 use super::manifest::LayoutManifest;
 use super::profile::{
-    ProfileAttempt, ProfileCreateContext, ProfileJournal, resolve_terminalization,
+    OwnedSupervisorChild, ProfileAttempt, ProfileCreateContext, ProfileJournal,
+    resolve_terminalization,
 };
 use super::selection::Fixture;
 use super::xml::{MeasuredLayout, Variant};
@@ -63,6 +64,92 @@ pub(super) enum BrowserExecution {
     Production,
     #[cfg(test)]
     Test(TestGenerationHost),
+}
+
+struct RetainedBrowser(Option<Browser>);
+
+impl RetainedBrowser {
+    fn new(browser: Browser) -> Self {
+        Self(Some(browser))
+    }
+
+    fn browser(&self) -> &Browser {
+        self.0.as_ref().expect("retained browser is present")
+    }
+
+    fn browser_mut(&mut self) -> &mut Browser {
+        self.0.as_mut().expect("retained browser is present")
+    }
+
+    fn supervisor_child(&mut self) -> Option<&mut dyn OwnedSupervisorChild> {
+        self.browser_mut()
+            .get_mut_child()
+            .map(|child| child.as_mut_inner() as &mut dyn OwnedSupervisorChild)
+    }
+
+    fn release_after_terminalization(mut self) {
+        drop(self.0.take());
+    }
+
+    fn release_if_exited(mut self) {
+        let exited = self
+            .browser_mut()
+            .get_mut_child()
+            .is_none_or(|child| child.try_wait().is_ok_and(|status| status.is_some()));
+        if exited {
+            drop(self.0.take());
+        }
+    }
+}
+
+impl Drop for RetainedBrowser {
+    fn drop(&mut self) {
+        if let Some(browser) = self.0.take() {
+            // Chromiumoxide enables kill-on-drop for its child. Until normal
+            // terminalization proves that child still owns the recorded group,
+            // detaching is the only signal-free failure and unwind behavior.
+            std::mem::forget(browser);
+        }
+    }
+}
+
+enum AttemptSupervisor {
+    Production(Box<RetainedBrowser>),
+    #[cfg(test)]
+    Test(std::process::Child),
+}
+
+impl AttemptSupervisor {
+    fn child(&mut self) -> Option<&mut dyn OwnedSupervisorChild> {
+        match self {
+            Self::Production(browser) => browser.supervisor_child(),
+            #[cfg(test)]
+            Self::Test(child) => Some(child),
+        }
+    }
+
+    fn finish_terminalization(self, succeeded: bool) {
+        match self {
+            Self::Production(browser) if succeeded => (*browser).release_after_terminalization(),
+            Self::Production(browser) => (*browser).release_if_exited(),
+            #[cfg(test)]
+            Self::Test(child) => drop(child),
+        }
+    }
+}
+
+struct AttemptExecution {
+    result: Result<AttemptOutcomes>,
+    supervisor: Option<AttemptSupervisor>,
+}
+
+impl AttemptExecution {
+    fn without_supervisor(result: Result<AttemptOutcomes>) -> Self {
+        Self {
+            result,
+            supervisor: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -225,7 +312,7 @@ async fn run_attempt(
     let (_capsule, config) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
-            journal.terminalize_with_forced_group_kill(context.lease.rooted())?;
+            journal.terminalize_with_forced_group_kill(context.lease.rooted(), None)?;
             return Err(error);
         }
     };
@@ -256,11 +343,24 @@ async fn run_attempt(
             .await
         }
     };
-    let terminal = journal.terminalize_with_forced_group_kill(context.lease.rooted());
     match outcome {
-        Ok(result) => resolve_terminalization(result, terminal),
+        Ok(mut execution) => {
+            let terminal = journal.terminalize_with_forced_group_kill(
+                context.lease.rooted(),
+                execution
+                    .supervisor
+                    .as_mut()
+                    .and_then(AttemptSupervisor::child),
+            );
+            let terminal_succeeded = terminal.is_ok();
+            let AttemptExecution { result, supervisor } = execution;
+            if let Some(supervisor) = supervisor {
+                supervisor.finish_terminalization(terminal_succeeded);
+            }
+            resolve_terminalization(result, terminal)
+        }
         Err(payload) => {
-            let _ = terminal;
+            let _ = journal.terminalize_with_forced_group_kill(context.lease.rooted(), None);
             std::panic::resume_unwind(payload)
         }
     }
@@ -273,27 +373,45 @@ async fn test_browser_attempt(
     host: &TestGenerationHost,
     attempt: &MeasurementAttempt<'_>,
     journal_path: &str,
-) -> Result<AttemptOutcomes> {
+) -> AttemptExecution {
     host.record_attempt(attempt.batch_ordinal, attempt.retry_ordinal);
     let mode = if host.plan() == TestBrowserPlan::BrowserFailure {
         super::supervisor::TestBrowserMode::Failure
     } else {
         super::supervisor::TestBrowserMode::Success
     };
-    run_test_supervisor(context.current_executable, capsule, mode).await?;
-    if host.plan() == TestBrowserPlan::OwnedPanicWithCleanupFailure {
-        context.lease.rooted().create_file_exclusive(
+    let supervisor = match run_test_supervisor(context.current_executable, capsule, mode).await {
+        Ok(supervisor) => supervisor,
+        Err(error) => return AttemptExecution::without_supervisor(Err(error)),
+    };
+    let TestSupervisorRun { result, child } = supervisor;
+    if let Err(error) = result {
+        return AttemptExecution {
+            result: Err(error),
+            supervisor: Some(AttemptSupervisor::Test(child)),
+        };
+    }
+    if host.plan() == TestBrowserPlan::OwnedPanicWithCleanupFailure
+        && let Err(error) = context.lease.rooted().create_file_exclusive(
             &format!("{journal_path}/unexpected"),
             b"retained cleanup evidence",
             PRIVATE_FILE_MODE,
-        )?;
+        )
+    {
+        return AttemptExecution {
+            result: Err(error),
+            supervisor: Some(AttemptSupervisor::Test(child)),
+        };
     }
     match host.plan() {
         TestBrowserPlan::DependencyPanic => {
-            return Err(dependency_panic(
-                "crate-owned fake browser dependency",
-                Box::new("synthetic dependency panic"),
-            ));
+            return AttemptExecution {
+                result: Err(dependency_panic(
+                    "crate-owned fake browser dependency",
+                    Box::new("synthetic dependency panic"),
+                )),
+                supervisor: Some(AttemptSupervisor::Test(child)),
+            };
         }
         TestBrowserPlan::OwnedPanic | TestBrowserPlan::OwnedPanicWithCleanupFailure => {
             std::panic::panic_any("synthetic owned generation panic");
@@ -303,7 +421,7 @@ async fn test_browser_attempt(
 
     let retryable_failure = host.plan() == TestBrowserPlan::AlwaysFail
         || (host.plan() == TestBrowserPlan::RetryOnce && attempt.retry_ordinal == 0);
-    Ok(attempt
+    let result = Ok(attempt
         .fixtures
         .iter()
         .map(|fixture| {
@@ -317,7 +435,17 @@ async fn test_browser_attempt(
             };
             (fixture.source().clone(), outcome)
         })
-        .collect())
+        .collect());
+    AttemptExecution {
+        result,
+        supervisor: Some(AttemptSupervisor::Test(child)),
+    }
+}
+
+#[cfg(test)]
+pub(super) struct TestSupervisorRun {
+    pub(super) result: Result<()>,
+    pub(super) child: std::process::Child,
 }
 
 #[cfg(test)]
@@ -325,21 +453,28 @@ pub(super) async fn run_test_supervisor(
     executable: &Path,
     capsule: &str,
     mode: super::supervisor::TestBrowserMode,
-) -> Result<()> {
+) -> Result<TestSupervisorRun> {
     let mut command = super::supervisor::test_process_command(executable, capsule, mode);
-    let status = tokio::task::spawn_blocking(move || command.status())
-        .await
-        .map_err(process_source)?
-        .map_err(process_source)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(GeneratorError::new(
-            GeneratorErrorKind::Process,
-            "run crate-owned fake browser supervisor",
-            format!("supervisor exited unsuccessfully: {status}"),
-        ))
-    }
+    let child = command.spawn().map_err(process_source)?;
+    let (child, status) = tokio::task::spawn_blocking(move || {
+        let mut child = child;
+        let status = child.wait();
+        (child, status)
+    })
+    .await
+    .map_err(process_source)?;
+    let result = status.map_err(process_source).and_then(|status| {
+        if status.success() {
+            Ok(())
+        } else {
+            Err(GeneratorError::new(
+                GeneratorErrorKind::Process,
+                "run crate-owned fake browser supervisor",
+                format!("supervisor exited unsuccessfully: {status}"),
+            ))
+        }
+    });
+    Ok(TestSupervisorRun { result, child })
 }
 
 async fn browser_attempt(
@@ -349,13 +484,13 @@ async fn browser_attempt(
     helper: &[u8],
     base_style: &[u8],
     fixtures: &[&Fixture],
-) -> Result<AttemptOutcomes> {
+) -> AttemptExecution {
     let launched = AssertUnwindSafe(Browser::launch(config))
         .catch_unwind()
         .await;
     match launched {
         Ok(Ok((browser, mut handler))) => {
-            let mut browser = browser;
+            let mut browser = RetainedBrowser::new(browser);
             let handler_task = tokio::spawn(async move {
                 let handled = AssertUnwindSafe(async move {
                     while let Some(event) = handler.next().await {
@@ -370,11 +505,18 @@ async fn browser_attempt(
                     Err(payload) => Err(dependency_panic("Chromiumoxide handler", payload)),
                 }
             });
-            let measured =
-                measure_pages(&browser, location, manifest, helper, base_style, fixtures).await;
+            let measured = measure_pages(
+                browser.browser(),
+                location,
+                manifest,
+                helper,
+                base_style,
+                fixtures,
+            )
+            .await;
             let close = tokio::time::timeout(
                 Duration::from_secs(5),
-                AssertUnwindSafe(browser.close()).catch_unwind(),
+                AssertUnwindSafe(browser.browser_mut().close()).catch_unwind(),
             )
             .await;
             let close_result = match close {
@@ -391,12 +533,17 @@ async fn browser_attempt(
                     Ok(Err(source)) => Err(process_source(source)),
                     Err(source) => Err(process_timeout("join Chromiumoxide handler", source)),
                 };
-            close_result?;
-            handler_result?;
-            measured
+            let result = close_result.and(handler_result).and(measured);
+            AttemptExecution {
+                result,
+                supervisor: Some(AttemptSupervisor::Production(Box::new(browser))),
+            }
         }
-        Ok(Err(source)) => Err(process_source(source)),
-        Err(payload) => Err(dependency_panic("Chromiumoxide launch", payload)),
+        Ok(Err(source)) => AttemptExecution::without_supervisor(Err(process_source(source))),
+        Err(payload) => AttemptExecution::without_supervisor(Err(dependency_panic(
+            "Chromiumoxide launch",
+            payload,
+        ))),
     }
 }
 
