@@ -7,6 +7,7 @@ use super::LayoutRequest;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
+    CheckCorpus,
     CheckTaffyCorpus,
     ImportTaffy,
 }
@@ -45,6 +46,7 @@ fn run_from_args(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
             Some("check-taffy-corpus") => {
                 set_once(&mut command, Command::CheckTaffyCorpus, "layout command")?
             }
+            Some("check-corpus") => set_once(&mut command, Command::CheckCorpus, "layout command")?,
             Some("import-taffy") => set_once(&mut command, Command::ImportTaffy, "layout command")?,
             Some(value) => return Err(cli_error(format!("unknown layout command: {value}"))),
             None => return Err(cli_error("layout command name must be UTF-8")),
@@ -54,11 +56,28 @@ fn run_from_args(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
     let owner_root = required_path(owner_root, "--owner-root")?;
     let corpus_root = required_path(corpus_root, "--corpus-root")?;
     let command = command.ok_or_else(|| cli_error("missing layout command"))?;
-    let source_root = required_path(source_root, "--source-root")?;
+    let source_root = match command {
+        Command::CheckCorpus => {
+            if source_root.is_some() {
+                return Err(cli_error("check-corpus forbids --source-root"));
+            }
+            None
+        }
+        Command::CheckTaffyCorpus | Command::ImportTaffy => {
+            Some(required_path(source_root, "--source-root")?)
+        }
+    };
     let location = CorpusLocation::new(owner_root, corpus_root)?;
     let request = match command {
-        Command::CheckTaffyCorpus => LayoutRequest::check_taffy_corpus(location, source_root)?,
-        Command::ImportTaffy => LayoutRequest::import_taffy(location, source_root)?,
+        Command::CheckCorpus => LayoutRequest::check_corpus(location),
+        Command::CheckTaffyCorpus => LayoutRequest::check_taffy_corpus(
+            location,
+            source_root.expect("checked Taffy command source root"),
+        )?,
+        Command::ImportTaffy => LayoutRequest::import_taffy(
+            location,
+            source_root.expect("checked Taffy command source root"),
+        )?,
     };
     super::run(request)
 }

@@ -428,6 +428,11 @@ fn layout_browser_free_public_requests_are_io_free_and_accessors_are_exact() {
     assert_eq!(check.command(), LayoutCommand::CheckTaffyCorpus);
     assert_eq!(check.source_root(), Some(source.as_path()));
 
+    let corpus_check = LayoutRequest::check_corpus(location.clone());
+    assert_eq!(corpus_check.location(), &location);
+    assert_eq!(corpus_check.command(), LayoutCommand::CheckCorpus);
+    assert_eq!(corpus_check.source_root(), None);
+
     let error = LayoutRequest::import_taffy(location, PathBuf::new())
         .expect_err("empty import source root");
     assert_eq!(error.kind(), GeneratorErrorKind::Cli);

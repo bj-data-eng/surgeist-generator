@@ -24,6 +24,40 @@ pub(super) struct LayoutManifest {
     pub(super) revision: SourceRevision,
     pub(super) expected_source_files: usize,
     pub(super) authored_files: BTreeSet<RelativePath>,
+    pub(super) authored_cases: Vec<case::LayoutCase>,
+    pub(super) browser: BrowserManifest,
+    pub(super) reports: GenerationReportManifest,
+    pub(super) launch_digest: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct BrowserManifest {
+    pub(super) source: String,
+    pub(super) version: String,
+    pub(super) cache_root: RelativePath,
+    pub(super) provenance_format: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct FullReportExpectations {
+    pub(super) generated: usize,
+    pub(super) unsupported: usize,
+    pub(super) expected_fail: usize,
+    pub(super) quarantined: usize,
+    pub(super) failed_to_generate: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ScopedReportManifest {
+    pub(super) filter: RelativePath,
+    pub(super) file: RelativePath,
+    pub(super) generated: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GenerationReportManifest {
+    pub(super) full: FullReportExpectations,
+    pub(super) scoped: Vec<ScopedReportManifest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,7 +180,8 @@ fn parse_complete(bytes: &[u8], path: &Path) -> Result<(LayoutManifest, Sha256Di
     validate_reports(&raw.generation_reports)?;
     validate_source_roots(&raw.source_roots)?;
     let launch_digest = launch_digest(&raw.browser.launch)?;
-    let authored_files = case::validate(raw.cases)?;
+    let cases = case::validate(raw.cases)?;
+    let authored_files = cases.authored_files;
     let import = raw.imports.taffy;
     if import.repo != TAFFY_REPOSITORY {
         return Err(invalid_manifest(
@@ -187,9 +222,56 @@ fn parse_complete(bytes: &[u8], path: &Path) -> Result<(LayoutManifest, Sha256Di
             revision: import.commit,
             expected_source_files,
             authored_files,
+            authored_cases: cases.authored_cases,
+            browser: BrowserManifest {
+                source: raw.browser.source,
+                version: raw.browser.version,
+                cache_root: raw.browser.cache_root,
+                provenance_format: raw.browser.provenance_format,
+            },
+            reports: report_manifest(raw.generation_reports)?,
+            launch_digest: launch_digest.clone(),
         },
         launch_digest,
     ))
+}
+
+fn report_manifest(raw: RawGenerationReports) -> Result<GenerationReportManifest> {
+    Ok(GenerationReportManifest {
+        full: FullReportExpectations {
+            generated: nonnegative_usize(raw.full.generated, "generation_reports.full.generated")?,
+            unsupported: nonnegative_usize(
+                raw.full.unsupported,
+                "generation_reports.full.unsupported",
+            )?,
+            expected_fail: nonnegative_usize(
+                raw.full.expected_fail,
+                "generation_reports.full.expected_fail",
+            )?,
+            quarantined: nonnegative_usize(
+                raw.full.quarantined,
+                "generation_reports.full.quarantined",
+            )?,
+            failed_to_generate: nonnegative_usize(
+                raw.full.failed_to_generate,
+                "generation_reports.full.failed_to_generate",
+            )?,
+        },
+        scoped: raw
+            .scoped
+            .into_iter()
+            .map(|scoped| {
+                Ok(ScopedReportManifest {
+                    filter: scoped.filter,
+                    file: scoped.file,
+                    generated: nonnegative_usize(
+                        scoped.generated,
+                        "generation_reports.scoped.generated",
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    })
 }
 
 fn validate_browser(browser: &RawBrowser) -> Result<()> {
@@ -461,6 +543,10 @@ fn positive_usize(value: u64, label: &str) -> Result<usize> {
     }
     usize::try_from(value)
         .map_err(|_| invalid_manifest(format!("imports.taffy.{label} overflows usize")))
+}
+
+fn nonnegative_usize(value: u64, label: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| invalid_manifest(format!("{label} overflows usize")))
 }
 
 fn reserved_component(component: &str) -> bool {

@@ -30,7 +30,7 @@ pub(crate) use coordination::Domain;
 #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 pub(crate) use fs::{CORPUS_FILE_MODE, HeldIdentity, NodeKind, RootedFs};
 #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
-pub(crate) use inventory::{Inventory, InventoryPolicy};
+pub(crate) use inventory::{Inventory, InventoryEntry, InventoryPolicy};
 #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
 pub(crate) use lease::GenerationCheck;
 #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]

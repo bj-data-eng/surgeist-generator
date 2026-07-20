@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use surgeist_generator::Sha256Digest;
+
 const TAFFY_REPOSITORY: &str = "https://github.com/DioxusLabs/taffy.git";
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -98,6 +100,15 @@ fn layout_cli_taffy_option_matrix_precedes_io() {
             "does-not-exist",
             "--corpus-root",
             "does-not-exist",
+            "check-corpus",
+            "--source-root",
+            "checkout",
+        ],
+        vec![
+            "--owner-root",
+            "does-not-exist",
+            "--corpus-root",
+            "does-not-exist",
             "check-taffy-corpus",
         ],
         vec![
@@ -110,13 +121,6 @@ fn layout_cli_taffy_option_matrix_precedes_io() {
             "checkout",
             "--filter",
             "grid",
-        ],
-        vec![
-            "--owner-root",
-            "does-not-exist",
-            "--corpus-root",
-            "does-not-exist",
-            "check-corpus",
         ],
         vec![
             "--owner-root",
@@ -161,6 +165,24 @@ fn layout_cli_taffy_option_matrix_precedes_io() {
                 .starts_with("surgeist-layout-generate: canonicalize owner root:")
         );
     }
+
+    let accepted = Command::new(env!("CARGO_BIN_EXE_surgeist-layout-generate"))
+        .args([
+            "--owner-root",
+            "does-not-exist",
+            "--corpus-root",
+            "does-not-exist",
+            "check-corpus",
+        ])
+        .output()
+        .expect("run packaged layout corpus check");
+    assert_eq!(accepted.status.code(), Some(1));
+    assert!(accepted.stdout.is_empty());
+    assert!(
+        String::from_utf8(accepted.stderr)
+            .expect("UTF-8 diagnostic")
+            .starts_with("surgeist-layout-generate: canonicalize owner root:")
+    );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -268,6 +290,181 @@ fn layout_cli_import_and_check_taffy_execute_real_public_paths() {
         path_identity(&corpus.join("html/.surgeist-taffy-source.json")),
         sidecar_identity
     );
+
+    write_current_layout_state(&corpus, &sidecar);
+    let before = snapshot_tree(&root.0);
+    let output = Command::new(env!("CARGO_BIN_EXE_surgeist-layout-generate"))
+        .arg("--owner-root")
+        .arg(&owner)
+        .arg("--corpus-root")
+        .arg(&corpus)
+        .arg("check-corpus")
+        .output()
+        .expect("run packaged offline layout corpus check");
+    assert!(
+        output.status.success(),
+        "offline layout check failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    assert_eq!(snapshot_tree(&root.0), before);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn write_current_layout_state(corpus: &Path, sidecar: &[u8]) {
+    const HELPER: &[u8] = b"window.__surgeist = true;\n";
+    const BASE_STYLE: &[u8] = b"html, body { margin: 0; }\n";
+    const BROWSER_DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let helper = corpus.join("scripts/gentest/test_helper.js");
+    fs::create_dir_all(helper.parent().expect("helper parent")).expect("create helper parent");
+    fs::write(&helper, HELPER).expect("write helper");
+    fs::write(
+        corpus.join("scripts/gentest/test_base_style.css"),
+        BASE_STYLE,
+    )
+    .expect("write base style");
+
+    let source = fs::read(corpus.join("html/grid/basic.html")).expect("read HTML source");
+    let manifest = fs::read(corpus.join("corpus.toml")).expect("read manifest");
+    let launch_arguments = vec![
+        "use-mock-keychain",
+        "headless",
+        "no-sandbox",
+        "disable-setuid-sandbox",
+        "disable-gpu",
+        "hide-scrollbars",
+        "mute-audio",
+        "no-first-run",
+        "no-default-browser-check",
+        "disable-background-networking",
+        "disable-background-timer-throttling",
+        "disable-client-side-phishing-detection",
+        "disable-component-update",
+        "disable-default-apps",
+        "disable-dev-shm-usage",
+        "disable-features=Translate",
+        "disable-hang-monitor",
+        "disable-popup-blocking",
+        "disable-prompt-on-repost",
+        "disable-renderer-backgrounding",
+        "disable-sync",
+        "metrics-recording-only",
+        "password-store=basic",
+        "safebrowsing-disable-auto-update",
+        "enable-automation",
+        "force-color-profile=srgb",
+        "disable-blink-features=AutomationControlled",
+        "window-size=1280,720",
+    ];
+    let launch = serde_json::to_vec(&(
+        1_u8,
+        1_u64,
+        1_u64,
+        1_u64,
+        1_u64,
+        "sorted-sequential",
+        "open-load-reset-timeout",
+        "per-batch-and-retry",
+        "per-job",
+        true,
+        true,
+        launch_arguments,
+    ))
+    .expect("serialize synthetic launch tuple");
+    let metadata = (
+        Sha256Digest::from_bytes(&launch),
+        Sha256Digest::from_bytes(HELPER),
+        Sha256Digest::from_bytes(BASE_STYLE),
+        Sha256Digest::from_bytes(&manifest),
+        Sha256Digest::from_bytes(sidecar),
+        Sha256Digest::from_bytes(&source),
+    );
+    let mut generated = Vec::new();
+    for variant in [
+        "border_box_ltr",
+        "border_box_rtl",
+        "content_box_ltr",
+        "content_box_rtl",
+    ] {
+        let output = format!("xml/grid/basic__{variant}.xml");
+        let xml = format!(
+            "<!-- generated-by: surgeist-layout-generate schema=2 source=\"html/grid/basic.html\" source-sha256=\"{}\" helper-sha256=\"{}\" browser=\"Chrome 123.0.1 browser-cache/chrome\" browser-executable-sha256=\"{BROWSER_DIGEST}\" launch-profile-sha256=\"{}\" corpus-manifest-sha256=\"{}\" taffy-revision=\"{}\" taffy-sidecar-sha256=\"{}\" -->\n<test name=\"basic__{variant}\"/>\n",
+            metadata.5,
+            metadata.1,
+            metadata.0,
+            metadata.3,
+            serde_json::from_slice::<serde_json::Value>(sidecar)
+                .expect("sidecar JSON")["source"]["revision"]
+                .as_str()
+                .expect("sidecar revision"),
+            metadata.4,
+        );
+        let path = corpus.join(&output);
+        fs::create_dir_all(path.parent().expect("XML parent")).expect("create XML parent");
+        fs::write(&path, xml.as_bytes()).expect("write XML");
+        generated.push(format!(
+            "    {{\n      \"name\": \"basic__{variant}\",\n      \"source\": \"html/grid/basic.html\",\n      \"output\": \"{output}\",\n      \"output_sha256\": \"{}\",\n      \"variant\": \"{variant}\"\n    }}",
+            Sha256Digest::from_bytes(xml.as_bytes())
+        ));
+    }
+    let report = format!(
+        "{{\n  \"metadata\": {{\n    \"schema_version\": 2,\n    \"generator\": \"surgeist-layout-generate\",\n    \"browser_source\": \"chrome-for-testing\",\n    \"browser_version\": \"123.0.1\",\n    \"browser_provenance\": \"Chrome 123.0.1 browser-cache/chrome\",\n    \"browser_executable_sha256\": \"{BROWSER_DIGEST}\",\n    \"launch_profile_sha256\": \"{}\",\n    \"helper_sha256\": \"{}\",\n    \"base_style_sha256\": \"{}\",\n    \"corpus_manifest_sha256\": \"{}\",\n    \"taffy_revision\": \"{}\",\n    \"taffy_sidecar_sha256\": \"{}\"\n  }},\n  \"filter\": null,\n  \"summary\": {{\n    \"generated\": 4,\n    \"unsupported\": 0,\n    \"expected_fail\": 0,\n    \"quarantined\": 0,\n    \"failed_to_generate\": 0\n  }},\n  \"generated\": [\n{}\n  ],\n  \"unsupported\": [],\n  \"expected_fail\": [],\n  \"quarantined\": [],\n  \"failed_to_generate\": []\n}}\n",
+        metadata.0,
+        metadata.1,
+        metadata.2,
+        metadata.3,
+        serde_json::from_slice::<serde_json::Value>(sidecar)
+            .expect("sidecar JSON")["source"]["revision"]
+            .as_str()
+            .expect("sidecar revision"),
+        metadata.4,
+        generated.join(",\n"),
+    );
+    let report_path = corpus.join("xml/generation-reports/all.json");
+    fs::create_dir_all(report_path.parent().expect("report parent")).expect("create report parent");
+    fs::write(report_path, report).expect("write report");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn snapshot_tree(root: &Path) -> std::collections::BTreeMap<PathBuf, (u64, u64, Vec<u8>)> {
+    fn visit(
+        base: &Path,
+        current: &Path,
+        output: &mut std::collections::BTreeMap<PathBuf, (u64, u64, Vec<u8>)>,
+    ) {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = fs::symlink_metadata(current).expect("snapshot metadata");
+        output.insert(
+            current
+                .strip_prefix(base)
+                .expect("relative path")
+                .to_path_buf(),
+            (
+                metadata.dev(),
+                metadata.ino(),
+                if metadata.is_file() {
+                    fs::read(current).expect("snapshot bytes")
+                } else {
+                    Vec::new()
+                },
+            ),
+        );
+        if metadata.is_dir() {
+            let mut entries = fs::read_dir(current)
+                .expect("snapshot directory")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("snapshot entries");
+            entries.sort_by_key(fs::DirEntry::file_name);
+            for entry in entries {
+                visit(base, &entry.path(), output);
+            }
+        }
+    }
+    let mut output = std::collections::BTreeMap::new();
+    visit(root, root, &mut output);
+    output
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

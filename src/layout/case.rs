@@ -6,7 +6,7 @@ use crate::{GeneratorError, GeneratorErrorKind, RelativePath, Result};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-enum LayoutCaseStatus {
+pub(super) enum LayoutCaseStatus {
     Active,
     ExpectedFail,
     Unsupported,
@@ -31,10 +31,25 @@ pub(super) struct RawCase {
     reason: Option<String>,
 }
 
-pub(super) fn validate(cases: Vec<RawCase>) -> Result<BTreeSet<RelativePath>> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct LayoutCase {
+    pub(super) id: String,
+    pub(super) source: RelativePath,
+    pub(super) status: LayoutCaseStatus,
+    pub(super) reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct LayoutCases {
+    pub(super) authored_files: BTreeSet<RelativePath>,
+    pub(super) authored_cases: Vec<LayoutCase>,
+}
+
+pub(super) fn validate(cases: Vec<RawCase>) -> Result<LayoutCases> {
     let mut ids = BTreeSet::new();
     let mut sources = BTreeSet::new();
     let mut authored = BTreeSet::new();
+    let mut authored_cases = Vec::new();
 
     for case in cases {
         if !ids.insert(case.id.clone()) {
@@ -60,15 +75,36 @@ pub(super) fn validate(cases: Vec<RawCase>) -> Result<BTreeSet<RelativePath>> {
                 RelativePath::with_extension(case.source.as_str(), "html").map_err(|_| {
                     invalid_manifest("Surgeist case source must be a strict .html path")
                 })?;
-                authored.insert(case.source);
+                authored.insert(case.source.clone());
+                authored_cases.push(LayoutCase {
+                    id: case.id,
+                    source: case.source,
+                    status: case.status,
+                    reason: effective_reason(case.status, case.reason),
+                });
             }
         }
-
-        // Status and reason are deliberately compatibility data in T01. All four
-        // statuses admit an absent or byte-preserved UTF-8 reason.
-        let _ = (case.status, case.reason);
     }
-    Ok(authored)
+    authored_cases.sort_by(|left, right| left.source.cmp(&right.source));
+    Ok(LayoutCases {
+        authored_files: authored,
+        authored_cases,
+    })
+}
+
+fn effective_reason(status: LayoutCaseStatus, reason: Option<String>) -> String {
+    if matches!(status, LayoutCaseStatus::Active) {
+        return String::new();
+    }
+    reason.unwrap_or_else(|| {
+        match status {
+            LayoutCaseStatus::Active => unreachable!("active status returned above"),
+            LayoutCaseStatus::ExpectedFail => "manifest marks case expected-fail",
+            LayoutCaseStatus::Unsupported => "manifest marks case unsupported",
+            LayoutCaseStatus::Quarantined => "manifest marks case quarantined",
+        }
+        .to_owned()
+    })
 }
 
 fn invalid_manifest(detail: impl Into<String>) -> GeneratorError {

@@ -25,17 +25,33 @@
 //! layout::run(request)
 //! # }
 //! ```
+//!
+//! Complete corpus checking is fully offline. Browser provenance in XML and
+//! reports is validated as a consistent historical attestation; no browser
+//! cache or executable is opened or authenticated:
+//!
+//! ```no_run
+//! # use surgeist_generator::{CorpusLocation, Result};
+//! # use surgeist_generator::layout::{self, LayoutRequest};
+//! # fn example(location: CorpusLocation) -> Result<()> {
+//! layout::run(LayoutRequest::check_corpus(location))
+//! # }
+//! ```
 
 use std::path::{Path, PathBuf};
 
 use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, Result};
 
 mod case;
+mod checker;
 mod cli;
 mod importer;
 mod manifest;
+mod report;
 mod sidecar;
 
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod checker_tests;
 #[cfg(test)]
 mod tests;
 
@@ -43,6 +59,8 @@ mod tests;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum LayoutCommand {
+    /// Verify imported HTML and generated XML/report attestations offline.
+    CheckCorpus,
     /// Verify the manifest-pinned checkout and persisted Taffy import read-only.
     CheckTaffyCorpus,
     /// Import the manifest-pinned Taffy `test_fixtures` tree.
@@ -54,10 +72,20 @@ pub enum LayoutCommand {
 pub struct LayoutRequest {
     location: CorpusLocation,
     command: LayoutCommand,
-    source_root: PathBuf,
+    source_root: Option<PathBuf>,
 }
 
 impl LayoutRequest {
+    /// Constructs a complete offline corpus check without filesystem access.
+    #[must_use]
+    pub fn check_corpus(location: CorpusLocation) -> Self {
+        Self {
+            location,
+            command: LayoutCommand::CheckCorpus,
+            source_root: None,
+        }
+    }
+
     /// Constructs a read-only Taffy corpus check without filesystem access.
     ///
     /// The caller supplies an existing checkout. An empty source path is a
@@ -99,13 +127,14 @@ impl LayoutRequest {
     /// Returns the source checkout supplied by this Taffy request.
     #[must_use]
     pub fn source_root(&self) -> Option<&Path> {
-        Some(&self.source_root)
+        self.source_root.as_deref()
     }
 }
 
 /// Executes one browser-free layout operation synchronously.
 pub fn run(request: LayoutRequest) -> Result<()> {
     match request.command() {
+        LayoutCommand::CheckCorpus => checker::run(&request),
         LayoutCommand::CheckTaffyCorpus => importer::check(&request),
         LayoutCommand::ImportTaffy => importer::run(&request),
     }
@@ -135,6 +164,6 @@ fn source_request(
     Ok(LayoutRequest {
         location,
         command,
-        source_root,
+        source_root: Some(source_root),
     })
 }

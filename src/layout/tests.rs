@@ -5,10 +5,11 @@ use crate::{GeneratorErrorKind, PinnedSource, RelativePath, Sha256Digest, Source
 
 use super::{manifest, sidecar};
 
-const SHA1_REVISION: &str = "1111111111111111111111111111111111111111";
-const SHA256_REVISION: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+pub(super) const SHA1_REVISION: &str = "1111111111111111111111111111111111111111";
+pub(super) const SHA256_REVISION: &str =
+    "1111111111111111111111111111111111111111111111111111111111111111";
 
-fn manifest_text(revision: &str, expected_count: usize, cases: &str) -> String {
+pub(super) fn manifest_text(revision: &str, expected_count: usize, cases: &str) -> String {
     format!(
         r#"schema_version = 2
 
@@ -97,7 +98,7 @@ excluded_destination_dirs = ["grid-lanes", "subgrid"]
     )
 }
 
-fn authored_cases() -> &'static str {
+pub(super) fn authored_cases() -> &'static str {
     r#"[[cases]]
 id = "authored/first"
 source_root = "surgeist"

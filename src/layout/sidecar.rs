@@ -130,6 +130,14 @@ impl TaffyImportSidecar {
         &self.files
     }
 
+    pub(super) fn revision(&self) -> &crate::SourceRevision {
+        self.source.revision()
+    }
+
+    pub(super) const fn source_file_count(&self) -> usize {
+        self.source_file_count
+    }
+
     fn validate(&self) -> Result<()> {
         if self.schema_version != 1 {
             return Err(invalid_inventory(
