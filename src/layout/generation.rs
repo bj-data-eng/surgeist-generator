@@ -8,6 +8,8 @@ use std::time::Duration;
 use futures::FutureExt;
 use tokio::io::AsyncReadExt;
 
+#[cfg(test)]
+use crate::core::PRIVATE_DIRECTORY_MODE;
 use crate::core::{
     ArtifactPlan, ArtifactReservation, Domain, GenerationLease, NamespaceDisjointness,
     PublicationInventory, PublicationPolicy, RootedFs,
@@ -15,9 +17,10 @@ use crate::core::{
 use crate::{GeneratorError, GeneratorErrorKind, RelativePath, Result, Sha256Digest};
 
 use super::browser::TrustedBrowser;
-use super::measurement::{MeasurementResults, VariantOutcome};
+use super::measurement::{BrowserExecution, MeasurementResults, VariantOutcome};
 use super::profile::{
-    ProfileJournal, ProfilePurpose, classify_pending, force_kill_group, resolve_terminalization,
+    ProfileAttempt, ProfileCreateContext, ProfileJournal, classify_pending, force_kill_group,
+    resolve_terminalization,
 };
 use super::report::{GenerationLedger, GenerationMetadata, HistoricalAuthority};
 use super::selection::{CurrentInputs, Fixture, FixtureDisposition, SelectionLedger};
@@ -28,6 +31,11 @@ const GENERATOR: &str = "surgeist-layout-generate";
 const COMMAND: &str = "generate";
 type GeneratedArtifact = (RelativePath, Vec<u8>);
 type DerivedArtifacts = (GenerationLedger, Vec<GeneratedArtifact>);
+
+struct GenerationHost {
+    executable: PathBuf,
+    execution: BrowserExecution,
+}
 
 pub(super) fn run(request: LayoutRequest) -> Result<()> {
     let executable = std::env::current_exe().map_err(|source| {
@@ -51,10 +59,16 @@ pub(super) fn run(request: LayoutRequest) -> Result<()> {
             "generation requires the packaged surgeist-layout-generate host",
         ));
     }
-    run_with_host(request, executable)
+    run_with_host(
+        request,
+        GenerationHost {
+            executable,
+            execution: BrowserExecution::Production,
+        },
+    )
 }
 
-fn run_with_host(request: LayoutRequest, executable: PathBuf) -> Result<()> {
+fn run_with_host(request: LayoutRequest, host: GenerationHost) -> Result<()> {
     let worker = std::thread::Builder::new()
         .name("surgeist-layout-generation".to_owned())
         .spawn(move || {
@@ -71,7 +85,7 @@ fn run_with_host(request: LayoutRequest, executable: PathBuf) -> Result<()> {
                             source,
                         )
                     })?
-                    .block_on(generate(&request, &executable))
+                    .block_on(generate(&request, &host))
             }))
         })
         .map_err(|source| {
@@ -88,7 +102,37 @@ fn run_with_host(request: LayoutRequest, executable: PathBuf) -> Result<()> {
     }
 }
 
-async fn generate(request: &LayoutRequest, executable: &Path) -> Result<()> {
+#[cfg(test)]
+pub(super) fn run_with_test_host(
+    request: LayoutRequest,
+    test_host: super::measurement::TestGenerationHost,
+) -> Result<()> {
+    let executable = std::env::current_exe().map_err(|source| {
+        GeneratorError::with_source(
+            GeneratorErrorKind::Generation,
+            "resolve crate-owned generation test host",
+            source.to_string(),
+            source,
+        )
+    })?;
+    let executable = std::fs::canonicalize(&executable).map_err(|source| {
+        GeneratorError::with_source(
+            GeneratorErrorKind::Generation,
+            "canonicalize crate-owned generation test host",
+            executable.display().to_string(),
+            source,
+        )
+    })?;
+    run_with_host(
+        request,
+        GenerationHost {
+            executable,
+            execution: BrowserExecution::Test(test_host),
+        },
+    )
+}
+
+async fn generate(request: &LayoutRequest, host: &GenerationHost) -> Result<()> {
     let location = request.location();
     let manifest_path = location.corpus_root().join(manifest::MANIFEST_FILE);
     let manifest_bytes = manifest::read_file(&manifest_path)?;
@@ -145,6 +189,8 @@ async fn generate(request: &LayoutRequest, executable: &Path) -> Result<()> {
         COMMAND,
         |rooted| {
             let pending = classify_pending(rooted)?;
+            #[cfg(test)]
+            test_before_closing_revalidation(&host.execution, location)?;
             protection.revalidate(rooted)?;
             manifest::revalidate(rooted, &manifest_bytes)?;
             inputs.revalidate(rooted, &manifest)?;
@@ -160,6 +206,8 @@ async fn generate(request: &LayoutRequest, executable: &Path) -> Result<()> {
                 current_historical.require_filtered_ownership(selection.scheduled_outputs())?;
             }
             if let Some(pending) = pending {
+                #[cfg(test)]
+                test_before_pending_profile_cleanup(&host.execution, rooted)?;
                 pending.execute(rooted)?;
             }
             Ok(())
@@ -168,7 +216,7 @@ async fn generate(request: &LayoutRequest, executable: &Path) -> Result<()> {
 
     browser.closing_revalidate()?;
     let normalized_version =
-        run_version_supervisor(location, &lease, &browser, &manifest, executable).await?;
+        run_version_supervisor(location, &lease, &browser, &manifest, host).await?;
     if normalized_version != manifest.browser.version_output {
         return Err(GeneratorError::new(
             GeneratorErrorKind::SourceVerification,
@@ -192,9 +240,10 @@ async fn generate(request: &LayoutRequest, executable: &Path) -> Result<()> {
             lease: &lease,
             browser: &browser,
             manifest: &manifest,
-            current_executable: executable,
+            current_executable: &host.executable,
             helper: inputs.helper(),
             base_style: inputs.base_style(),
+            execution: &host.execution,
         },
         &scheduled,
     )
@@ -205,14 +254,16 @@ async fn generate(request: &LayoutRequest, executable: &Path) -> Result<()> {
     let base_style_digest = inputs.base_style_digest();
     let provenance = browser.provenance(&manifest);
     let (ledger, mut artifacts) = derive_artifacts(
-        &selection,
-        &inputs,
+        DerivationContext {
+            selection: &selection,
+            inputs: &inputs,
+            manifest: &manifest,
+            browser: &browser,
+            manifest_digest: &manifest_digest,
+            base_style_digest: &base_style_digest,
+            browser_provenance: &provenance,
+        },
         &measurements,
-        &manifest,
-        &browser,
-        &manifest_digest,
-        &base_style_digest,
-        &provenance,
     )?;
     let diagnostic = ledger.has_failures();
     if selection.is_filtered() && diagnostic {
@@ -301,22 +352,73 @@ async fn generate(request: &LayoutRequest, executable: &Path) -> Result<()> {
     }
 }
 
+#[cfg(test)]
+fn test_before_closing_revalidation(
+    execution: &BrowserExecution,
+    location: &crate::CorpusLocation,
+) -> Result<()> {
+    if matches!(
+        execution,
+        BrowserExecution::Test(host)
+            if host.plan() == super::measurement::TestBrowserPlan::ClosingRevalidationFailure
+    ) {
+        let path = location.corpus_root().join(selection::HELPER_SCRIPT);
+        std::fs::write(&path, b"synthetic protected-input drift\n").map_err(|source| {
+            GeneratorError::with_source(
+                GeneratorErrorKind::Io,
+                "inject crate-owned closing-revalidation test drift",
+                path.display().to_string(),
+                source,
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn test_before_pending_profile_cleanup(
+    execution: &BrowserExecution,
+    rooted: &RootedFs,
+) -> Result<()> {
+    if !matches!(
+        execution,
+        BrowserExecution::Test(host)
+            if host.plan() == super::measurement::TestBrowserPlan::ProfileIdentityDrift
+    ) {
+        return Ok(());
+    }
+    let name = rooted
+        .list_dir(super::profile::PROFILE_PARENT)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| generation_error("pending profile disappeared before test drift"))?;
+    let path = format!("{}/{name}", super::profile::PROFILE_PARENT);
+    let displaced = format!("{path}-displaced");
+    let identity = rooted.identity_at(&path)?.ok_or_else(|| {
+        generation_error("pending profile identity disappeared before test drift")
+    })?;
+    rooted.rename_exclusive_bound(&path, &displaced, &identity)?;
+    rooted.create_dir_exclusive(&path, PRIVATE_DIRECTORY_MODE)?;
+    Ok(())
+}
+
 async fn run_version_supervisor(
     location: &crate::CorpusLocation,
     lease: &GenerationLease,
     browser: &TrustedBrowser,
     manifest: &manifest::LayoutManifest,
-    executable: &Path,
+    host: &GenerationHost,
 ) -> Result<String> {
     let journal = ProfileJournal::create(
-        location,
-        lease,
-        browser,
-        manifest,
-        ProfilePurpose::Version,
-        None,
-        None,
-        vec!["version".to_owned()],
+        ProfileCreateContext {
+            location,
+            lease,
+            browser,
+            manifest,
+        },
+        ProfileAttempt::Version {
+            launch_strings: vec!["version".to_owned()],
+        },
     )?;
     let capsule = match (|| {
         let capsule = journal.capsule_json()?;
@@ -329,9 +431,29 @@ async fn run_version_supervisor(
             return Err(error);
         }
     };
-    let outcome = AssertUnwindSafe(run_version_process(executable, capsule))
-        .catch_unwind()
-        .await;
+    let outcome = match &host.execution {
+        BrowserExecution::Production => {
+            AssertUnwindSafe(run_version_process(&host.executable, capsule))
+                .catch_unwind()
+                .await
+        }
+        #[cfg(test)]
+        BrowserExecution::Test(test_host) => {
+            let mode = if test_host.plan() == super::measurement::TestBrowserPlan::BrowserFailure {
+                supervisor::TestBrowserMode::Failure
+            } else {
+                supervisor::TestBrowserMode::Success
+            };
+            let result = AssertUnwindSafe(measurement::run_test_supervisor(
+                &host.executable,
+                &capsule,
+                mode,
+            ))
+            .catch_unwind()
+            .await;
+            result.map(|result| result.map(|()| manifest.browser.version_output.clone()))
+        }
+    };
     let terminal = journal.terminalize_with_forced_group_kill(lease.rooted());
     match outcome {
         Ok(result) => resolve_terminalization(result, terminal),
@@ -408,21 +530,24 @@ async fn read_capped(reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8
     Ok(bytes)
 }
 
-#[allow(clippy::too_many_arguments)]
+struct DerivationContext<'a> {
+    selection: &'a SelectionLedger,
+    inputs: &'a CurrentInputs,
+    manifest: &'a manifest::LayoutManifest,
+    browser: &'a TrustedBrowser,
+    manifest_digest: &'a Sha256Digest,
+    base_style_digest: &'a Sha256Digest,
+    browser_provenance: &'a str,
+}
+
 fn derive_artifacts(
-    selection: &SelectionLedger,
-    inputs: &CurrentInputs,
+    context: DerivationContext<'_>,
     measurements: &MeasurementResults,
-    manifest: &manifest::LayoutManifest,
-    browser: &TrustedBrowser,
-    manifest_digest: &Sha256Digest,
-    base_style_digest: &Sha256Digest,
-    browser_provenance: &str,
 ) -> Result<DerivedArtifacts> {
     let mut ledger = GenerationLedger::default();
     let mut artifacts = Vec::new();
     let linked = BTreeMap::new();
-    for fixture in selection.fixtures(inputs) {
+    for fixture in context.selection.fixtures(context.inputs) {
         match fixture.disposition() {
             FixtureDisposition::ExpectedFail { name, reason } => {
                 ledger.expected_fail(name.clone(), fixture.source().clone(), reason.clone());
@@ -461,16 +586,16 @@ fn derive_artifacts(
                             source: fixture.source(),
                             source_sha256: fixture.digest(),
                             linked_resources: &linked,
-                            helper_sha256: inputs.helper_digest(),
+                            helper_sha256: context.inputs.helper_digest(),
                             base_style_sha256: fixture
                                 .uses_base_style()
-                                .then_some(base_style_digest),
-                            browser: browser_provenance,
-                            browser_executable_sha256: browser.digest(),
-                            launch_profile_sha256: &manifest.launch_digest,
-                            corpus_manifest_sha256: manifest_digest,
-                            taffy_revision: &manifest.revision,
-                            taffy_sidecar_sha256: inputs.sidecar_digest(),
+                                .then_some(context.base_style_digest),
+                            browser: context.browser_provenance,
+                            browser_executable_sha256: context.browser.digest(),
+                            launch_profile_sha256: &context.manifest.launch_digest,
+                            corpus_manifest_sha256: context.manifest_digest,
+                            taffy_revision: &context.manifest.revision,
+                            taffy_sidecar_sha256: context.inputs.sidecar_digest(),
                         },
                     )?;
                     let digest = Sha256Digest::from_bytes(&bytes);

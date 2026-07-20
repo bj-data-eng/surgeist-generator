@@ -77,7 +77,7 @@ pub(super) struct MeasuredLayout {
 
 impl MeasuredLayout {
     #[cfg(test)]
-    fn zero() -> Self {
+    pub(super) fn zero() -> Self {
         Self {
             viewport_width: 0.0,
             viewport_height: 0.0,

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use chromiumoxide::browser::BrowserConfig;
@@ -49,6 +49,11 @@ impl TrustedBrowser {
         let cache = BoundPath::bind(&cache_path)?;
         cache.require_existing_directory("bind trusted browser cache root")?;
         let executable = BoundPath::bind(&executable_path)?;
+        if !executable.is_strict_descendant_of(&cache) {
+            return Err(invalid_path(
+                "trusted browser executable does not resolve to a strict descendant of browser.cache_root",
+            ));
+        }
         let identity = executable.existing_identity().clone();
         if identity.kind() != NodeKind::Regular
             || identity.link_count() != Some(1)
@@ -80,16 +85,21 @@ impl TrustedBrowser {
         self.executable
             .revalidate()
             .map_err(source_verification_revalidation)?;
-        if !self
+        let contained = self.executable.is_strict_descendant_of(&self.cache);
+        let identity_matches = self
             .identity
-            .matches_recovery(self.executable.existing_identity())
-            || digest_held(&self.executable).map_err(source_verification_revalidation)?
-                != self.digest
-        {
+            .matches_recovery(self.executable.existing_identity());
+        let digest_matches =
+            digest_held(&self.executable).map_err(source_verification_revalidation)? == self.digest;
+        if !contained || !identity_matches || !digest_matches {
             return Err(GeneratorError::new(
                 GeneratorErrorKind::SourceVerification,
                 "revalidate trusted browser executable",
-                "browser identity or raw bytes changed after preflight",
+                format!(
+                    "browser containment, identity, or raw bytes changed after preflight \
+                     (contained={contained}, identity_matches={identity_matches}, \
+                     digest_matches={digest_matches})"
+                ),
             ));
         }
         Ok(())
@@ -264,6 +274,14 @@ fn split_switch(argument: &str) -> Result<(&str, Option<&str>)> {
 
 fn digest_held(path: &BoundPath) -> Result<Sha256Digest> {
     let mut file = path.held_regular_file()?;
+    file.seek(SeekFrom::Start(0)).map_err(|source| {
+        GeneratorError::with_source(
+            GeneratorErrorKind::SourceVerification,
+            "rewind held trusted browser executable",
+            path.canonical_path().display().to_string(),
+            source,
+        )
+    })?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -304,10 +322,55 @@ fn invalid_manifest(detail: impl Into<String>) -> GeneratorError {
 mod tests {
     use std::collections::BTreeSet;
     use std::ffi::OsString;
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{DRIVER_KEYS, effective_switches, fixed_environment, validate_received_switches};
+    use super::{
+        DRIVER_KEYS, TrustedBrowser, effective_switches, fixed_environment,
+        validate_received_switches,
+    };
     use crate::layout::{manifest, tests};
+    use crate::{CorpusLocation, GeneratorErrorKind, RelativePath};
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "surgeist-layout-browser-test-{}-{sequence:016x}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create browser test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).expect("remove browser test directory");
+        }
+    }
+
+    fn executable(path: &Path) {
+        fs::create_dir_all(path.parent().expect("browser parent")).expect("create browser parent");
+        fs::write(path, b"synthetic trusted browser\n").expect("write browser");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("make browser executable");
+    }
+
+    fn parsed_manifest(corpus: &Path) -> super::LayoutManifest {
+        let text = tests::manifest_text(tests::SHA1_REVISION, 1, "");
+        manifest::parse(text.as_bytes(), &corpus.join("corpus.toml")).expect("manifest")
+    }
 
     #[test]
     fn layout_browser_driver_switch_keys_are_exact() {
@@ -386,5 +449,58 @@ mod tests {
             second.keys().collect::<Vec<_>>()
         );
         assert_ne!(first["user-data-dir"], second["user-data-dir"]);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn layout_browser_intermediate_symlink_escape_is_invalid_path() {
+        let temporary = TestDirectory::new();
+        let owner = temporary.path().join("owner");
+        let corpus = owner.join("corpus");
+        let cache = owner.join("browser-cache");
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(&corpus).expect("create corpus");
+        fs::create_dir(&cache).expect("create cache");
+        fs::create_dir(&outside).expect("create outside");
+        executable(&outside.join("chromium"));
+        symlink(&outside, cache.join("escape")).expect("create intermediate symlink");
+        let location = CorpusLocation::new(&owner, &corpus).expect("location");
+        let manifest = parsed_manifest(&corpus);
+        let relative = RelativePath::new("browser-cache/escape/chromium").expect("browser path");
+
+        let error = TrustedBrowser::validate(&location, &manifest, &relative)
+            .expect_err("real path outside cache must be rejected");
+
+        assert_eq!(error.kind(), GeneratorErrorKind::InvalidPath);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn layout_browser_intermediate_path_drift_fails_closing_revalidation() {
+        let temporary = TestDirectory::new();
+        let owner = temporary.path().join("owner");
+        let corpus = owner.join("corpus");
+        let cache = owner.join("browser-cache");
+        let original = cache.join("live");
+        let displaced = cache.join("held");
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(&corpus).expect("create corpus");
+        fs::create_dir_all(&original).expect("create cache child");
+        fs::create_dir(&outside).expect("create outside");
+        executable(&original.join("chromium"));
+        executable(&outside.join("chromium"));
+        let location = CorpusLocation::new(&owner, &corpus).expect("location");
+        let manifest = parsed_manifest(&corpus);
+        let relative = RelativePath::new("browser-cache/live/chromium").expect("browser path");
+        let browser = TrustedBrowser::validate(&location, &manifest, &relative)
+            .expect("initial trusted browser");
+
+        fs::rename(&original, &displaced).expect("displace held cache child");
+        symlink(&outside, &original).expect("replace path with escaping symlink");
+        let error = browser
+            .closing_revalidate()
+            .expect_err("closing validation must detect intermediate drift");
+
+        assert_eq!(error.kind(), GeneratorErrorKind::SourceVerification);
     }
 }

@@ -3,15 +3,22 @@ use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
+
 use chromiumoxide::browser::Browser;
 use futures::{FutureExt, StreamExt};
 
 use crate::core::GenerationLease;
+#[cfg(test)]
+use crate::core::PRIVATE_FILE_MODE;
 use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, RelativePath, Result};
 
 use super::browser::{TrustedBrowser, chromium_config, effective_switches};
 use super::manifest::LayoutManifest;
-use super::profile::{ProfileJournal, ProfilePurpose, resolve_terminalization};
+use super::profile::{
+    ProfileAttempt, ProfileCreateContext, ProfileJournal, resolve_terminalization,
+};
 use super::selection::Fixture;
 use super::xml::{MeasuredLayout, Variant};
 
@@ -49,6 +56,62 @@ pub(super) struct MeasurementContext<'a> {
     pub(super) current_executable: &'a Path,
     pub(super) helper: &'a [u8],
     pub(super) base_style: &'a [u8],
+    pub(super) execution: &'a BrowserExecution,
+}
+
+pub(super) enum BrowserExecution {
+    Production,
+    #[cfg(test)]
+    Test(TestGenerationHost),
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TestBrowserPlan {
+    Success,
+    BrowserFailure,
+    RetryOnce,
+    AlwaysFail,
+    DependencyPanic,
+    OwnedPanic,
+    OwnedPanicWithCleanupFailure,
+    ClosingRevalidationFailure,
+    ProfileIdentityDrift,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct TestGenerationHost {
+    plan: TestBrowserPlan,
+    attempts: Arc<Mutex<Vec<(u64, u64)>>>,
+}
+
+#[cfg(test)]
+impl TestGenerationHost {
+    pub(super) fn new(plan: TestBrowserPlan) -> Self {
+        Self {
+            plan,
+            attempts: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub(super) const fn plan(&self) -> TestBrowserPlan {
+        self.plan
+    }
+
+    pub(super) fn attempts(&self) -> Vec<(u64, u64)> {
+        self.attempts
+            .lock()
+            .expect("test generation attempt trace lock")
+            .clone()
+    }
+
+    fn record_attempt(&self, batch: u64, retry: u64) {
+        self.attempts
+            .lock()
+            .expect("test generation attempt trace lock")
+            .push((batch, retry));
+    }
 }
 
 pub(super) async fn measure(
@@ -67,17 +130,13 @@ pub(super) async fn measure(
             }
             context.browser.closing_revalidate()?;
             let attempt = run_attempt(
-                context.location,
-                context.lease,
-                context.browser,
-                context.manifest,
-                context.current_executable,
-                context.helper,
-                context.base_style,
-                u64::try_from(batch_ordinal)
-                    .map_err(|_| generation_error("layout batch ordinal exceeds u64"))?,
-                retry_ordinal,
-                &pending,
+                &context,
+                MeasurementAttempt {
+                    batch_ordinal: u64::try_from(batch_ordinal)
+                        .map_err(|_| generation_error("layout batch ordinal exceeds u64"))?,
+                    retry_ordinal,
+                    fixtures: &pending,
+                },
             )
             .await;
             let mut retry = Vec::new();
@@ -121,62 +180,165 @@ pub(super) async fn measure(
 type AttemptOutcomes =
     BTreeMap<RelativePath, std::result::Result<Vec<(Variant, VariantOutcome)>, String>>;
 
-#[allow(clippy::too_many_arguments)]
-async fn run_attempt(
-    location: &CorpusLocation,
-    lease: &GenerationLease,
-    trusted: &TrustedBrowser,
-    manifest: &LayoutManifest,
-    current_executable: &Path,
-    helper: &[u8],
-    base_style: &[u8],
+struct MeasurementAttempt<'a> {
     batch_ordinal: u64,
     retry_ordinal: u64,
-    fixtures: &[&Fixture],
+    fixtures: &'a [&'a Fixture],
+}
+
+async fn run_attempt(
+    context: &MeasurementContext<'_>,
+    attempt: MeasurementAttempt<'_>,
 ) -> Result<AttemptOutcomes> {
-    let launch_strings = effective_switches(manifest, Path::new("profile"))?
+    let launch_strings = effective_switches(context.manifest, Path::new("profile"))?
         .into_iter()
         .map(|(key, value)| value.map_or(key.clone(), |value| format!("{key}={value}")))
         .collect();
     let journal = ProfileJournal::create(
-        location,
-        lease,
-        trusted,
-        manifest,
-        ProfilePurpose::Measurement,
-        Some(batch_ordinal),
-        Some(retry_ordinal),
-        launch_strings,
+        ProfileCreateContext {
+            location: context.location,
+            lease: context.lease,
+            browser: context.browser,
+            manifest: context.manifest,
+        },
+        ProfileAttempt::Measurement {
+            batch_ordinal: attempt.batch_ordinal,
+            retry_ordinal: attempt.retry_ordinal,
+            launch_strings,
+        },
     )?;
     let prepared = (|| {
         let capsule = journal.capsule_json()?;
-        journal.validates_prefix(lease.rooted())?;
-        chromium_config(
-            current_executable,
-            journal.profile_path(),
-            manifest,
-            &capsule,
-        )
+        journal.validates_prefix(context.lease.rooted())?;
+        let config = match context.execution {
+            BrowserExecution::Production => Some(chromium_config(
+                context.current_executable,
+                journal.profile_path(),
+                context.manifest,
+                &capsule,
+            )?),
+            #[cfg(test)]
+            BrowserExecution::Test(_) => None,
+        };
+        Ok::<_, GeneratorError>((capsule, config))
     })();
-    let config = match prepared {
-        Ok(config) => config,
+    let (_capsule, config) = match prepared {
+        Ok(prepared) => prepared,
         Err(error) => {
-            journal.terminalize_with_forced_group_kill(lease.rooted())?;
+            journal.terminalize_with_forced_group_kill(context.lease.rooted())?;
             return Err(error);
         }
     };
-    let outcome = AssertUnwindSafe(browser_attempt(
-        config, location, manifest, helper, base_style, fixtures,
-    ))
-    .catch_unwind()
-    .await;
-    let terminal = journal.terminalize_with_forced_group_kill(lease.rooted());
+
+    let outcome = match context.execution {
+        BrowserExecution::Production => {
+            AssertUnwindSafe(browser_attempt(
+                config.expect("production measurement prepared Chromiumoxide config"),
+                context.location,
+                context.manifest,
+                context.helper,
+                context.base_style,
+                attempt.fixtures,
+            ))
+            .catch_unwind()
+            .await
+        }
+        #[cfg(test)]
+        BrowserExecution::Test(host) => {
+            AssertUnwindSafe(test_browser_attempt(
+                context,
+                &_capsule,
+                host,
+                &attempt,
+                journal.journal_path(),
+            ))
+            .catch_unwind()
+            .await
+        }
+    };
+    let terminal = journal.terminalize_with_forced_group_kill(context.lease.rooted());
     match outcome {
         Ok(result) => resolve_terminalization(result, terminal),
         Err(payload) => {
             let _ = terminal;
             std::panic::resume_unwind(payload)
         }
+    }
+}
+
+#[cfg(test)]
+async fn test_browser_attempt(
+    context: &MeasurementContext<'_>,
+    capsule: &str,
+    host: &TestGenerationHost,
+    attempt: &MeasurementAttempt<'_>,
+    journal_path: &str,
+) -> Result<AttemptOutcomes> {
+    host.record_attempt(attempt.batch_ordinal, attempt.retry_ordinal);
+    let mode = if host.plan() == TestBrowserPlan::BrowserFailure {
+        super::supervisor::TestBrowserMode::Failure
+    } else {
+        super::supervisor::TestBrowserMode::Success
+    };
+    run_test_supervisor(context.current_executable, capsule, mode).await?;
+    if host.plan() == TestBrowserPlan::OwnedPanicWithCleanupFailure {
+        context.lease.rooted().create_file_exclusive(
+            &format!("{journal_path}/unexpected"),
+            b"retained cleanup evidence",
+            PRIVATE_FILE_MODE,
+        )?;
+    }
+    match host.plan() {
+        TestBrowserPlan::DependencyPanic => {
+            return Err(dependency_panic(
+                "crate-owned fake browser dependency",
+                Box::new("synthetic dependency panic"),
+            ));
+        }
+        TestBrowserPlan::OwnedPanic | TestBrowserPlan::OwnedPanicWithCleanupFailure => {
+            std::panic::panic_any("synthetic owned generation panic");
+        }
+        _ => {}
+    }
+
+    let retryable_failure = host.plan() == TestBrowserPlan::AlwaysFail
+        || (host.plan() == TestBrowserPlan::RetryOnce && attempt.retry_ordinal == 0);
+    Ok(attempt
+        .fixtures
+        .iter()
+        .map(|fixture| {
+            let outcome = if retryable_failure {
+                Err("synthetic open-load-reset-timeout failure".to_owned())
+            } else {
+                Ok(Variant::ALL
+                    .into_iter()
+                    .map(|variant| (variant, VariantOutcome::Generated(MeasuredLayout::zero())))
+                    .collect())
+            };
+            (fixture.source().clone(), outcome)
+        })
+        .collect())
+}
+
+#[cfg(test)]
+pub(super) async fn run_test_supervisor(
+    executable: &Path,
+    capsule: &str,
+    mode: super::supervisor::TestBrowserMode,
+) -> Result<()> {
+    let mut command = super::supervisor::test_process_command(executable, capsule, mode);
+    let status = tokio::task::spawn_blocking(move || command.status())
+        .await
+        .map_err(process_source)?
+        .map_err(process_source)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(GeneratorError::new(
+            GeneratorErrorKind::Process,
+            "run crate-owned fake browser supervisor",
+            format!("supervisor exited unsuccessfully: {status}"),
+        ))
     }
 }
 

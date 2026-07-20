@@ -30,6 +30,95 @@ pub(super) enum ProfilePurpose {
     Measurement,
 }
 
+pub(super) struct ProfileCreateContext<'a> {
+    pub(super) location: &'a CorpusLocation,
+    pub(super) lease: &'a GenerationLease,
+    pub(super) browser: &'a TrustedBrowser,
+    pub(super) manifest: &'a LayoutManifest,
+}
+
+pub(super) enum ProfileAttempt {
+    Version {
+        launch_strings: Vec<String>,
+    },
+    Measurement {
+        batch_ordinal: u64,
+        retry_ordinal: u64,
+        launch_strings: Vec<String>,
+    },
+}
+
+impl ProfileAttempt {
+    fn into_parts(self) -> Result<ProfileAttemptParts> {
+        match self {
+            Self::Version { launch_strings } => Ok(ProfileAttemptParts {
+                purpose: ProfilePurpose::Version,
+                batch_ordinal: None,
+                retry_ordinal: None,
+                launch_strings,
+            }),
+            Self::Measurement {
+                batch_ordinal,
+                retry_ordinal,
+                launch_strings,
+            } => {
+                validate_ordinals(
+                    ProfilePurpose::Measurement,
+                    Some(batch_ordinal),
+                    Some(retry_ordinal),
+                )?;
+                Ok(ProfileAttemptParts {
+                    purpose: ProfilePurpose::Measurement,
+                    batch_ordinal: Some(batch_ordinal),
+                    retry_ordinal: Some(retry_ordinal),
+                    launch_strings,
+                })
+            }
+        }
+    }
+}
+
+struct ProfileAttemptParts {
+    purpose: ProfilePurpose,
+    batch_ordinal: Option<u64>,
+    retry_ordinal: Option<u64>,
+    launch_strings: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ProfileCreateStep {
+    JournalDirectory,
+    IntentRecord,
+    TransitionLock,
+    ProfileDirectory,
+    HomeDirectory,
+    TemporaryDirectory,
+    XdgConfigDirectory,
+    XdgCacheDirectory,
+    XdgDataDirectory,
+    ProfileRecord,
+    JournalSync,
+    ParentSync,
+}
+
+#[cfg(test)]
+impl ProfileCreateStep {
+    pub(super) const ALL: [Self; 12] = [
+        Self::JournalDirectory,
+        Self::IntentRecord,
+        Self::TransitionLock,
+        Self::ProfileDirectory,
+        Self::HomeDirectory,
+        Self::TemporaryDirectory,
+        Self::XdgConfigDirectory,
+        Self::XdgCacheDirectory,
+        Self::XdgDataDirectory,
+        Self::ProfileRecord,
+        Self::JournalSync,
+        Self::ParentSync,
+    ];
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct IntentRecord {
@@ -124,19 +213,25 @@ pub(super) struct ProfileJournal {
 }
 
 impl ProfileJournal {
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn create(
-        location: &CorpusLocation,
-        lease: &GenerationLease,
-        browser: &TrustedBrowser,
-        manifest: &LayoutManifest,
-        purpose: ProfilePurpose,
-        batch_ordinal: Option<u64>,
-        retry_ordinal: Option<u64>,
-        launch_strings: Vec<String>,
+        context: ProfileCreateContext<'_>,
+        attempt: ProfileAttempt,
     ) -> Result<Self> {
-        validate_ordinals(purpose, batch_ordinal, retry_ordinal)?;
-        let rooted = lease.rooted();
+        Self::create_with_observer(context, attempt, |_| Ok(()))
+    }
+
+    fn create_with_observer(
+        context: ProfileCreateContext<'_>,
+        attempt: ProfileAttempt,
+        mut observe: impl FnMut(ProfileCreateStep) -> Result<()>,
+    ) -> Result<Self> {
+        let ProfileAttemptParts {
+            purpose,
+            batch_ordinal,
+            retry_ordinal,
+            launch_strings,
+        } = attempt.into_parts()?;
+        let rooted = context.lease.rooted();
         rooted.ensure_dir(".surgeist-generator/profiles", PRIVATE_DIRECTORY_MODE)?;
         rooted.ensure_dir(PROFILE_PARENT, PRIVATE_DIRECTORY_MODE)?;
         if !rooted.list_dir(PROFILE_PARENT)?.is_empty() {
@@ -149,11 +244,11 @@ impl ProfileJournal {
         let profile_token = new_token()?;
         let suffix = match purpose {
             ProfilePurpose::Version => {
-                format!("{}-version-{profile_token}", lease.token())
+                format!("{}-version-{profile_token}", context.lease.token())
             }
             ProfilePurpose::Measurement => format!(
                 "{}-batch-{}-retry-{}-{profile_token}",
-                lease.token(),
+                context.lease.token(),
                 batch_ordinal.expect("validated measurement batch"),
                 retry_ordinal.expect("validated measurement retry")
             ),
@@ -161,20 +256,21 @@ impl ProfileJournal {
         let name = format!("active-{suffix}");
         let path = format!("{PROFILE_PARENT}/{name}");
         let identity = rooted.create_dir_exclusive(&path, PRIVATE_DIRECTORY_MODE)?;
+        observe(ProfileCreateStep::JournalDirectory)?;
 
         let intent = IntentRecord {
             schema_version: 1,
             purpose,
-            authority_key: lease.authority_key().to_owned(),
+            authority_key: context.lease.authority_key().to_owned(),
             parent_pid: std::process::id(),
-            lease_token: lease.token().to_owned(),
+            lease_token: context.lease.token().to_owned(),
             profile_token: profile_token.clone(),
             batch_ordinal,
             retry_ordinal,
-            browser_path: browser.relative().clone(),
-            browser_identity: browser.identity().clone(),
-            browser_sha256: browser.digest().clone(),
-            launch_profile_sha256: manifest.launch_digest.clone(),
+            browser_path: context.browser.relative().clone(),
+            browser_identity: context.browser.identity().clone(),
+            browser_sha256: context.browser.digest().clone(),
+            launch_profile_sha256: context.manifest.launch_digest.clone(),
         };
         let intent_bytes = canonical_json_line(&intent, "serialize layout profile intent")?;
         rooted.create_file_exclusive(
@@ -182,19 +278,29 @@ impl ProfileJournal {
             &intent_bytes,
             PRIVATE_FILE_MODE,
         )?;
+        observe(ProfileCreateStep::IntentRecord)?;
         rooted.create_file_exclusive(
             &format!("{path}/transition.lock"),
             LOCK_HEADER,
             PRIVATE_FILE_MODE,
         )?;
+        observe(ProfileCreateStep::TransitionLock)?;
         let profile_relative = format!("{path}/profile");
         let profile_identity =
             rooted.create_dir_exclusive(&profile_relative, PRIVATE_DIRECTORY_MODE)?;
-        for directory in ["home", "tmp", "xdg-config", "xdg-cache", "xdg-data"] {
+        observe(ProfileCreateStep::ProfileDirectory)?;
+        for (directory, step) in [
+            ("home", ProfileCreateStep::HomeDirectory),
+            ("tmp", ProfileCreateStep::TemporaryDirectory),
+            ("xdg-config", ProfileCreateStep::XdgConfigDirectory),
+            ("xdg-cache", ProfileCreateStep::XdgCacheDirectory),
+            ("xdg-data", ProfileCreateStep::XdgDataDirectory),
+        ] {
             rooted.create_dir_exclusive(
                 &format!("{profile_relative}/{directory}"),
                 PRIVATE_DIRECTORY_MODE,
             )?;
+            observe(step)?;
         }
         let profile = ProfileRecord {
             schema_version: 1,
@@ -208,20 +314,23 @@ impl ProfileJournal {
             &profile_bytes,
             PRIVATE_FILE_MODE,
         )?;
+        observe(ProfileCreateStep::ProfileRecord)?;
         rooted.sync_dir(&path)?;
+        observe(ProfileCreateStep::JournalSync)?;
         rooted.sync_dir(PROFILE_PARENT)?;
+        observe(ProfileCreateStep::ParentSync)?;
 
-        let profile_path = location.corpus_root().join(&profile_relative);
+        let profile_path = context.location.corpus_root().join(&profile_relative);
         let capsule = LaunchCapsule {
             schema_version: 1,
-            owner_root_hex: encode_path(location.owner_root()),
-            corpus_root_hex: encode_path(location.corpus_root()),
+            owner_root_hex: encode_path(context.location.owner_root()),
+            corpus_root_hex: encode_path(context.location.corpus_root()),
             journal_path: RelativePath::new(&path)?,
             intent_sha256: Sha256Digest::from_bytes(&intent_bytes),
             profile_sha256: Sha256Digest::from_bytes(&profile_bytes),
             parent_pid: std::process::id(),
             profile_token,
-            browser_path: browser.relative().clone(),
+            browser_path: context.browser.relative().clone(),
             purpose,
             launch_strings,
         };
@@ -235,6 +344,15 @@ impl ProfileJournal {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn create_observed(
+        context: ProfileCreateContext<'_>,
+        attempt: ProfileAttempt,
+        observe: impl FnMut(ProfileCreateStep) -> Result<()>,
+    ) -> Result<Self> {
+        Self::create_with_observer(context, attempt, observe)
+    }
+
     pub(super) fn capsule_json(&self) -> Result<String> {
         serde_json::to_string(&self.capsule)
             .map_err(|source| artifact_source("serialize layout launch capsule", source))
@@ -242,6 +360,11 @@ impl ProfileJournal {
 
     pub(super) fn profile_path(&self) -> &Path {
         &self.profile_path
+    }
+
+    #[cfg(test)]
+    pub(super) fn journal_path(&self) -> &str {
+        &self.path
     }
 
     pub(super) fn terminalize(self, rooted: &RootedFs) -> Result<()> {
@@ -1112,13 +1235,4 @@ pub(super) fn test_cleanup_path(path: &str) -> Result<String> {
 #[cfg(test)]
 pub(super) fn test_group_is_dead(group: u32) -> Result<bool> {
     probe_group(group).map(|state| state == GroupState::Dead)
-}
-
-#[cfg(test)]
-pub(super) fn test_erase_opaque(
-    rooted: &RootedFs,
-    path: &str,
-    identity: &HeldIdentity,
-) -> Result<()> {
-    erase_opaque(rooted, path, identity)
 }

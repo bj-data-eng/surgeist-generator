@@ -503,6 +503,29 @@ impl BoundPath {
         Ok(self.descriptor_ancestor_of(other)? || other.descriptor_ancestor_of(self)?)
     }
 
+    /// Returns whether this existing binding is a real strict descendant of
+    /// another existing binding in both canonical and descriptor ancestry.
+    #[cfg(feature = "layout-browser")]
+    pub(crate) fn is_strict_descendant_of(&self, ancestor: &Self) -> bool {
+        if !self.remaining.is_empty()
+            || !ancestor.remaining.is_empty()
+            || self.canonical_path == ancestor.canonical_path
+            || !self.canonical_path.starts_with(&ancestor.canonical_path)
+        {
+            return false;
+        }
+
+        self.components
+            .iter()
+            .enumerate()
+            .any(|(index, component)| {
+                ancestor
+                    .existing_identity()
+                    .same_object(&component.identity)
+                    && index + 1 < self.components.len()
+            })
+    }
+
     fn same_binding(&self, other: &Self) -> bool {
         self.canonical_path == other.canonical_path
             && self.remaining == other.remaining
