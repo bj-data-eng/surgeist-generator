@@ -126,13 +126,8 @@ fn inspect_html(rooted: &RootedFs, manifest: &LayoutManifest) -> Result<HtmlStat
         .read_file(&format!("{HTML_ROOT}/{SIDECAR_FILE}"), CORPUS_FILE_MODE)
         .map_err(html_io)?;
     let sidecar = TaffyImportSidecar::parse_canonical(&sidecar_bytes)?;
-    if sidecar.revision() != &manifest.revision
-        || sidecar.source_file_count() != manifest.expected_source_files
-    {
-        return Err(verification(
-            "Taffy import sidecar is stale against the corpus manifest",
-        ));
-    }
+    let sidecar_is_stale = sidecar.revision() != &manifest.revision
+        || sidecar.source_file_count() != manifest.expected_source_files;
 
     let taffy_paths = sidecar
         .files()
@@ -217,6 +212,11 @@ fn inspect_html(rooted: &RootedFs, manifest: &LayoutManifest) -> Result<HtmlStat
                 disposition: desired_disposition(case.status, case.id.clone(), case.reason.clone()),
             },
         );
+    }
+    if sidecar_is_stale {
+        return Err(verification(
+            "Taffy import sidecar is stale against the corpus manifest",
+        ));
     }
     Ok(HtmlState {
         inventory,

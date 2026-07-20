@@ -440,6 +440,7 @@ status = "active"
     fn assert_preserved(&self, expected: Option<GeneratorErrorKind>) {
         let before = snapshot(&self.root);
         let result = self.check();
+        assert_eq!(snapshot(&self.root), before);
         match expected {
             None => result.expect("current layout corpus"),
             Some(kind) => {
@@ -447,7 +448,6 @@ status = "active"
                 assert_eq!(error.kind(), kind, "unexpected diagnostic: {error}");
             }
         }
-        assert_eq!(snapshot(&self.root), before);
     }
 }
 
@@ -685,6 +685,31 @@ fn layout_check_corpus_import_and_helper_states_keep_exact_error_kinds() {
         .join("scripts/gentest/test_helper.js");
     fs::set_permissions(&helper, fs::Permissions::from_mode(0o600)).expect("malform helper mode");
     malformed_helper.assert_preserved(Some(GeneratorErrorKind::InvalidInventory));
+}
+
+#[test]
+fn layout_check_corpus_stale_sidecar_does_not_mask_unknown_html() {
+    let unknown = Fixture::current();
+    unknown.write_manifest(2);
+    write_file(&unknown.corpus.join("html/unknown.html"), b"unknown\n");
+    unknown.assert_preserved(Some(GeneratorErrorKind::InvalidInventory));
+}
+
+#[test]
+fn layout_check_corpus_stale_sidecar_does_not_mask_authored_taffy_collision() {
+    let collision = Fixture::current();
+    let cases = r#"[[cases]]
+id = "authored/collision"
+source_root = "surgeist"
+source = "grid/basic.html"
+generator = "constrained-html"
+status = "active"
+"#;
+    write_file(
+        &collision.corpus.join("corpus.toml"),
+        manifest_text(&"2".repeat(40), 1, cases).as_bytes(),
+    );
+    collision.assert_preserved(Some(GeneratorErrorKind::InvalidInventory));
 }
 
 #[test]
