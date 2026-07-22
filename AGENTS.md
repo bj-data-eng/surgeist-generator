@@ -1,6 +1,7 @@
 # surgeist-generator Repository Guide
 
-Use `$surgeist-agent` for every task in this repository.
+Use the installed `surgeist-agent` plugin for every task in this repository.
+Select the task-appropriate focused skill.
 
 ## Authority Split
 
@@ -9,15 +10,16 @@ mapping from mutable leaf facts to authoritative sources, the intended crate and
 architecture boundary, and the configured local command inventory. The sources
 named below own their current values.
 
-`$surgeist-agent` is the sole Surgeist workflow authority. It owns scope control,
-planning, debugging and TDD, worker/reviewer gates, external-software permission,
+The installed `surgeist-agent` plugin is the sole Surgeist workflow authority.
+Its selected skill owns scope control, planning, debugging and TDD,
+worker/reviewer gates, external-software permission,
 the absolute unsafe prohibition, Git landing and publication, and cross-repository
 handoffs. This file does not redefine those workflows or grant authority to
 mutate, install, commit, or publish.
 
 Resolve an apparent conflict by domain: use this file and the sources below for
-mutable repository facts; use `$surgeist-agent` for workflow. Higher-priority user
-and system instructions still apply. Do not import another general development
+mutable repository facts; use the selected plugin skill for workflow.
+Higher-priority user and system instructions still apply. Do not import another
 workflow.
 
 ## Repository Identity And Ownership
@@ -83,7 +85,7 @@ no copies.
 
 ## Command Inventory
 
-These commands describe local verification capability. `$surgeist-agent`
+These commands describe local verification capability. The selected plugin skill
 determines the exact gate, order, feature matrix, and whether already-present
 tooling can run without unauthorized acquisition.
 
@@ -110,9 +112,10 @@ cargo audit --no-fetch --stale
 ```
 
 The ignored invocation is list-only inventory evidence; never remove `--list`
-without the separate explicit authorization required by `$surgeist-agent` and
-the active cycle contract. Offline/no-fetch flags prove use of already-present
-artifacts; they do not authorize installing or downloading missing software.
+without the separate explicit authorization required by the selected plugin
+skill and the active cycle contract. Offline/no-fetch flags prove use of
+already-present artifacts; they do not authorize installing or downloading
+missing software.
 
 Discovery is complete when the owning repository, public front door, dependency
 and feature facts, verification sources, API-artifact owner, and applicable
