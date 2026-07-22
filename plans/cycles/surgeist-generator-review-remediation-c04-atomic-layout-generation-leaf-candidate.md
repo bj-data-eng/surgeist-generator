@@ -9,14 +9,14 @@
 - Published prerequisite: C03 at the cycle base, with local `main`, its authority
   tracking ref, and observed authority-remote `main` equal at readback.
 - Reviewed specification:
-  `plans/specs/2026-07-17-surgeist-generator-review-remediation.md` at
+  `plans/specs/surgeist-generator-review-remediation.md` at
   `d2fbbedb033177731af5487d3498ba7f14b721d8`, normalized semantic SHA-256
   `faa4320f1e06ad9c003f2525fcf7171e387458eacc4ec3fd0d2d88f7c0e1eb71`,
   review `CLEAN`. C04 implements its remaining SR-01/SR-02, layout portions of
   SR-03.1/SR-03.2, all SR-03.3, remaining SR-04.5/SR-04.6, SR-05.1/SR-05.2/
   SR-05.4, generation portions of SR-06.1/SR-06.3/SR-06.4, SR-08, and SR-09.
 - Reviewed sequence:
-  `plans/sequences/2026-07-17-surgeist-generator-review-remediation.md` C04 at
+  `plans/sequences/surgeist-generator-review-remediation.md` C04 at
   `faad9c1406b0cda68d9ce087a8cc3e06e6205360`, normalized semantic SHA-256
   `590c79d705cd9657a649b2a303e01437beda6facb538f08d85f86ae87392e3f6`,
   review `CLEAN`.
@@ -253,7 +253,7 @@ runs before the separately authorized terminal diagnostic.
     pass; lock regeneration leaves the committed graph/worktree unchanged;
   - `test "$(git ls-files plans/cycles | wc -l | tr -d ' ')" = 4`
   - `test "$(git ls-files plans | wc -l | tr -d ' ')" = 8`
-  - `git ls-files --error-unmatch plans/.gitkeep plans/2026-07-17-crate-baseline-review.md plans/specs/2026-07-17-surgeist-generator-review-remediation.md plans/sequences/2026-07-17-surgeist-generator-review-remediation.md plans/cycles/2026-07-17-surgeist-generator-review-remediation-c01-rooted-core-production-recovery.md plans/cycles/2026-07-17-surgeist-generator-review-remediation-c02-protected-source-css-vertical-slice.md plans/cycles/2026-07-17-surgeist-generator-review-remediation-c03-browser-free-layout-corpus-interface.md plans/cycles/2026-07-17-surgeist-generator-review-remediation-c04-atomic-layout-generation-leaf-candidate.md`
+  - `git ls-files --error-unmatch plans/.gitkeep plans/crate-baseline-review.md plans/specs/surgeist-generator-review-remediation.md plans/sequences/surgeist-generator-review-remediation.md plans/cycles/surgeist-generator-review-remediation-c01-rooted-core-production-recovery.md plans/cycles/surgeist-generator-review-remediation-c02-protected-source-css-vertical-slice.md plans/cycles/surgeist-generator-review-remediation-c03-browser-free-layout-corpus-interface.md plans/cycles/surgeist-generator-review-remediation-c04-atomic-layout-generation-leaf-candidate.md`
 - Dependencies: T02 and its fresh task review are clean.
 - Intended commit: `docs: finalize generator guidance and policy`.
 

@@ -12,7 +12,7 @@
   `efcb868905025270c875fc683d82cfba3c029080`; local `main`, `origin/main`, and
   authority-remote `main` were equal at the C01 readback.
 - Reviewed specification:
-  `plans/specs/2026-07-17-surgeist-generator-review-remediation.md`, CSS and
+  `plans/specs/surgeist-generator-review-remediation.md`, CSS and
   shared clauses of SR-01 and SR-02; SR-03.1 and SR-03.2 shared/CSS clauses;
   SR-04.5 CSS source, historical-inventory, selection, publication, and error
   clauses; SR-04.6 CSS linkage; the CSS edge of SR-05.1, SR-05.3, and CSS
@@ -23,7 +23,7 @@
   `9a1a148c198d39145017db769b9ab91025f1cc37719efc6d3c68ab998da7c524`,
   review `CLEAN`.
 - Reviewed implementation sequence:
-  `plans/sequences/2026-07-17-surgeist-generator-review-remediation.md`, entry
+  `plans/sequences/surgeist-generator-review-remediation.md`, entry
   C02, at commit `c7d3f010faf5769960df7c42c937924ebb4d2a39`, normalized
   semantic-content SHA-256
   `7bb79d1c0f9bd7c78593bff7ac9dbf60b3b5372f7852486b678e9ed4e31316c2`,
