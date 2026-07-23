@@ -9,7 +9,7 @@
 - Immutable implementation-series source base:
   `1e545530fb992e2e749f26a1ba7ac0d77ed85dd6`
 - Reviewed specification:
-  `plans/specs/surgeist-generator-review-remediation.md`, sections
+  `plans/specs/P01-I01-review-remediation.md`, sections
   SR-02 rows **Rooted lease-tree rejection**, **Model-only crash/bootstrap
   tests**, and the pre-existing portion of **Quality matrix**; SR-04.1 through
   SR-04.4; the transaction, lease, bootstrap, owner-record, rename-probe, and
@@ -19,7 +19,7 @@
   `9a1a148c198d39145017db769b9ab91025f1cc37719efc6d3c68ab998da7c524`,
   review `CLEAN`.
 - Reviewed implementation sequence:
-  `plans/sequences/surgeist-generator-review-remediation.md`, entry
+  `plans/sequences/P01-I01-S01-review-remediation-delivery.md`, entry
   C01, at commit `c7d3f010faf5769960df7c42c937924ebb4d2a39`, normalized
   semantic-content SHA-256
   `7bb79d1c0f9bd7c78593bff7ac9dbf60b3b5372f7852486b678e9ed4e31316c2`,

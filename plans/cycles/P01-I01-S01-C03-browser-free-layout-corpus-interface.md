@@ -12,7 +12,7 @@
   `90958976f171f2153d01efd993b958071d052831`; local `main`, `origin/main`, and
   authority-remote `main` were equal at the C02 readback.
 - Reviewed specification:
-  `plans/specs/surgeist-generator-review-remediation.md`, the
+  `plans/specs/P01-I01-review-remediation.md`, the
   browser-free layout clauses of SR-01 and the layout portion of SR-02
   **Missing domain surface**, **Tautological CLI test**, and affected quality
   obligations; layout import/check clauses of SR-03.1 and SR-03.2; SR-04.5
@@ -27,7 +27,7 @@
   `faa4320f1e06ad9c003f2525fcf7171e387458eacc4ec3fd0d2d88f7c0e1eb71`,
   review `CLEAN`.
 - Reviewed implementation sequence:
-  `plans/sequences/surgeist-generator-review-remediation.md`, entry
+  `plans/sequences/P01-I01-S01-review-remediation-delivery.md`, entry
   C03, at commit `faad9c1406b0cda68d9ce087a8cc3e06e6205360`, normalized
   semantic-content SHA-256
   `590c79d705cd9657a649b2a303e01437beda6facb538f08d85f86ae87392e3f6`,

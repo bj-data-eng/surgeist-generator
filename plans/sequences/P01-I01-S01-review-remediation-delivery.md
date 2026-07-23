@@ -10,7 +10,7 @@
   `plans/crate-baseline-review.md` at commit
   `05293743a551454adcf63345e80ef0d3982786b1`.
 - Clean reviewed specification:
-  `plans/specs/surgeist-generator-review-remediation.md` at commit
+  `plans/specs/P01-I01-review-remediation.md` at commit
   `d2fbbedb033177731af5487d3498ba7f14b721d8`, normalized semantic-content
   SHA-256
   `faa4320f1e06ad9c003f2525fcf7171e387458eacc4ec3fd0d2d88f7c0e1eb71`.
