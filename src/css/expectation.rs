@@ -9,7 +9,6 @@ use crate::{
     Sha256Digest, SourceRevision,
 };
 
-use super::case::CssCaseId;
 use super::fixture::ValidatedImport;
 use super::manifest::CssManifest;
 
@@ -42,7 +41,7 @@ struct ExpectationFile<'a> {
 
 #[derive(Serialize)]
 struct ExpectationCase {
-    id: CssCaseId,
+    id: String,
     context: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     label: Option<String>,
@@ -131,12 +130,23 @@ impl Serialize for CanonicalValue {
 }
 
 struct RawFixture {
-    ordinary: Vec<(String, RawOrdinaryCase)>,
-    errors: Vec<RawErrorCase>,
+    groups: Vec<FixtureGroup>,
 }
 
-struct RawOrdinaryCase {
+struct FixtureGroup {
+    label: String,
+    members: FixtureMembers,
+}
+
+enum FixtureMembers {
+    Singleton(CaseMember),
+    Array(Vec<CaseMember>),
+    LegacyErrorArray(Vec<RawErrorCase>),
+}
+
+struct CaseMember {
     source: String,
+    error_truthy: bool,
     options: Option<CanonicalObject>,
     generate: Option<String>,
 }
@@ -176,45 +186,7 @@ pub(super) fn derive(
             .next()
             .ok_or_else(|| invalid_inventory("CSS fixture path has no context component"))?
             .to_owned();
-        let mut cases = Vec::with_capacity(raw.ordinary.len() + raw.errors.len());
-        for (label, ordinary) in raw.ordinary {
-            let id = CssCaseId::new(
-                format!(
-                    "{}#/{}",
-                    fixture.path.as_str(),
-                    escape_json_pointer_token(&label)
-                ),
-                &fixture.path,
-            )?;
-            cases.push(ExpectationCase {
-                id,
-                context: context.clone(),
-                label: Some(label),
-                input: ordinary.source,
-                options: ordinary.options,
-                upstream_outcome: UpstreamOutcome::Parsed,
-                canonical_css: ordinary.generate,
-                status: CaseDisposition::Active,
-                reason: None,
-            });
-        }
-        for (index, error) in raw.errors.into_iter().enumerate() {
-            let id = CssCaseId::new(
-                format!("{}#/error/{index}", fixture.path.as_str()),
-                &fixture.path,
-            )?;
-            cases.push(ExpectationCase {
-                id,
-                context: context.clone(),
-                label: None,
-                input: error.source,
-                options: None,
-                upstream_outcome: UpstreamOutcome::Rejected,
-                canonical_css: None,
-                status: CaseDisposition::Active,
-                reason: None,
-            });
-        }
+        let mut cases = derive_fixture_cases(raw, &fixture.path, &context);
         if cases.is_empty() {
             return Err(invalid_inventory(format!(
                 "CSS fixture derives no cases: {}",
@@ -233,7 +205,7 @@ pub(super) fn derive(
                 let record = record
                     .bind(&fixture.path)
                     .map_err(|error| invalid_inventory(error.to_string()))?;
-                case.id = record.case_id().clone();
+                case.id = record.case_id().as_str().to_owned();
                 case.status = record.disposition();
                 case.reason = record.reason().map(str::to_owned);
             }
@@ -288,6 +260,87 @@ pub(super) fn derive(
     Ok(DerivedExpectations { artifacts, counts })
 }
 
+fn derive_fixture_cases(
+    raw: RawFixture,
+    fixture_path: &RelativePath,
+    context: &str,
+) -> Vec<ExpectationCase> {
+    let mut cases = Vec::new();
+    for group in raw.groups {
+        match group.members {
+            FixtureMembers::Singleton(member) => {
+                cases.push(non_legacy_case(
+                    fixture_path,
+                    context,
+                    &group.label,
+                    None,
+                    member,
+                ));
+            }
+            FixtureMembers::Array(members) => {
+                for (index, member) in members.into_iter().enumerate() {
+                    cases.push(non_legacy_case(
+                        fixture_path,
+                        context,
+                        &group.label,
+                        Some(index),
+                        member,
+                    ));
+                }
+            }
+            FixtureMembers::LegacyErrorArray(errors) => {
+                for (index, error) in errors.into_iter().enumerate() {
+                    cases.push(ExpectationCase {
+                        id: format!("{}#/error/{index}", fixture_path.as_str()),
+                        context: context.to_owned(),
+                        label: None,
+                        input: error.source,
+                        options: None,
+                        upstream_outcome: UpstreamOutcome::Rejected,
+                        canonical_css: None,
+                        status: CaseDisposition::Active,
+                        reason: None,
+                    });
+                }
+            }
+        }
+    }
+    cases
+}
+
+fn non_legacy_case(
+    fixture_path: &RelativePath,
+    context: &str,
+    label: &str,
+    index: Option<usize>,
+    member: CaseMember,
+) -> ExpectationCase {
+    let mut id = format!(
+        "{}#/{}",
+        fixture_path.as_str(),
+        escape_json_pointer_token(label)
+    );
+    if let Some(index) = index {
+        id.push('/');
+        id.push_str(&index.to_string());
+    }
+    ExpectationCase {
+        id,
+        context: context.to_owned(),
+        label: Some(label.to_owned()),
+        input: member.source,
+        options: member.options,
+        upstream_outcome: if member.error_truthy {
+            UpstreamOutcome::Rejected
+        } else {
+            UpstreamOutcome::Parsed
+        },
+        canonical_css: member.generate,
+        status: CaseDisposition::Active,
+        reason: None,
+    }
+}
+
 pub(super) fn validate_persisted(
     bytes: &[u8],
     fixture_path: &RelativePath,
@@ -340,9 +393,9 @@ pub(super) fn validate_persisted(
         .next()
         .ok_or_else(|| invalid_inventory("CSS expectation path has no context component"))?;
     let mut prior_id = None::<&str>;
-    let mut rejected_indices = BTreeSet::new();
+    let mut legacy_error_indices = BTreeSet::new();
+    let mut ordinary_groups = BTreeMap::new();
     for case in &persisted.cases {
-        CssCaseId::new(&case.id, fixture_path)?;
         if prior_id.is_some_and(|prior| prior >= case.id.as_str()) {
             return Err(invalid_inventory(format!(
                 "CSS expectation case IDs are not strictly increasing: {}",
@@ -358,58 +411,131 @@ pub(super) fn validate_persisted(
                 case.id
             )));
         }
-        match case.upstream_outcome {
-            PersistedUpstreamOutcome::Parsed => {
-                let label = case.label.as_deref().ok_or_else(|| {
-                    invalid_inventory(format!("parsed CSS expectation has no label: {}", case.id))
-                })?;
-                let expected_id = format!(
-                    "{}#/{}",
-                    fixture_path.as_str(),
-                    escape_json_pointer_token(label)
-                );
-                if case.id != expected_id {
-                    return Err(invalid_inventory(format!(
-                        "parsed CSS expectation ID does not match its label: {}",
-                        case.id
-                    )));
-                }
-            }
-            PersistedUpstreamOutcome::Rejected => {
-                if case.label.is_some() || case.options.is_some() || case.canonical_css.is_some() {
-                    return Err(invalid_inventory(format!(
-                        "rejected CSS expectation contains parsed-only fields: {}",
-                        case.id
-                    )));
-                }
-                let prefix = format!("{}#/error/", fixture_path.as_str());
-                let index = case
-                    .id
-                    .strip_prefix(&prefix)
-                    .and_then(parse_canonical_index)
-                    .ok_or_else(|| {
-                        invalid_inventory(format!(
-                            "rejected CSS expectation ID is invalid: {}",
-                            case.id
-                        ))
-                    })?;
-                if !rejected_indices.insert(index) {
-                    return Err(invalid_inventory(format!(
-                        "duplicate rejected CSS expectation index: {index}"
-                    )));
-                }
-            }
-        }
+        validate_persisted_case_shape(
+            case,
+            fixture_path,
+            &mut ordinary_groups,
+            &mut legacy_error_indices,
+        )?;
     }
-    if rejected_indices
+    if legacy_error_indices
         .iter()
         .copied()
-        .ne(0..rejected_indices.len())
+        .ne(0..legacy_error_indices.len())
     {
         return Err(invalid_inventory(format!(
             "rejected CSS expectation indices are not contiguous: {}",
             fixture_path.as_str()
         )));
+    }
+    for (label, group) in ordinary_groups {
+        if let PersistedGroupShape::Array(indices) = group
+            && indices.iter().copied().ne(0..indices.len())
+        {
+            return Err(invalid_inventory(format!(
+                "CSS expectation group indices are not contiguous for label: {label}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+enum PersistedGroupShape {
+    Singleton,
+    Array(BTreeSet<usize>),
+}
+
+fn validate_persisted_case_shape(
+    case: &PersistedExpectationCase,
+    fixture_path: &RelativePath,
+    ordinary_groups: &mut BTreeMap<String, PersistedGroupShape>,
+    legacy_error_indices: &mut BTreeSet<usize>,
+) -> Result<()> {
+    if let Some(label) = case.label.as_deref() {
+        return record_ordinary_group_case(case, fixture_path, label, ordinary_groups);
+    }
+    if matches!(case.upstream_outcome, PersistedUpstreamOutcome::Parsed) {
+        return Err(invalid_inventory(format!(
+            "parsed CSS expectation has no label: {}",
+            case.id
+        )));
+    }
+    if case.options.is_some() || case.canonical_css.is_some() {
+        return Err(invalid_inventory(format!(
+            "legacy rejected CSS expectation contains ordinary fields: {}",
+            case.id
+        )));
+    }
+    let prefix = format!("{}#/error/", fixture_path.as_str());
+    let index = case
+        .id
+        .strip_prefix(&prefix)
+        .and_then(parse_canonical_index)
+        .ok_or_else(|| {
+            invalid_inventory(format!(
+                "legacy rejected CSS expectation ID is invalid: {}",
+                case.id
+            ))
+        })?;
+    if !legacy_error_indices.insert(index) {
+        return Err(invalid_inventory(format!(
+            "duplicate rejected CSS expectation index: {index}"
+        )));
+    }
+    Ok(())
+}
+
+fn record_ordinary_group_case(
+    case: &PersistedExpectationCase,
+    fixture_path: &RelativePath,
+    label: &str,
+    groups: &mut BTreeMap<String, PersistedGroupShape>,
+) -> Result<()> {
+    use std::collections::btree_map::Entry;
+
+    let base = format!(
+        "{}#/{}",
+        fixture_path.as_str(),
+        escape_json_pointer_token(label)
+    );
+    let index = if case.id == base {
+        None
+    } else {
+        case.id
+            .strip_prefix(&format!("{base}/"))
+            .and_then(parse_canonical_index)
+            .map(Some)
+            .ok_or_else(|| {
+                invalid_inventory(format!(
+                    "CSS expectation ID does not match its label: {}",
+                    case.id
+                ))
+            })?
+    };
+    match (groups.entry(label.to_owned()), index) {
+        (Entry::Vacant(entry), None) => {
+            entry.insert(PersistedGroupShape::Singleton);
+        }
+        (Entry::Vacant(entry), Some(index)) => {
+            entry.insert(PersistedGroupShape::Array(BTreeSet::from([index])));
+        }
+        (Entry::Occupied(_), None) => {
+            return Err(invalid_inventory(format!(
+                "CSS expectation mixes singleton and grouped IDs for label: {label}"
+            )));
+        }
+        (Entry::Occupied(mut entry), Some(index)) => {
+            let PersistedGroupShape::Array(indices) = entry.get_mut() else {
+                return Err(invalid_inventory(format!(
+                    "CSS expectation mixes singleton and grouped IDs for label: {label}"
+                )));
+            };
+            if !indices.insert(index) {
+                return Err(invalid_inventory(format!(
+                    "duplicate CSS expectation group index: {label}/{index}"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -541,6 +667,18 @@ impl<'de> Deserialize<'de> for CanonicalValue {
     }
 }
 
+impl CanonicalValue {
+    fn is_javascript_truthy(&self) -> bool {
+        match self {
+            Self::Null => false,
+            Self::Bool(value) => *value,
+            Self::Number(value) => value.as_f64().is_some_and(|number| number != 0.0),
+            Self::String(value) => !value.is_empty(),
+            Self::Array(_) | Self::Object(_) => true,
+        }
+    }
+}
+
 struct CanonicalValueVisitor;
 
 impl<'de> Visitor<'de> for CanonicalValueVisitor {
@@ -666,22 +804,11 @@ impl<'de> Deserialize<'de> for RawFixture {
             where
                 A: MapAccess<'de>,
             {
-                let mut ordinary = Vec::new();
-                let mut errors = None;
+                let mut groups = Vec::new();
                 while let Some(label) = map.next_key::<String>()? {
-                    if label == "error" {
-                        if errors.is_some() {
-                            return Err(serde::de::Error::duplicate_field("error"));
-                        }
-                        errors = Some(map.next_value::<Vec<RawErrorCase>>()?);
-                    } else {
-                        ordinary.push((label, map.next_value::<RawOrdinaryCase>()?));
-                    }
+                    groups.push(map.next_value_seed(FixtureGroupSeed { label })?);
                 }
-                Ok(RawFixture {
-                    ordinary,
-                    errors: errors.unwrap_or_default(),
-                })
+                Ok(RawFixture { groups })
             }
         }
 
@@ -689,76 +816,154 @@ impl<'de> Deserialize<'de> for RawFixture {
     }
 }
 
-impl<'de> Deserialize<'de> for RawOrdinaryCase {
+struct FixtureGroupSeed {
+    label: String,
+}
+
+impl<'de> DeserializeSeed<'de> for FixtureGroupSeed {
+    type Value = FixtureGroup;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(FixtureGroupVisitor { label: self.label })
+    }
+}
+
+struct FixtureGroupVisitor {
+    label: String,
+}
+
+impl<'de> Visitor<'de> for FixtureGroupVisitor {
+    type Value = FixtureGroup;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a CSSTree case object or array")
+    }
+
+    fn visit_map<A>(self, map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        Ok(FixtureGroup {
+            label: self.label,
+            members: FixtureMembers::Singleton(CaseMember::from_map(map)?),
+        })
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let members = if self.label == "error" {
+            let mut members = Vec::new();
+            while let Some(member) = sequence.next_element::<RawErrorCase>()? {
+                members.push(member);
+            }
+            FixtureMembers::LegacyErrorArray(members)
+        } else {
+            let mut members = Vec::new();
+            while let Some(member) = sequence.next_element::<CaseMember>()? {
+                members.push(member);
+            }
+            FixtureMembers::Array(members)
+        };
+        Ok(FixtureGroup {
+            label: self.label,
+            members,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for CaseMember {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        struct RawOrdinaryVisitor;
+        struct CaseMemberVisitor;
 
-        impl<'de> Visitor<'de> for RawOrdinaryVisitor {
-            type Value = RawOrdinaryCase;
+        impl<'de> Visitor<'de> for CaseMemberVisitor {
+            type Value = CaseMember;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a CSSTree ordinary case object")
+                formatter.write_str("a CSSTree case object")
             }
 
-            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            fn visit_map<A>(self, map: A) -> std::result::Result<Self::Value, A::Error>
             where
                 A: MapAccess<'de>,
             {
-                let mut source = None;
-                let mut ast_seen = false;
-                let mut options = None;
-                let mut options_seen = false;
-                let mut generate = None;
-                let mut generate_seen = false;
-                while let Some(field) = map.next_key::<String>()? {
-                    match field.as_str() {
-                        "source" => {
-                            if source.is_some() {
-                                return Err(serde::de::Error::duplicate_field("source"));
-                            }
-                            source = Some(map.next_value::<String>()?);
-                        }
-                        "ast" => {
-                            if ast_seen {
-                                return Err(serde::de::Error::duplicate_field("ast"));
-                            }
-                            ast_seen = true;
-                            map.next_value::<IgnoredAny>()?;
-                        }
-                        "options" => {
-                            if options_seen {
-                                return Err(serde::de::Error::duplicate_field("options"));
-                            }
-                            options_seen = true;
-                            options = Some(map.next_value::<CanonicalObject>()?);
-                        }
-                        "generate" => {
-                            if generate_seen {
-                                return Err(serde::de::Error::duplicate_field("generate"));
-                            }
-                            generate_seen = true;
-                            generate = Some(map.next_value::<String>()?);
-                        }
-                        _ => {
-                            map.next_value::<IgnoredAny>()?;
-                        }
-                    }
-                }
-                if !ast_seen {
-                    return Err(serde::de::Error::missing_field("ast"));
-                }
-                Ok(RawOrdinaryCase {
-                    source: source.ok_or_else(|| serde::de::Error::missing_field("source"))?,
-                    options,
-                    generate,
-                })
+                CaseMember::from_map(map)
             }
         }
 
-        deserializer.deserialize_map(RawOrdinaryVisitor)
+        deserializer.deserialize_map(CaseMemberVisitor)
+    }
+}
+
+impl CaseMember {
+    fn from_map<'de, A>(mut map: A) -> std::result::Result<Self, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut source = None;
+        let mut ast_seen = false;
+        let mut error_truthy = None;
+        let mut options = None;
+        let mut options_seen = false;
+        let mut generate = None;
+        let mut generate_seen = false;
+        while let Some(field) = map.next_key::<String>()? {
+            match field.as_str() {
+                "source" => {
+                    if source.is_some() {
+                        return Err(serde::de::Error::duplicate_field("source"));
+                    }
+                    source = Some(map.next_value::<String>()?);
+                }
+                "ast" => {
+                    if ast_seen {
+                        return Err(serde::de::Error::duplicate_field("ast"));
+                    }
+                    ast_seen = true;
+                    map.next_value::<IgnoredAny>()?;
+                }
+                "error" => {
+                    if error_truthy.is_some() {
+                        return Err(serde::de::Error::duplicate_field("error"));
+                    }
+                    error_truthy = Some(map.next_value::<CanonicalValue>()?.is_javascript_truthy());
+                }
+                "options" => {
+                    if options_seen {
+                        return Err(serde::de::Error::duplicate_field("options"));
+                    }
+                    options_seen = true;
+                    options = Some(map.next_value::<CanonicalObject>()?);
+                }
+                "generate" => {
+                    if generate_seen {
+                        return Err(serde::de::Error::duplicate_field("generate"));
+                    }
+                    generate_seen = true;
+                    generate = Some(map.next_value::<String>()?);
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        let error_truthy = error_truthy.unwrap_or(false);
+        if !error_truthy && !ast_seen {
+            return Err(serde::de::Error::missing_field("ast"));
+        }
+        Ok(Self {
+            source: source.ok_or_else(|| serde::de::Error::missing_field("source"))?,
+            error_truthy,
+            options,
+            generate,
+        })
     }
 }
 

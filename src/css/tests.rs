@@ -1465,6 +1465,147 @@ mod imports {
     }
 
     #[test]
+    fn css_expectation_grouped_cases_follow_member_truthiness_and_stable_ids() {
+        let source = br#"{
+  "empty": [],
+  "z\\singleton": {"source": "singleton", "ast": {}},
+  "mixed/~truth": [
+    {"source": "absent", "ast": {}},
+    {"source": "null", "error": null, "ast": {}},
+    {"source": "false", "error": false, "ast": {}},
+    {"source": "zero", "error": 0, "ast": {}, "options": {"z": 2, "a": 1}, "generate": "zero{}"},
+    {"source": "negative zero", "error": -0, "ast": {}},
+    {"source": "empty string", "error": "", "ast": {}},
+    {"source": "true", "error": true},
+    {"source": "number", "error": 1, "options": {"nested": {"z": 0, "a": 1}}, "generate": "number{}"},
+    {"source": "string", "error": "failure"},
+    {"source": "array", "error": []},
+    {"source": "object", "error": {}}
+  ]
+}
+"#;
+        let path = "declaration/Grouped.json";
+        let fixture = imported_generation_fixture(path, source, 12, &[]);
+        fixture.generate().expect("generate grouped expectations");
+        fixture.check().expect("check grouped expectations");
+
+        let expectation: serde_json::Value =
+            serde_json::from_slice(&fixture.expectation(path)).expect("grouped expectation JSON");
+        let cases = expectation["cases"].as_array().expect("grouped cases");
+        let mut expected = [
+            ("absent", "parsed"),
+            ("null", "parsed"),
+            ("false", "parsed"),
+            ("zero", "parsed"),
+            ("negative zero", "parsed"),
+            ("empty string", "parsed"),
+            ("true", "rejected"),
+            ("number", "rejected"),
+            ("string", "rejected"),
+            ("array", "rejected"),
+            ("object", "rejected"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (input, outcome))| {
+            (
+                format!("{path}#/mixed~1~0truth/{index}"),
+                input,
+                outcome,
+                "mixed/~truth",
+            )
+        })
+        .chain(std::iter::once((
+            format!("{path}#/z\\singleton"),
+            "singleton",
+            "parsed",
+            "z\\singleton",
+        )))
+        .collect::<Vec<_>>();
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(cases.len(), expected.len());
+        for (case, (id, input, outcome, label)) in cases.iter().zip(expected) {
+            assert_eq!(case["id"], id);
+            assert_eq!(case["input"], input);
+            assert_eq!(case["upstream_outcome"], outcome);
+            assert_eq!(case["label"], label);
+        }
+        let zero = cases
+            .iter()
+            .find(|case| case["input"] == "zero")
+            .expect("zero case");
+        assert_eq!(zero["options"], serde_json::json!({"a": 1, "z": 2}));
+        assert_eq!(zero["canonical_css"], "zero{}");
+        let number = cases
+            .iter()
+            .find(|case| case["input"] == "number")
+            .expect("number case");
+        assert_eq!(
+            number["options"],
+            serde_json::json!({"nested": {"a": 1, "z": 0}})
+        );
+        assert_eq!(number["canonical_css"], "number{}");
+    }
+
+    #[test]
+    fn css_expectation_literal_error_arrays_preserve_legacy_bytes() {
+        let source = br#"{"error":[{"source":"source only"},{"source":"metadata ignored","ast":{"secret":true},"error":false,"options":[],"generate":null,"offset":4}]}
+"#;
+        let path = "declaration/LegacyError.json";
+        let fixture = imported_generation_fixture(path, source, 2, &[]);
+        fixture.generate().expect("generate legacy error array");
+        fixture.check().expect("check legacy error array");
+
+        let source_digest = Sha256Digest::from_bytes(source);
+        let sidecar_digest = Sha256Digest::from_bytes(fixture.sidecar());
+        let expected = format!(
+            "{{\n  \"schema_version\": 1,\n  \"generator\": \"surgeist-css-generate\",\n  \"source\": \"source/{path}\",\n  \"source_sha256\": \"{source_digest}\",\n  \"source_revision\": \"{}\",\n  \"import_provenance_sha256\": \"{sidecar_digest}\",\n  \"cases\": [\n    {{\n      \"id\": \"{path}#/error/0\",\n      \"context\": \"declaration\",\n      \"input\": \"source only\",\n      \"upstream_outcome\": \"rejected\",\n      \"status\": \"active\"\n    }},\n    {{\n      \"id\": \"{path}#/error/1\",\n      \"context\": \"declaration\",\n      \"input\": \"metadata ignored\",\n      \"upstream_outcome\": \"rejected\",\n      \"status\": \"active\"\n    }}\n  ]\n}}\n",
+            fixture.revision
+        );
+        assert_eq!(fixture.expectation(path), expected.as_bytes());
+    }
+
+    #[test]
+    fn css_expectation_error_singleton_uses_ordinary_semantics() {
+        let falsy = br#"{"error":{"source":"falsy","error":0,"ast":{},"options":{"z":2,"a":1},"generate":"falsy{}"}}
+"#;
+        let truthy = br#"{"error":{"source":"truthy","error":{},"options":{"z":4,"a":3},"generate":"truthy{}"}}
+"#;
+        let fixture = Fixture::new(&[
+            ("declaration/Falsy.json", falsy, false),
+            ("selector/Truthy.json", truthy, false),
+        ]);
+        fixture.set_manifest(2, 2, &[]);
+        fixture.import().expect("import error singletons");
+        fixture.generate().expect("generate error singletons");
+        fixture.check().expect("check error singletons");
+
+        for (path, outcome, options, canonical_css) in [
+            (
+                "declaration/Falsy.json",
+                "parsed",
+                serde_json::json!({"a": 1, "z": 2}),
+                "falsy{}",
+            ),
+            (
+                "selector/Truthy.json",
+                "rejected",
+                serde_json::json!({"a": 3, "z": 4}),
+                "truthy{}",
+            ),
+        ] {
+            let expectation: serde_json::Value =
+                serde_json::from_slice(&fixture.expectation(path)).expect("expectation JSON");
+            let case = &expectation["cases"][0];
+            assert_eq!(case["id"], format!("{path}#/error"));
+            assert_eq!(case["label"], "error");
+            assert_eq!(case["upstream_outcome"], outcome);
+            assert_eq!(case["options"], options);
+            assert_eq!(case["canonical_css"], canonical_css);
+        }
+    }
+
+    #[test]
     fn css_expectation_hash_label_and_strict_hash_source_path_golden() {
         let source =
             b"{\"before#/middle/#after\":{\"source\":\"a {}\",\"ast\":{},\"generate\":\"a{}\"}}\n";
@@ -1540,6 +1681,13 @@ mod imports {
             b"{\"case\":{\"source\":\"a\",\"ast\":{},\"generate\":null}}\n",
             b"{\"error\":{\"source\":\"a\"}}\n",
             b"{\"error\":[{\"source\":null}]}\n",
+            b"{\"case\":1}\n",
+            b"{\"case\":[[]]}\n",
+            b"{\"case\":[{\"ast\":{}}]}\n",
+            b"{\"case\":[{\"source\":\"a\",\"error\":false}]}\n",
+            b"{\"case\":[{\"source\":\"a\",\"error\":true,\"options\":[]}]}\n",
+            b"{\"case\":[{\"source\":\"a\",\"error\":true,\"generate\":null}]}\n",
+            b"{\"case\":[]}\n",
         ];
         for bytes in fixtures {
             let fixture =
