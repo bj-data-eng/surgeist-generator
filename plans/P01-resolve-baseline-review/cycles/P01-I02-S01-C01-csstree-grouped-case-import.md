@@ -149,28 +149,23 @@ cargo test --locked --offline -p surgeist-generator --features css-corpus
 RUSTFLAGS="-D warnings" cargo check --locked --offline -p surgeist-generator --all-features
 cargo test --locked --offline -p surgeist-generator --all-features
 cargo test --locked --offline -p surgeist-generator --all-features -- --ignored --list
+cargo clippy --locked --offline -p surgeist-generator --no-default-features --all-targets -- -F unsafe-code -D warnings
+cargo clippy --locked --offline -p surgeist-generator --features layout-browser --all-targets -- -F unsafe-code -D warnings
+cargo clippy --locked --offline -p surgeist-generator --features css-corpus --all-targets -- -F unsafe-code -D warnings
+cargo clippy --locked --offline -p surgeist-generator --all-features --all-targets -- -F unsafe-code -D warnings
 cargo fmt --check
 git diff --check
 git diff --check a91f1cce79a44a6f031f6c3a767c01504f79c7b4..HEAD
 ```
 
-Run the complete Clippy matrix with `clippy::too_many_lines` explicitly enabled
-at threshold 100 through a disposable configuration:
-
-```zsh
-set -eu
-clippy_conf_dir="$(mktemp -d "${TMPDIR:-/tmp}/surgeist-generator-clippy.XXXXXX")"
-trap 'rm -rf "$clippy_conf_dir"' EXIT
-printf '%s\n' 'too-many-lines-threshold = 100' >"$clippy_conf_dir/clippy.toml"
-
-CLIPPY_CONF_DIR="$clippy_conf_dir" cargo clippy --locked --offline -p surgeist-generator --no-default-features --all-targets -- -F unsafe-code -W clippy::too_many_lines -D warnings
-CLIPPY_CONF_DIR="$clippy_conf_dir" cargo clippy --locked --offline -p surgeist-generator --features layout-browser --all-targets -- -F unsafe-code -W clippy::too_many_lines -D warnings
-CLIPPY_CONF_DIR="$clippy_conf_dir" cargo clippy --locked --offline -p surgeist-generator --features css-corpus --all-targets -- -F unsafe-code -W clippy::too_many_lines -D warnings
-CLIPPY_CONF_DIR="$clippy_conf_dir" cargo clippy --locked --offline -p surgeist-generator --all-features --all-targets -- -F unsafe-code -W clippy::too_many_lines -D warnings
-
-rm -rf "$clippy_conf_dir"
-trap - EXIT
-```
+The user explicitly defers the separately enabled threshold-100
+`clippy::too_many_lines` findings for P01/I02. The ordinary warning-free Clippy
+matrix above remains mandatory and unsuppressed. The known line-count
+diagnostics remain retained evidence, are not converted into allowances, and
+are not a P01/I02 pass condition. After this initiative is published and
+closed, its mandatory fresh whole-crate sprawl review must independently
+rediscover and classify the line-count issue for follow-on `P01/I03`; the
+review must not merely copy the current inventory.
 
 Perform the bounded pinned acceptance with this complete disposable setup and
 procedure:
@@ -268,8 +263,7 @@ The exact final rerun set on the completed candidate is:
 1. the task-command block in clause `5.1` beginning with the aggregate
    `css_expectation_` test and ending with the exact
    `a91f1cce79a44a6f031f6c3a767c01504f79c7b4..HEAD` diff check;
-2. the complete four-command disposable-configuration Clippy block in clause
-   `5.1`;
+2. all four ordinary warning-free Clippy commands in clause `5.1`;
 3. the complete pinned-acceptance setup, two generation passes, census and
    uniqueness assertions, SHA-256 comparison, checkout-free check, and cleanup
    block in clause `5.1`; and
@@ -278,15 +272,17 @@ The exact final rerun set on the completed candidate is:
 
 The cycle is accepted when T01 has one clean independent task review, that exact
 final rerun set passes on the task head, and a fresh holistic reviewer returns
-`CLEAN` for the complete cycle range. Follow the installed canonical review,
-landing, remote-readback, telemetry-review, and cycle-closure contracts rather
-than copying them here.
+`CLEAN` for the complete cycle range under the explicit line-count deferral.
+Follow the installed canonical review, landing, remote-readback,
+telemetry-review, and cycle-closure contracts rather than copying them here.
 
 The published candidate handoff reports the full remote `main` SHA, reviewed
 planning revisions, exact ID and truthiness rules, compatibility result,
 commands, task and holistic verdicts, 74/721/214/935 census, checkout-free
 checking result, dependency/API/safety classifications, and genuine
-nonblocking observations.
+nonblocking observations. It also cites the user-authorized line-count deferral
+and the registered `P01/I03` follow-on without claiming that its future sprawl
+review has already occurred.
 
 Block on source revision/tree drift, inability to preserve legacy bytes or IDs,
 missing already-present offline tooling, acquisition pressure, executable
