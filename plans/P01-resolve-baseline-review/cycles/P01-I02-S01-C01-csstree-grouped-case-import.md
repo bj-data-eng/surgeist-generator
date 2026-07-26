@@ -4,7 +4,7 @@
 
 - Cycle path: `P01/I02/S01/C01`
 - Owning repository: `/Users/codex/Development/surgeist-generator`
-- Status: `reviewed`
+- Status: `in_progress`
 - Cycle base: `a91f1cce79a44a6f031f6c3a767c01504f79c7b4`
 - Reviewed specification: `P01/I02/V01`,
   `plans/P01-resolve-baseline-review/initiatives/P01-I02-csstree-grouped-case-import.md`,
@@ -35,9 +35,9 @@ ignored test body.
 
 ## 3 Boundary And Resolved Decisions
 
-- Change only `src/css/expectation.rs`, focused tests in `src/css/tests.rs`, and
-  directly affected CSS-facing documentation if implementation makes a
-  clarification necessary.
+- Change only `src/css/expectation.rs`, the private generated-ID validator in
+  `src/css/case.rs`, focused tests in `src/css/tests.rs`, and directly affected
+  CSS-facing documentation if implementation makes a clarification necessary.
 - Preserve singleton IDs as `<path>#/<escaped-label>`. Derive array-member IDs
   as `<path>#/<escaped-label>/<zero-based-index>`, using the existing JSON
   Pointer token escaping.
@@ -80,14 +80,16 @@ ignored test body.
 
 **Files and outcome**
 
-Own `src/css/expectation.rs`, focused `src/css/tests.rs` coverage, and only
-directly necessary CSS documentation. Replace the special object-only ordinary
-decoder with a private group/member model that implements clause `3` without
+Own `src/css/expectation.rs`, the narrow generated-ID validation boundary in
+`src/css/case.rs`, focused `src/css/tests.rs` coverage, and only directly
+necessary CSS documentation. Replace the special object-only ordinary decoder
+with a private group/member model that implements clause `3`, and keep manifest
+override validation aligned with every generated JSON-Pointer ID, without
 changing public or persisted schemas.
 
 **RED evidence**
 
-Before production edits, add focused front-door tests:
+Before each corresponding production edit, add focused front-door tests:
 
 1. `css_expectation_grouped_cases_follow_member_truthiness_and_stable_ids`
    is RED because the baseline rejects arbitrary array labels. It covers mixed
@@ -102,22 +104,30 @@ Before production edits, add focused front-door tests:
    baseline routes label `error` through the legacy array decoder. It proves
    truthy and falsy outcomes, the ordinary singleton ID and label, and
    shape-valid metadata.
+4. `css_expectation_backslash_label_case_id_binds_override` is RED because the
+   baseline private case-ID validator rejects the backslash retained by the
+   generated JSON-Pointer token. It proves that a generated singleton or grouped
+   ID can receive a manifest disposition override.
 
-Run and retain the two expected failures and one characterization pass:
+Run and retain the three expected failures and one characterization pass:
 
 ```sh
 cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_expectation_grouped_cases_follow_member_truthiness_and_stable_ids
 cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_expectation_literal_error_arrays_preserve_legacy_bytes
 cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_expectation_error_singleton_uses_ordinary_semantics
+cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_expectation_backslash_label_case_id_binds_override
 ```
 
 **Acceptance**
 
-- All three RED predicates pass through the real generate front door after the
-  implementation.
+- All four focused predicates pass through the real generate front door after
+  the implementation.
 - Existing expectation goldens remain byte-identical and existing malformed,
   duplicate, count-mismatch, repeat-generation, report, and `check-corpus`
   tests remain green.
+- Every generated ID accepted into neutral output, including a backslash-bearing
+  label token, is accepted by the private manifest-override ID validator and
+  binds to its exact source fixture.
 - An empty array derives no cases and remains accepted when another group yields
   a valid case. A complete fixture deriving no cases, top-level scalars, nested
   arrays, malformed source/options/generate values, missing `ast` on parsed
@@ -130,7 +140,7 @@ cargo test --locked --offline -p surgeist-generator --features css-corpus --lib 
 
 **Task commands**
 
-Run the three focused commands above, then:
+Run the four focused commands above, then:
 
 ```sh
 cargo test --locked --offline -p surgeist-generator --features css-corpus --lib css_expectation_
