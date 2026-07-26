@@ -96,7 +96,6 @@ fn validate_text(value: &str) -> bool {
         && value.len() <= 4096
         && value.trim() == value
         && !value.chars().any(char::is_control)
-        && !value.contains('\\')
 }
 
 fn validate_json_pointer(pointer: &str) -> bool {

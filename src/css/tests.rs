@@ -1691,6 +1691,35 @@ mod imports {
     }
 
     #[test]
+    fn css_expectation_backslash_label_case_id_binds_override() {
+        let path = "declaration/Grouped.json";
+        let id = "declaration/Grouped.json#/z\\singleton";
+        let fixture = imported_generation_fixture(
+            path,
+            br#"{"z\\singleton":{"source":"a {}","ast":{}}}
+"#,
+            1,
+            &[(
+                "declaration/Grouped.json#/z\\\\singleton",
+                "unsupported",
+                Some("backslash-label override"),
+            )],
+        );
+        fixture
+            .generate()
+            .expect("generate overridden backslash-label case");
+
+        let expectation: serde_json::Value =
+            serde_json::from_slice(&fixture.expectation(path)).expect("expectation JSON");
+        assert_eq!(expectation["cases"][0]["id"], id);
+        assert_eq!(expectation["cases"][0]["status"], "unsupported");
+        assert_eq!(
+            expectation["cases"][0]["reason"],
+            "backslash-label override"
+        );
+    }
+
+    #[test]
     fn css_expectation_duplicate_decoded_members_at_every_depth_are_rejected() {
         let fixtures: &[&[u8]] = &[
             b"{\"\\u0063ase\":{\"source\":\"a\",\"ast\":{}},\"case\":{\"source\":\"b\",\"ast\":{}}}\n",
