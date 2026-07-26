@@ -74,28 +74,19 @@ impl CssCaseDispositionRecord {
 }
 
 pub(super) fn has_bindable_syntax(value: &str) -> bool {
-    validate_text(value)
-        && value.match_indices('#').any(|(delimiter, _)| {
-            let (source, suffix) = value.split_at(delimiter);
-            RelativePath::with_extension(source, "json").is_ok()
-                && suffix.strip_prefix('#').is_some_and(validate_json_pointer)
-        })
+    value.match_indices('#').any(|(delimiter, _)| {
+        let (source, suffix) = value.split_at(delimiter);
+        RelativePath::with_extension(source, "json").is_ok()
+            && suffix.strip_prefix('#').is_some_and(validate_json_pointer)
+    })
 }
 
 fn validate_for_source(value: &str, source_path: &RelativePath) -> bool {
-    validate_text(value)
-        && RelativePath::with_extension(source_path.as_str(), "json").is_ok()
+    RelativePath::with_extension(source_path.as_str(), "json").is_ok()
         && value
             .strip_prefix(source_path.as_str())
             .and_then(|suffix| suffix.strip_prefix('#'))
             .is_some_and(validate_json_pointer)
-}
-
-fn validate_text(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 4096
-        && value.trim() == value
-        && !value.chars().any(char::is_control)
 }
 
 fn validate_json_pointer(pointer: &str) -> bool {

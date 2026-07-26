@@ -1432,7 +1432,7 @@ mod imports {
 
     fn imported_generation_fixture(
         relative: &str,
-        bytes: &'static [u8],
+        bytes: &[u8],
         expected_cases: usize,
         overrides: &[(&str, &str, Option<&str>)],
     ) -> Fixture {
@@ -1717,6 +1717,64 @@ mod imports {
             expectation["cases"][0]["reason"],
             "backslash-label override"
         );
+    }
+
+    fn assert_arbitrary_label_case_id_binds_override(
+        source: &[u8],
+        manifest_id: &str,
+        expected_id: &str,
+        reason: &str,
+    ) {
+        let path = "declaration/ArbitraryLabel.json";
+        let fixture = imported_generation_fixture(
+            path,
+            source,
+            1,
+            &[(manifest_id, "unsupported", Some(reason))],
+        );
+        fixture
+            .generate()
+            .expect("generate overridden arbitrary-label case");
+
+        let expectation: serde_json::Value =
+            serde_json::from_slice(&fixture.expectation(path)).expect("expectation JSON");
+        assert_eq!(expectation["cases"][0]["id"], expected_id);
+        assert_eq!(expectation["cases"][0]["status"], "unsupported");
+        assert_eq!(expectation["cases"][0]["reason"], reason);
+    }
+
+    #[test]
+    fn css_expectation_trailing_whitespace_label_case_id_binds_override() {
+        let id = "declaration/ArbitraryLabel.json#/trailing ";
+        assert_arbitrary_label_case_id_binds_override(
+            br#"{"trailing ":{"source":"a {}","ast":{}}}
+"#,
+            id,
+            id,
+            "trailing-whitespace label override",
+        );
+    }
+
+    #[test]
+    fn css_expectation_control_label_case_id_binds_override() {
+        assert_arbitrary_label_case_id_binds_override(
+            br#"{"control\u0001label":{"source":"a {}","ast":{}}}
+"#,
+            "declaration/ArbitraryLabel.json#/control\\u0001label",
+            "declaration/ArbitraryLabel.json#/control\u{0001}label",
+            "control label override",
+        );
+    }
+
+    #[test]
+    fn css_expectation_overlong_label_case_id_binds_override() {
+        let label = "x".repeat(4096);
+        let source =
+            serde_json::to_vec(&serde_json::json!({label.clone(): {"source": "a {}", "ast": {}}}))
+                .expect("serialize long-label fixture");
+        let id = format!("declaration/ArbitraryLabel.json#/{label}");
+        assert!(id.len() > 4096);
+        assert_arbitrary_label_case_id_binds_override(&source, &id, &id, "overlong label override");
     }
 
     #[test]
