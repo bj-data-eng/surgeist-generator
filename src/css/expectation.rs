@@ -171,8 +171,9 @@ pub(super) fn derive(
     let mut total_cases = 0_usize;
 
     for fixture in imported.fixtures() {
-        reject_duplicate_members_and_trailing(&fixture.bytes, &fixture.path)?;
-        let raw: RawFixture = serde_json::from_slice(&fixture.bytes).map_err(|error| {
+        let normalized = normalize_numeric_error_values(&fixture.bytes, &fixture.path)?;
+        reject_duplicate_members_and_trailing(&normalized, &fixture.path)?;
+        let raw: RawFixture = serde_json::from_slice(&normalized).map_err(|error| {
             invalid_inventory_with_source(
                 "parse typed CSS fixture",
                 format!("invalid fixture shape: {}", fixture.path.as_str()),
@@ -563,6 +564,280 @@ fn prefixed(root: &RelativePath, path: &RelativePath) -> Result<RelativePath> {
 
 fn escape_json_pointer_token(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
+}
+
+fn normalize_numeric_error_values(bytes: &[u8], path: &RelativePath) -> Result<Vec<u8>> {
+    NumericErrorNormalizer::new(bytes)
+        .normalize()
+        .map_err(|detail| {
+            invalid_inventory(format!(
+                "normalize numeric CSS error values in {}: {detail}",
+                path.as_str()
+            ))
+        })
+}
+
+struct NumericErrorNormalizer<'a> {
+    input: &'a [u8],
+    cursor: usize,
+    output: Vec<u8>,
+}
+
+impl<'a> NumericErrorNormalizer<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self {
+            input,
+            cursor: 0,
+            output: Vec::with_capacity(input.len()),
+        }
+    }
+
+    fn normalize(mut self) -> std::result::Result<Vec<u8>, String> {
+        self.copy_whitespace();
+        if self.peek() != Some(b'{') {
+            return Ok(self.input.to_vec());
+        }
+        self.normalize_fixture_object()?;
+        self.output.extend_from_slice(&self.input[self.cursor..]);
+        Ok(self.output)
+    }
+
+    fn normalize_fixture_object(&mut self) -> std::result::Result<(), String> {
+        self.copy_expected(b'{')?;
+        self.copy_whitespace();
+        if self.copy_if(b'}') {
+            return Ok(());
+        }
+        loop {
+            let label = self.copy_object_key()?;
+            self.copy_member_separator()?;
+            match self.peek() {
+                Some(b'{') => self.normalize_case_member_object()?,
+                Some(b'[') if label != "error" => self.normalize_group_array()?,
+                _ => self.normalize_value(false)?,
+            }
+            if self.copy_collection_end(b'}')? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn normalize_group_array(&mut self) -> std::result::Result<(), String> {
+        self.copy_expected(b'[')?;
+        self.copy_whitespace();
+        if self.copy_if(b']') {
+            return Ok(());
+        }
+        loop {
+            if self.peek() == Some(b'{') {
+                self.normalize_case_member_object()?;
+            } else {
+                self.normalize_value(false)?;
+            }
+            if self.copy_collection_end(b']')? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn normalize_case_member_object(&mut self) -> std::result::Result<(), String> {
+        self.copy_expected(b'{')?;
+        self.copy_whitespace();
+        if self.copy_if(b'}') {
+            return Ok(());
+        }
+        loop {
+            let field = self.copy_object_key()?;
+            self.copy_member_separator()?;
+            self.normalize_value(field == "error")?;
+            if self.copy_collection_end(b'}')? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn normalize_value(&mut self, normalize_numbers: bool) -> std::result::Result<(), String> {
+        self.copy_whitespace();
+        match self.peek() {
+            Some(b'{') => self.normalize_object(normalize_numbers),
+            Some(b'[') => self.normalize_array(normalize_numbers),
+            Some(b'"') => self.copy_string().map(|_| ()),
+            Some(b't') => self.copy_literal(b"true"),
+            Some(b'f') => self.copy_literal(b"false"),
+            Some(b'n') => self.copy_literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.copy_number(normalize_numbers),
+            Some(_) => Err(self.error("expected a JSON value")),
+            None => Err(self.error("unexpected end of JSON value")),
+        }
+    }
+
+    fn normalize_object(&mut self, normalize_numbers: bool) -> std::result::Result<(), String> {
+        self.copy_expected(b'{')?;
+        self.copy_whitespace();
+        if self.copy_if(b'}') {
+            return Ok(());
+        }
+        loop {
+            self.copy_object_key()?;
+            self.copy_member_separator()?;
+            self.normalize_value(normalize_numbers)?;
+            if self.copy_collection_end(b'}')? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn normalize_array(&mut self, normalize_numbers: bool) -> std::result::Result<(), String> {
+        self.copy_expected(b'[')?;
+        self.copy_whitespace();
+        if self.copy_if(b']') {
+            return Ok(());
+        }
+        loop {
+            self.normalize_value(normalize_numbers)?;
+            if self.copy_collection_end(b']')? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn copy_object_key(&mut self) -> std::result::Result<String, String> {
+        self.copy_whitespace();
+        let start = self.cursor;
+        let end = self.copy_string()?;
+        serde_json::from_slice(&self.input[start..end])
+            .map_err(|error| self.error(&format!("invalid JSON object member: {error}")))
+    }
+
+    fn copy_string(&mut self) -> std::result::Result<usize, String> {
+        self.copy_expected(b'"')?;
+        while let Some(byte) = self.peek() {
+            self.copy_byte();
+            match byte {
+                b'"' => return Ok(self.cursor),
+                b'\\' => {
+                    if self.peek().is_none() {
+                        return Err(self.error("unterminated JSON string escape"));
+                    }
+                    self.copy_byte();
+                }
+                _ => {}
+            }
+        }
+        Err(self.error("unterminated JSON string"))
+    }
+
+    fn copy_number(&mut self, normalize: bool) -> std::result::Result<(), String> {
+        let start = self.cursor;
+        if self.peek() == Some(b'-') {
+            self.cursor += 1;
+        }
+        match self.peek() {
+            Some(b'0') => self.cursor += 1,
+            Some(b'1'..=b'9') => self.advance_digits(),
+            _ => return Err(self.error("invalid JSON number integer")),
+        }
+        if self.peek() == Some(b'.') {
+            self.cursor += 1;
+            self.require_digits("invalid JSON number fraction")?;
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.cursor += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.cursor += 1;
+            }
+            self.require_digits("invalid JSON number exponent")?;
+        }
+        let token = &self.input[start..self.cursor];
+        let overflow = normalize
+            && std::str::from_utf8(token)
+                .ok()
+                .and_then(|value| value.parse::<f64>().ok())
+                .is_some_and(f64::is_infinite);
+        if overflow {
+            self.output.push(b'1');
+            self.output
+                .resize(self.output.len() + token.len() - 1, b' ');
+        } else {
+            self.output.extend_from_slice(token);
+        }
+        Ok(())
+    }
+
+    fn require_digits(&mut self, detail: &str) -> std::result::Result<(), String> {
+        if !matches!(self.peek(), Some(b'0'..=b'9')) {
+            return Err(self.error(detail));
+        }
+        self.advance_digits();
+        Ok(())
+    }
+
+    fn advance_digits(&mut self) {
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.cursor += 1;
+        }
+    }
+
+    fn copy_member_separator(&mut self) -> std::result::Result<(), String> {
+        self.copy_whitespace();
+        self.copy_expected(b':')?;
+        self.copy_whitespace();
+        Ok(())
+    }
+
+    fn copy_collection_end(&mut self, end: u8) -> std::result::Result<bool, String> {
+        self.copy_whitespace();
+        if self.copy_if(end) {
+            return Ok(true);
+        }
+        self.copy_expected(b',')?;
+        self.copy_whitespace();
+        Ok(false)
+    }
+
+    fn copy_literal(&mut self, literal: &[u8]) -> std::result::Result<(), String> {
+        if !self.input[self.cursor..].starts_with(literal) {
+            return Err(self.error("invalid JSON literal"));
+        }
+        self.output.extend_from_slice(literal);
+        self.cursor += literal.len();
+        Ok(())
+    }
+
+    fn copy_whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+            self.copy_byte();
+        }
+    }
+
+    fn copy_expected(&mut self, expected: u8) -> std::result::Result<(), String> {
+        if !self.copy_if(expected) {
+            return Err(self.error(&format!("expected JSON byte {:?}", char::from(expected))));
+        }
+        Ok(())
+    }
+
+    fn copy_if(&mut self, expected: u8) -> bool {
+        if self.peek() == Some(expected) {
+            self.copy_byte();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn copy_byte(&mut self) {
+        self.output.push(self.input[self.cursor]);
+        self.cursor += 1;
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.input.get(self.cursor).copied()
+    }
+
+    fn error(&self, detail: &str) -> String {
+        format!("{detail} at byte {}", self.cursor)
+    }
 }
 
 fn reject_duplicate_members_and_trailing(bytes: &[u8], path: &RelativePath) -> Result<()> {

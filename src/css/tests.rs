@@ -1548,6 +1548,51 @@ mod imports {
     }
 
     #[test]
+    fn css_expectation_numeric_error_truthiness_matches_json_parse() {
+        let source = br#"{"numbers":[
+  {"source":"positive overflow","error":1e400},
+  {"source":"negative overflow","error":-1e400},
+  {"source":"positive underflow","error":1e-400,"ast":{}},
+  {"source":"negative underflow","error":-1e-400,"ast":{}},
+  {"source":"zero","error":0,"ast":{}},
+  {"source":"negative zero","error":-0,"ast":{}}
+]}
+"#;
+        let path = "value/NumericTruthiness.json";
+        let fixture = imported_generation_fixture(path, source, 6, &[]);
+        fixture
+            .generate()
+            .expect("derive JavaScript numeric truthiness");
+        fixture.check().expect("check numeric truthiness");
+
+        let expectation: serde_json::Value =
+            serde_json::from_slice(&fixture.expectation(path)).expect("expectation JSON");
+        let cases = expectation["cases"]
+            .as_array()
+            .expect("numeric truthiness cases");
+        let outcomes = cases
+            .iter()
+            .map(|case| {
+                (
+                    case["input"].as_str().expect("case input"),
+                    case["upstream_outcome"].as_str().expect("case outcome"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes,
+            [
+                ("positive overflow", "rejected"),
+                ("negative overflow", "rejected"),
+                ("positive underflow", "parsed"),
+                ("negative underflow", "parsed"),
+                ("zero", "parsed"),
+                ("negative zero", "parsed"),
+            ]
+        );
+    }
+
+    #[test]
     fn css_expectation_literal_error_arrays_preserve_legacy_bytes() {
         let source = br#"{"error":[{"source":"source only"},{"source":"metadata ignored","ast":{"secret":true},"error":false,"options":[],"generate":null,"offset":4}]}
 "#;
