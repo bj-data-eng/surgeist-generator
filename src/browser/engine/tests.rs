@@ -434,3 +434,6 @@ mod input_contract_tests;
 
 #[path = "adapter_error_tests.rs"]
 mod adapter_error_tests;
+
+#[path = "mixed_outcome_tests.rs"]
+mod mixed_outcome_tests;
