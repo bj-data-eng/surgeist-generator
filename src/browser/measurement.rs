@@ -14,49 +14,27 @@ use crate::core::GenerationLease;
 use crate::core::PRIVATE_FILE_MODE;
 use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, RelativePath, Result};
 
-use super::browser::{TrustedBrowser, chromium_config, effective_switches};
-use super::manifest::LayoutManifest;
+use super::browser_runtime::{TrustedBrowser, chromium_config, effective_switches};
+use super::engine::PreparedInput;
+use super::model::EngineManifest;
 use super::profile::{
     OwnedSupervisorChild, ProfileAttempt, ProfileCreateContext, ProfileJournal,
     SupervisorTermination, resolve_terminalization,
 };
-use super::selection::Fixture;
-use super::xml::{MeasuredLayout, Variant};
-
-#[derive(Clone, Debug, PartialEq)]
-pub(super) enum VariantOutcome {
-    Generated(MeasuredLayout),
-    Unsupported(String),
-}
+use serde_json::Value;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct MeasurementResults {
-    outcomes: BTreeMap<(RelativePath, Variant), VariantOutcome>,
-    failures: BTreeMap<RelativePath, String>,
-}
-
-impl MeasurementResults {
-    pub(super) fn outcome(
-        &self,
-        source: &RelativePath,
-        variant: Variant,
-    ) -> Option<&VariantOutcome> {
-        self.outcomes.get(&(source.clone(), variant))
-    }
-
-    pub(super) fn failure(&self, source: &RelativePath) -> Option<&str> {
-        self.failures.get(source).map(String::as_str)
-    }
+    pub(super) outcomes: BTreeMap<RelativePath, Value>,
+    pub(super) failures: BTreeMap<RelativePath, String>,
 }
 
 pub(super) struct MeasurementContext<'a> {
     pub(super) location: &'a CorpusLocation,
     pub(super) lease: &'a GenerationLease,
     pub(super) browser: &'a TrustedBrowser,
-    pub(super) manifest: &'a LayoutManifest,
+    pub(super) manifest: &'a EngineManifest,
     pub(super) current_executable: &'a Path,
-    pub(super) helper: &'a [u8],
-    pub(super) base_style: &'a [u8],
     pub(super) execution: &'a BrowserExecution,
 }
 
@@ -164,6 +142,9 @@ pub(super) enum TestBrowserPlan {
     BrowserFailure,
     RetryOnce,
     AlwaysFail,
+    HelperFailure,
+    MeasurementFailure,
+    CloseFailure,
     DependencyPanic,
     OwnedPanic,
     OwnedPanicWithCleanupFailure,
@@ -176,6 +157,7 @@ pub(super) enum TestBrowserPlan {
 pub(super) struct TestGenerationHost {
     plan: TestBrowserPlan,
     attempts: Arc<Mutex<Vec<(u64, u64)>>>,
+    fixture_attempts: Arc<Mutex<Vec<Vec<RelativePath>>>>,
 }
 
 #[cfg(test)]
@@ -184,6 +166,7 @@ impl TestGenerationHost {
         Self {
             plan,
             attempts: Arc::new(Mutex::new(Vec::new())),
+            fixture_attempts: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -198,7 +181,23 @@ impl TestGenerationHost {
             .clone()
     }
 
-    fn record_attempt(&self, batch: u64, retry: u64) {
+    pub(super) fn fixture_attempts(&self) -> Vec<Vec<RelativePath>> {
+        self.fixture_attempts
+            .lock()
+            .expect("fixture attempt trace")
+            .clone()
+    }
+
+    fn record_attempt(&self, batch: u64, retry: u64, fixtures: &[&PreparedInput]) {
+        self.fixture_attempts
+            .lock()
+            .expect("fixture attempt trace")
+            .push(
+                fixtures
+                    .iter()
+                    .map(|fixture| fixture.source().clone())
+                    .collect(),
+            );
         self.attempts
             .lock()
             .expect("test generation attempt trace lock")
@@ -208,74 +207,92 @@ impl TestGenerationHost {
 
 pub(super) async fn measure(
     context: MeasurementContext<'_>,
-    fixtures: &[&Fixture],
+    fixtures: &[&PreparedInput],
 ) -> Result<MeasurementResults> {
     let mut results = MeasurementResults::default();
     for (batch_ordinal, batch) in fixtures
         .chunks(context.manifest.browser.launch.batch_size)
         .enumerate()
     {
-        let mut pending = batch.to_vec();
-        for retry_ordinal in 0..=1_u64 {
-            if pending.is_empty() {
-                break;
-            }
-            context.browser.closing_revalidate()?;
-            let attempt = run_attempt(
-                &context,
-                MeasurementAttempt {
-                    batch_ordinal: u64::try_from(batch_ordinal)
-                        .map_err(|_| generation_error("layout batch ordinal exceeds u64"))?,
-                    retry_ordinal,
-                    fixtures: &pending,
-                },
-            )
-            .await;
-            let mut retry = Vec::new();
-            match attempt {
-                Ok(outcomes) => {
-                    for fixture in pending {
-                        match outcomes.get(fixture.source()) {
-                            Some(Ok(variants)) => {
-                                for (variant, outcome) in variants {
-                                    results.outcomes.insert(
-                                        (fixture.source().clone(), *variant),
-                                        outcome.clone(),
-                                    );
-                                }
-                            }
-                            Some(Err(reason)) => {
-                                if retry_ordinal == 0 {
-                                    retry.push(fixture);
-                                } else {
-                                    results
-                                        .failures
-                                        .insert(fixture.source().clone(), reason.clone());
-                                }
-                            }
-                            None => {
-                                return Err(generation_error(
-                                    "measurement attempt omitted a scheduled fixture",
-                                ));
-                            }
-                        }
-                    }
+        let batch_ordinal = u64::try_from(batch_ordinal)
+            .map_err(|_| generation_error("browser batch ordinal exceeds u64"))?;
+        context.browser.closing_revalidate()?;
+        let mut outcomes = run_attempt(
+            &context,
+            MeasurementAttempt {
+                batch_ordinal,
+                retry_ordinal: 0,
+                fixtures: batch,
+            },
+        )
+        .await?;
+        for fixture in batch {
+            let outcome = outcomes.remove(fixture.source()).ok_or_else(|| {
+                generation_error("measurement attempt omitted a scheduled fixture")
+            })?;
+            let outcome = match outcome {
+                Err(failure @ PageFailure::NavigationTimeout(_)) => {
+                    // Every failed fixture receives a separately owned browser/profile.
+                    // Terminal page failures never enter this navigation-only retry path.
+                    context.browser.closing_revalidate()?;
+                    let mut retried = run_attempt(
+                        &context,
+                        MeasurementAttempt {
+                            batch_ordinal,
+                            retry_ordinal: 1,
+                            fixtures: std::slice::from_ref(fixture),
+                        },
+                    )
+                    .await?;
+                    retried
+                        .remove(fixture.source())
+                        .ok_or_else(|| generation_error("retry omitted its scheduled fixture"))?
+                        .map_err(|retry| format!("{failure}; retry failed: {retry}"))
                 }
-                Err(error) => return Err(error),
+                result => result.map_err(|error| error.to_string()),
+            };
+            match outcome {
+                Ok(value) => {
+                    results.outcomes.insert(fixture.source().clone(), value);
+                }
+                Err(reason) => {
+                    results.failures.insert(fixture.source().clone(), reason);
+                }
             }
-            pending = retry;
         }
     }
     Ok(results)
 }
 
-type AttemptOutcomes =
-    BTreeMap<RelativePath, std::result::Result<Vec<(Variant, VariantOutcome)>, String>>;
+/// Retry eligibility belongs to the page operation that observed the failure.
+/// Only document navigation/readiness timeouts permit another browser attempt.
+#[derive(Debug)]
+enum PageFailure {
+    NavigationTimeout(GeneratorError),
+    Terminal(GeneratorError),
+}
+
+impl std::fmt::Display for PageFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NavigationTimeout(error) | Self::Terminal(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl From<GeneratorError> for PageFailure {
+    fn from(error: GeneratorError) -> Self {
+        Self::Terminal(error)
+    }
+}
+
+type PageResult<T> = std::result::Result<T, PageFailure>;
+type AttemptOutcomes = BTreeMap<RelativePath, PageResult<Value>>;
 
 struct MeasurementAttempt<'a> {
     batch_ordinal: u64,
     retry_ordinal: u64,
-    fixtures: &'a [&'a Fixture],
+    fixtures: &'a [&'a PreparedInput],
 }
 
 async fn run_attempt(
@@ -326,10 +343,7 @@ async fn run_attempt(
         BrowserExecution::Production => {
             AssertUnwindSafe(browser_attempt(
                 config.expect("production measurement prepared Chromiumoxide config"),
-                context.location,
                 context.manifest,
-                context.helper,
-                context.base_style,
                 attempt.fixtures,
             ))
             .catch_unwind()
@@ -396,7 +410,11 @@ async fn test_browser_attempt(
     attempt: &MeasurementAttempt<'_>,
     journal_path: &str,
 ) -> AttemptExecution {
-    host.record_attempt(attempt.batch_ordinal, attempt.retry_ordinal);
+    host.record_attempt(
+        attempt.batch_ordinal,
+        attempt.retry_ordinal,
+        attempt.fixtures,
+    );
     let mode = if host.plan() == TestBrowserPlan::BrowserFailure {
         super::supervisor::TestBrowserMode::Failure
     } else {
@@ -451,12 +469,21 @@ async fn test_browser_attempt(
         .iter()
         .map(|fixture| {
             let outcome = if retryable_failure {
-                Err("synthetic open-load-reset-timeout failure".to_owned())
+                Err(PageFailure::NavigationTimeout(generation_error(
+                    "synthetic open-load-reset-timeout failure",
+                )))
+            } else if matches!(
+                host.plan(),
+                TestBrowserPlan::HelperFailure
+                    | TestBrowserPlan::MeasurementFailure
+                    | TestBrowserPlan::CloseFailure
+            ) {
+                Err(PageFailure::Terminal(generation_error(format!(
+                    "synthetic terminal {:?} failure",
+                    host.plan()
+                ))))
             } else {
-                Ok(Variant::ALL
-                    .into_iter()
-                    .map(|variant| (variant, VariantOutcome::Generated(MeasuredLayout::zero())))
-                    .collect())
+                Ok(serde_json::json!({"synthetic": true}))
             };
             (fixture.source().clone(), outcome)
         })
@@ -504,11 +531,8 @@ pub(super) async fn run_test_supervisor(
 
 async fn browser_attempt(
     config: chromiumoxide::browser::BrowserConfig,
-    location: &CorpusLocation,
-    manifest: &LayoutManifest,
-    helper: &[u8],
-    base_style: &[u8],
-    fixtures: &[&Fixture],
+    manifest: &EngineManifest,
+    fixtures: &[&PreparedInput],
 ) -> AttemptExecution {
     let launched = AssertUnwindSafe(Browser::launch(config))
         .catch_unwind()
@@ -530,16 +554,9 @@ async fn browser_attempt(
                     Err(payload) => Err(dependency_panic("Chromiumoxide handler", payload)),
                 }
             });
-            let measured = AssertUnwindSafe(measure_pages(
-                browser.browser(),
-                location,
-                manifest,
-                helper,
-                base_style,
-                fixtures,
-            ))
-            .catch_unwind()
-            .await;
+            let measured = AssertUnwindSafe(measure_pages(browser.browser(), manifest, fixtures))
+                .catch_unwind()
+                .await;
             let close = tokio::time::timeout(
                 Duration::from_secs(5),
                 AssertUnwindSafe(browser.browser_mut().close()).catch_unwind(),
@@ -580,103 +597,124 @@ async fn browser_attempt(
 
 async fn measure_pages(
     browser: &Browser,
-    location: &CorpusLocation,
-    manifest: &LayoutManifest,
-    helper: &[u8],
-    base_style: &[u8],
-    fixtures: &[&Fixture],
+    manifest: &EngineManifest,
+    fixtures: &[&PreparedInput],
 ) -> Result<AttemptOutcomes> {
-    let helper = std::str::from_utf8(helper)
-        .map_err(|_| generation_error("layout helper script is not UTF-8"))?;
-    let base_style = std::str::from_utf8(base_style)
-        .map_err(|_| generation_error("layout base style is not UTF-8"))?;
     let mut outcomes = BTreeMap::new();
     for fixture in fixtures {
-        let outcome = measure_page(browser, location, manifest, helper, base_style, fixture).await;
-        outcomes.insert(
-            fixture.source().clone(),
-            outcome.map_err(|error| error.to_string()),
-        );
+        let outcome = measure_page(browser, manifest, fixture).await;
+        outcomes.insert(fixture.source().clone(), outcome);
     }
     Ok(outcomes)
 }
 
 async fn measure_page(
     browser: &Browser,
-    location: &CorpusLocation,
-    manifest: &LayoutManifest,
-    helper: &str,
-    base_style: &str,
-    fixture: &Fixture,
-) -> Result<Vec<(Variant, VariantOutcome)>> {
-    let html = std::str::from_utf8(fixture.bytes())
-        .map_err(|_| generation_error("layout fixture is not UTF-8"))?;
-    let base_directory = fixture
-        .source()
-        .as_str()
-        .rsplit_once('/')
-        .map_or("html", |(parent, _)| parent);
-    let base_url = url::Url::from_directory_path(location.corpus_root().join(base_directory))
-        .map_err(|_| generation_error("cannot construct layout fixture base URL"))?;
-    let style = if fixture.uses_base_style() {
-        format!("<style>{base_style}</style>")
-    } else {
-        String::new()
-    };
-    let document = format!(
-        "<base href=\"{}\">{style}{html}",
-        escape_html_attribute(base_url.as_str())
+    manifest: &EngineManifest,
+    fixture: &PreparedInput,
+) -> PageResult<Value> {
+    let job = fixture.job();
+    let page = navigation_future("open browser page", browser.new_page("about:blank")).await?;
+    // The adapter owns document construction. document.write preserves the existing
+    // HTML loading semantics, including authored doctype and script execution.
+    let document = serde_json::to_string(&job.document).map_err(generation_source)?;
+    let write = format!(
+        "(() => {{ document.open(); document.write({document}); document.close(); return true; }})()"
     );
-    let page =
-        dependency_future("open Chromiumoxide page", browser.new_page("about:blank")).await?;
-    dependency_future("set Chromiumoxide page content", page.set_content(document)).await?;
-    dependency_future("evaluate layout helper", page.evaluate(helper)).await?;
-    let timeout = Duration::from_millis(manifest.browser.launch.navigation_timeout_ms);
-    let poll = Duration::from_millis(manifest.browser.launch.dom_poll_interval_ms);
-    tokio::time::timeout(timeout, async {
-        loop {
-            let ready = dependency_future(
-                "poll layout document readiness",
-                page.evaluate(
-                    "document.readyState === 'complete' || document.readyState === 'interactive'",
-                ),
-            )
-            .await?
-            .into_value::<bool>()
-            .map_err(generation_source)?;
-            if ready {
-                break Ok::<(), GeneratorError>(());
+    let result = async {
+        navigation_future("load browser fixture", page.evaluate_expression(write)).await?;
+        let timeout = Duration::from_millis(manifest.browser.launch.navigation_timeout_ms);
+        let poll = Duration::from_millis(manifest.browser.launch.dom_poll_interval_ms);
+        let mut last_readiness_error = None;
+        tokio::time::timeout(timeout, async {
+            loop {
+                match dependency_future(
+                    "poll fixture readiness",
+                    page.evaluate_expression(job.readiness_expression.clone()),
+                )
+                .await
+                {
+                    Ok(value) => {
+                        let ready = value.into_value::<bool>().map_err(generation_source)?;
+                        if ready {
+                            break Ok::<(), GeneratorError>(());
+                        }
+                    }
+                    Err(error) => last_readiness_error = Some(error.to_string()),
+                }
+                tokio::time::sleep(poll).await;
             }
-            tokio::time::sleep(poll).await;
+        })
+        .await
+        .map_err(|source| {
+            PageFailure::NavigationTimeout(GeneratorError::with_source(
+                GeneratorErrorKind::Process,
+                "wait for fixture readiness",
+                last_readiness_error.map_or_else(
+                    || "timed out waiting for fixture readiness".to_owned(),
+                    |error| format!("timed out waiting for fixture readiness; last error: {error}"),
+                ),
+                source,
+            ))
+        })??;
+        if !job.setup_expression.trim().is_empty() {
+            dependency_future(
+                "initialize fixture protocol",
+                page.evaluate_expression(job.setup_expression.clone()),
+            )
+            .await?;
         }
-    })
-    .await
-    .map_err(|source| process_timeout("wait for layout document readiness", source))??;
-
-    let mut outcomes = Vec::with_capacity(4);
-    for variant in Variant::ALL {
-        let expression = format!(
-            "globalThis[{}] ?? null",
-            json_string(variant.browser_key())?
-        );
-        let result =
-            dependency_future("read layout measurement", page.evaluate(expression)).await?;
-        let value = result
-            .value()
-            .cloned()
-            .ok_or_else(|| generation_error("layout measurement has no protocol value"))?;
-        if value.is_null() {
-            outcomes.push((
-                variant,
-                VariantOutcome::Unsupported("browser produced no variant measurement".to_owned()),
-            ));
-        } else {
-            let measurement = serde_json::from_value(value).map_err(generation_source)?;
-            outcomes.push((variant, VariantOutcome::Generated(measurement)));
-        }
+        let value = dependency_future(
+            "measure browser fixture",
+            page.evaluate_expression(job.measurement_expression.clone()),
+        )
+        .await?;
+        value.value().cloned().ok_or_else(|| {
+            PageFailure::Terminal(generation_error(
+                "browser measurement omitted its JSON value",
+            ))
+        })
     }
-    dependency_future("close Chromiumoxide page", page.close()).await?;
-    Ok(outcomes)
+    .await;
+    let closed = dependency_future("close browser page", page.close()).await;
+    finish_page(result, closed)
+}
+
+fn finish_page<T>(result: PageResult<T>, closed: Result<()>) -> PageResult<T> {
+    match (result, closed) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(error)) => Err(PageFailure::Terminal(error)),
+        (Err(primary), Err(error)) => Err(PageFailure::Terminal(GeneratorError::with_source(
+            GeneratorErrorKind::Process,
+            "close browser page",
+            format!("{primary}; page cleanup failed: {error}"),
+            error,
+        ))),
+    }
+}
+
+async fn navigation_future<T>(
+    operation: &'static str,
+    future: impl std::future::Future<Output = chromiumoxide::error::Result<T>>,
+) -> PageResult<T> {
+    match AssertUnwindSafe(future).catch_unwind().await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(source)) => {
+            let timed_out = matches!(source, chromiumoxide::error::CdpError::Timeout);
+            let error = GeneratorError::with_source(
+                GeneratorErrorKind::Process,
+                operation,
+                source.to_string(),
+                source,
+            );
+            Err(if timed_out {
+                PageFailure::NavigationTimeout(error)
+            } else {
+                PageFailure::Terminal(error)
+            })
+        }
+        Err(payload) => Err(PageFailure::Terminal(dependency_panic(operation, payload))),
+    }
 }
 
 async fn dependency_future<T, E>(
@@ -734,7 +772,7 @@ fn process_timeout(operation: &str, source: tokio::time::error::Elapsed) -> Gene
 fn supervisor_timeout() -> GeneratorError {
     GeneratorError::new(
         GeneratorErrorKind::Process,
-        "wait for layout browser supervisor",
+        "wait for browser supervisor",
         "supervisor exceeded the five-second graceful exit bound and required SIGKILL",
     )
 }
@@ -755,7 +793,7 @@ where
 {
     GeneratorError::with_source(
         GeneratorErrorKind::Generation,
-        "convert layout measurement",
+        "convert browser measurement",
         source.to_string(),
         source,
     )
@@ -764,57 +802,68 @@ where
 fn generation_error(detail: impl Into<String>) -> GeneratorError {
     GeneratorError::new(
         GeneratorErrorKind::Generation,
-        "measure layout fixture",
+        "measure browser fixture",
         detail,
     )
 }
 
-fn escape_html_attribute(value: &str) -> String {
-    value.replace('&', "&amp;").replace('"', "&quot;")
-}
-
-fn json_string(value: &str) -> Result<String> {
-    serde_json::to_string(value).map_err(generation_source)
-}
-
 #[cfg(test)]
-mod tests {
-    use super::{apply_supervisor_termination, dependency_panic};
-    use crate::{GeneratorError, GeneratorErrorKind};
+mod retry_classification_tests {
+    use super::*;
+    use chromiumoxide::error::CdpError;
 
-    use super::SupervisorTermination;
+    #[tokio::test]
+    async fn navigation_retries_only_the_typed_timeout() {
+        for operation in [
+            "open fixture document",
+            "load browser fixture",
+            "reset fixture document",
+        ] {
+            let timeout = navigation_future(operation, async { Err::<(), _>(CdpError::Timeout) })
+                .await
+                .unwrap_err();
+            assert!(matches!(timeout, PageFailure::NavigationTimeout(_)));
+            let text = navigation_future(operation, async {
+                Err::<(), _>(CdpError::msg("Request timed out."))
+            })
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(text, PageFailure::Terminal(_)),
+                "diagnostic text cannot grant retry eligibility"
+            );
+        }
+    }
 
-    #[test]
-    fn layout_generate_dependency_panic_maps_to_process() {
-        let error = dependency_panic("test", Box::new("boom"));
-        assert_eq!(error.kind(), GeneratorErrorKind::Process);
-        assert!(error.to_string().contains("boom"));
+    #[tokio::test]
+    async fn helper_measurement_and_close_timeouts_remain_terminal() {
+        for operation in [
+            "initialize fixture protocol",
+            "measure browser fixture",
+            "close browser page",
+        ] {
+            let failure = dependency_future(operation, async { Err::<(), _>(CdpError::Timeout) })
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                PageFailure::from(failure),
+                PageFailure::Terminal(_)
+            ));
+        }
     }
 
     #[test]
-    fn layout_generate_forced_supervisor_exit_is_process() {
-        let error = apply_supervisor_termination(Ok(()), SupervisorTermination::Forced)
-            .expect_err("forced exit must fail an otherwise successful measurement");
-        assert_eq!(error.kind(), GeneratorErrorKind::Process);
-        assert!(
-            error
-                .to_string()
-                .contains("five-second graceful exit bound")
-        );
-    }
-
-    #[test]
-    fn layout_generate_forced_supervisor_exit_preserves_primary_failure() {
-        let error = apply_supervisor_termination::<()>(
-            Err(GeneratorError::new(
-                GeneratorErrorKind::Generation,
-                "synthetic measurement failure",
-                "primary context",
-            )),
-            SupervisorTermination::Forced,
+    fn page_cleanup_failure_prevents_retry_without_hiding_the_navigation_failure() {
+        let result = finish_page::<()>(
+            Err(PageFailure::NavigationTimeout(generation_error(
+                "navigation timed out",
+            ))),
+            Err(generation_error("close failed")),
         )
-        .expect_err("primary failure remains authoritative after successful terminalization");
-        assert_eq!(error.kind(), GeneratorErrorKind::Generation);
-        assert!(error.to_string().contains("primary context"));
+        .unwrap_err();
+        assert!(matches!(result, PageFailure::Terminal(_)));
+        let diagnostic = result.to_string();
+        assert!(diagnostic.contains("navigation timed out"));
+        assert!(diagnostic.contains("close failed"));
     }
 }

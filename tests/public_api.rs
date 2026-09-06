@@ -12,8 +12,6 @@ use surgeist_generator::{
 
 #[cfg(feature = "css-corpus")]
 use surgeist_generator::css::{CssCommand, CssRequest};
-#[cfg(feature = "layout-browser")]
-use surgeist_generator::layout::{LayoutCommand, LayoutRequest};
 
 const REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
 const ZERO_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -401,138 +399,262 @@ fn portable_count_bounds_and_structural_report_counts_are_enforced() {
     .expect("shared reports do not invent artifacts for unsupported/failed cases");
 }
 
-#[cfg(feature = "layout-browser")]
-#[test]
-fn layout_public_requests_are_io_free_and_accessors_are_exact() {
+#[cfg(feature = "browser-corpus")]
+mod browser_contract {
+    use super::*;
     use std::fs;
-    use std::path::PathBuf;
+    use std::io;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use surgeist_generator::browser::{
+        self, AcquisitionMode, BrowserCorpus, BrowserCorpusAdapter, BrowserGenerationReport,
+        BrowserLaunch, BrowserLocation, BrowserReportSummary, BrowserSettings, CaseOutcome,
+        CaseSpec, FixtureInput, FixtureSpec, FixtureStatus, GenerationError, GenerationRequest,
+        PreparedFixture, ReportScope, ResourceDependencies, SourceAttestation, SourceImportSpec,
+    };
 
-    struct TestRoot(PathBuf);
+    struct JsonAdapter;
 
-    impl Drop for TestRoot {
-        fn drop(&mut self) {
-            fs::remove_dir_all(&self.0).expect("remove public API roots");
+    impl BrowserCorpusAdapter for JsonAdapter {
+        type Error = io::Error;
+
+        fn prepare(&self, input: FixtureInput<'_>) -> io::Result<PreparedFixture> {
+            let document = std::str::from_utf8(input.source_bytes()).map_err(io::Error::other)?;
+            let _source = input.fixture().source();
+            let _base = input.base_url();
+            let _helper = input.input_bytes(&RelativePath::new("helpers/probe.js").unwrap());
+            PreparedFixture::new(
+                document.to_owned(),
+                "document.readyState !== 'loading'".to_owned(),
+                String::new(),
+                "({answer: 42})".to_owned(),
+                ResourceDependencies::Paths(Vec::new()),
+            )
+            .map_err(io::Error::other)
+        }
+
+        fn lower(
+            &self,
+            fixture: &FixtureSpec,
+            measurement: serde_json::Value,
+        ) -> io::Result<Vec<CaseOutcome>> {
+            Ok(vec![CaseOutcome::Generated {
+                case_id: fixture.cases()[0].id().to_owned(),
+                bytes: serde_json::to_vec(&measurement).map_err(io::Error::other)?,
+            }])
         }
     }
 
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let root = TestRoot(std::env::temp_dir().join(format!(
-        "surgeist-generator-layout-public-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    )));
-    let owner = root.0.join("owner");
-    let corpus = owner.join("corpus");
-    fs::create_dir_all(&corpus).expect("create public API roots");
-    let location = CorpusLocation::new(&owner, &corpus).expect("location");
-    fs::rename(&owner, root.0.join("detached-owner"))
-        .expect("detach roots before request construction");
-    let source = PathBuf::from("a-source-that-need-not-exist");
-
-    assert_copy_debug_eq::<LayoutCommand>();
-    assert_clone_debug_eq::<LayoutRequest>();
-    let _ = [
-        LayoutCommand::CheckCorpus,
-        LayoutCommand::CheckTaffyCorpus,
-        LayoutCommand::ImportTaffy,
-        LayoutCommand::Generate,
-    ];
-    let _: fn(CorpusLocation) -> LayoutRequest = LayoutRequest::check_corpus;
-    let _: fn(CorpusLocation, PathBuf) -> surgeist_generator::Result<LayoutRequest> =
-        LayoutRequest::check_taffy_corpus;
-    let _: fn(CorpusLocation, PathBuf) -> surgeist_generator::Result<LayoutRequest> =
-        LayoutRequest::import_taffy;
-    let _: fn(
-        CorpusLocation,
-        RelativePath,
-        Option<RelativePath>,
-    ) -> surgeist_generator::Result<LayoutRequest> = LayoutRequest::generate;
-    let _: fn(&LayoutRequest) -> &CorpusLocation = LayoutRequest::location;
-    let _: fn(&LayoutRequest) -> LayoutCommand = LayoutRequest::command;
-    let _: fn(&LayoutRequest) -> Option<&std::path::Path> = LayoutRequest::source_root;
-    let _: fn(&LayoutRequest) -> Option<&RelativePath> = LayoutRequest::browser_path;
-    let _: fn(&LayoutRequest) -> Option<&RelativePath> = LayoutRequest::filter;
-    let _: fn(LayoutRequest) -> surgeist_generator::Result<()> = surgeist_generator::layout::run;
-    let _: fn() -> surgeist_generator::Result<()> = surgeist_generator::layout::run_from_env;
-
-    let request = LayoutRequest::import_taffy(location.clone(), source.clone())
-        .expect("I/O-free import request");
-    assert_eq!(request.location(), &location);
-    assert_eq!(request.command(), LayoutCommand::ImportTaffy);
-    assert_eq!(request.source_root(), Some(source.as_path()));
-    assert_eq!(request.browser_path(), None);
-    assert_eq!(request.filter(), None);
-
-    let check = LayoutRequest::check_taffy_corpus(location.clone(), source.clone())
-        .expect("I/O-free Taffy check request");
-    assert_eq!(check.location(), &location);
-    assert_eq!(check.command(), LayoutCommand::CheckTaffyCorpus);
-    assert_eq!(check.source_root(), Some(source.as_path()));
-    assert_eq!(check.browser_path(), None);
-    assert_eq!(check.filter(), None);
-
-    let corpus_check = LayoutRequest::check_corpus(location.clone());
-    assert_eq!(corpus_check.location(), &location);
-    assert_eq!(corpus_check.command(), LayoutCommand::CheckCorpus);
-    assert_eq!(corpus_check.source_root(), None);
-    assert_eq!(corpus_check.browser_path(), None);
-    assert_eq!(corpus_check.filter(), None);
-
-    let browser = RelativePath::new("cache/chrome").expect("browser path");
-    let filter = RelativePath::new("grid/case.html").expect("filter");
-    let generation =
-        LayoutRequest::generate(location.clone(), browser.clone(), Some(filter.clone()))
-            .expect("I/O-free generation request");
-    assert_eq!(generation.location(), &location);
-    assert_eq!(generation.command(), LayoutCommand::Generate);
-    assert_eq!(generation.source_root(), None);
-    assert_eq!(generation.browser_path(), Some(&browser));
-    assert_eq!(generation.filter(), Some(&filter));
-
-    let error = LayoutRequest::generate(
-        location.clone(),
-        browser,
-        Some(RelativePath::new(".surgeist-taffy-source.json").unwrap()),
-    )
-    .expect_err("reserved generation filter");
-    assert_eq!(error.kind(), GeneratorErrorKind::Cli);
-    assert_eq!(error.exit_code(), 64);
-
-    #[cfg(unix)]
-    {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-
-        let native_source = PathBuf::from(OsString::from_vec(b"checkout-\x80".to_vec()));
-        let native = LayoutRequest::import_taffy(location.clone(), native_source.clone())
-            .expect("OS-native source payload is retained without I/O");
-        assert_eq!(
-            native
-                .source_root()
-                .expect("native source root")
-                .as_os_str(),
-            native_source.as_os_str()
-        );
+    struct TestRoot(PathBuf);
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).expect("remove browser public API roots");
+        }
     }
 
-    let error = LayoutRequest::import_taffy(location, PathBuf::new())
-        .expect_err("empty import source root");
-    assert_eq!(error.kind(), GeneratorErrorKind::Cli);
-    assert_eq!(error.exit_code(), 64);
-    assert_eq!(
-        error.to_string(),
-        "construct layout request: import-taffy requires a nonempty source root"
-    );
+    fn browser_settings() -> BrowserSettings {
+        BrowserSettings::new(
+            "chrome-for-testing".to_owned(),
+            "123.0.1".to_owned(),
+            "Chrome for Testing 123.0.1".to_owned(),
+            RelativePath::new("tmp/surgeist-browser").unwrap(),
+            "Chrome {version} {repository_relative_executable}".to_owned(),
+            BrowserLaunch::new(16, 30_000, 25, vec!["headless".to_owned()]).unwrap(),
+        )
+        .unwrap()
+    }
 
-    let error = LayoutRequest::check_taffy_corpus(check.location().clone(), PathBuf::new())
-        .expect_err("empty check source root");
-    assert_eq!(error.kind(), GeneratorErrorKind::Cli);
-    assert_eq!(error.exit_code(), 64);
-    assert_eq!(
-        error.to_string(),
-        "construct layout request: check-taffy-corpus requires a nonempty source root"
-    );
+    fn fixture(name: &str) -> FixtureSpec {
+        FixtureSpec::new(
+            name.to_owned(),
+            RelativePath::new(format!("fixtures/{name}.html")).unwrap(),
+            vec![
+                CaseSpec::new(
+                    "ordinary".to_owned(),
+                    "default".to_owned(),
+                    RelativePath::new(format!("out/{name}.json")).unwrap(),
+                )
+                .unwrap(),
+            ],
+            FixtureStatus::Active,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn downstream_adapter_can_declare_an_io_free_domain_neutral_request() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = TestRoot(std::env::temp_dir().join(format!(
+            "surgeist-generator-browser-public-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )));
+        let owner = root.0.join("browser-owner");
+        let corpus_root = root.0.join("external-corpus");
+        fs::create_dir_all(&owner).unwrap();
+        fs::create_dir_all(&corpus_root).unwrap();
+        let location = BrowserLocation::new(&owner, &corpus_root).unwrap();
+        assert_eq!(location.browser_owner(), fs::canonicalize(&owner).unwrap());
+        assert_eq!(
+            location.location().owner_root(),
+            location.location().corpus_root()
+        );
+        let captured_location = location.location().clone();
+        fs::rename(&owner, root.0.join("detached-owner")).unwrap();
+        fs::rename(&corpus_root, root.0.join("detached-corpus")).unwrap();
+
+        // Request construction cannot read or mutate either previously checked root.
+        // Per-fixture case IDs may repeat; output paths remain globally distinct.
+        let manifest = RelativePath::new("corpus.toml").unwrap();
+        let corpus = BrowserCorpus::new(
+            location,
+            manifest.clone(),
+            "example-json-adapter".to_owned(),
+            RelativePath::new("out").unwrap(),
+            vec![ReportScope::new(RelativePath::new("reports/all.json").unwrap(), None).unwrap()],
+            browser_settings(),
+            vec![fixture("b"), fixture("a")],
+            vec![RelativePath::new("helpers/probe.js").unwrap()],
+            Vec::new(),
+        )
+        .unwrap()
+        .with_expected_counts(BrowserReportSummary::new(2, 0, 0, 0, 0).unwrap())
+        .with_expected_inputs(BTreeMap::from([(
+            manifest,
+            Sha256Digest::from_bytes(b"manifest"),
+        )]))
+        .unwrap()
+        .with_exact_input_roots(vec![RelativePath::new("helpers").unwrap()])
+        .unwrap();
+        assert_eq!(corpus.location(), &captured_location);
+        assert_eq!(corpus.fixtures()[0].name(), "a");
+        assert_eq!(corpus.fixtures()[1].name(), "b");
+        assert_eq!(corpus.output_root().as_str(), "out");
+        assert_eq!(corpus.browser().launch().batch_size(), 16);
+        let result = JsonAdapter
+            .lower(
+                corpus.fixtures().first().unwrap(),
+                serde_json::json!({"answer": 42}),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            [CaseOutcome::Generated {
+                case_id: "ordinary".to_owned(),
+                bytes: br#"{"answer":42}"#.to_vec(),
+            }]
+        );
+        let browser = RelativePath::new("tmp/surgeist-browser/chrome").unwrap();
+        let _request = GenerationRequest::new(corpus.clone(), browser.clone(), None, None).unwrap();
+        let missing = GenerationRequest::new(
+            corpus,
+            browser,
+            Some(RelativePath::new("fixtures/missing.html").unwrap()),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(missing.kind(), GeneratorErrorKind::InvalidInventory);
+
+        let _: fn(
+            GenerationRequest,
+            JsonAdapter,
+        )
+            -> std::result::Result<BrowserGenerationReport, GenerationError<io::Error>> =
+            browser::generate;
+        let _: fn(
+            &BrowserCorpus,
+            &JsonAdapter,
+        )
+            -> std::result::Result<BrowserGenerationReport, GenerationError<io::Error>> =
+            browser::check_corpus;
+        let _: fn() -> Option<surgeist_generator::Result<()>> = browser::run_supervisor_from_env;
+    }
+
+    #[test]
+    fn public_source_policy_and_typed_adapter_errors_preserve_their_boundaries() {
+        assert_copy_debug_eq::<AcquisitionMode>();
+        assert_serde::<BrowserLaunch>();
+        assert_serde::<BrowserSettings>();
+        assert_serde::<SourceImportSpec>();
+        assert_error::<GenerationError<io::Error>>();
+        let pin = PinnedSource::new(
+            "fixtures",
+            "https://example.invalid/fixtures.git",
+            SourceRevision::new(REVISION).unwrap(),
+            RelativePath::new("cases").unwrap(),
+        )
+        .unwrap();
+        let spec = SourceImportSpec::new(
+            pin.clone(),
+            RelativePath::new("fixtures").unwrap(),
+            RelativePath::new(".surgeist-source.json").unwrap(),
+            "html".to_owned(),
+            2,
+            vec![RelativePath::new("authored").unwrap()],
+            vec![RelativePath::new("authored/local.html").unwrap()],
+        )
+        .unwrap();
+        assert_eq!(spec.pin(), &pin);
+        assert_eq!(spec.destination().as_str(), "fixtures");
+        assert_eq!(spec.sidecar().as_str(), ".surgeist-source.json");
+        assert_eq!(spec.expected_source_files(), 2);
+        assert_eq!(
+            serde_json::from_value::<SourceImportSpec>(serde_json::to_value(&spec).unwrap())
+                .unwrap(),
+            spec
+        );
+        let _: fn(
+            &CorpusLocation,
+            &SourceImportSpec,
+            &Path,
+        ) -> surgeist_generator::Result<SourceAttestation> = browser::import_source;
+        let _: fn(
+            &CorpusLocation,
+            &SourceImportSpec,
+        ) -> surgeist_generator::Result<SourceAttestation> = browser::verify_import;
+        let _: fn(
+            &CorpusLocation,
+            &SourceImportSpec,
+            &Path,
+        ) -> surgeist_generator::Result<SourceAttestation> = browser::verify_source_import;
+        let _: fn(
+            &Path,
+            &PinnedSource,
+            AcquisitionMode,
+        ) -> surgeist_generator::Result<VerifiedSource> = browser::acquire_source;
+        let _: fn(
+            &Path,
+            &BrowserSettings,
+            AcquisitionMode,
+        ) -> surgeist_generator::Result<RelativePath> = browser::acquire_browser;
+        let _: fn(&SourceAttestation) -> BTreeMap<RelativePath, Sha256Digest> =
+            SourceAttestation::verified_inputs;
+
+        let error = GenerationError::Adapter {
+            source: RelativePath::new("fixtures/a.html").unwrap(),
+            stage: "lower",
+            error: io::Error::other("domain-owned measurement rejection"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "lower fixtures/a.html: domain-owned measurement rejection"
+        );
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            "domain-owned measurement rejection"
+        );
+        assert!(serde_json::from_str::<BrowserLaunch>(r#"{"batch_size":0,"navigation_timeout_ms":1,"dom_poll_interval_ms":1,"arguments":[]}"#).is_err());
+        assert!(
+            PreparedFixture::new(
+                String::new(),
+                String::new(),
+                String::new(),
+                "1".to_owned(),
+                ResourceDependencies::Paths(Vec::new())
+            )
+            .is_err()
+        );
+    }
 }
 
 #[cfg(feature = "css-corpus")]

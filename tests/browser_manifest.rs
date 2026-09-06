@@ -1,15 +1,15 @@
-#![cfg(feature = "layout-browser")]
+#![cfg(feature = "browser-corpus")]
 
 use std::fs;
 
 #[test]
-fn layout_browser_feature_has_the_exact_optional_dependency_edge() {
+fn browser_corpus_feature_has_the_exact_optional_dependency_edge() {
     let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let manifest = fs::read_to_string(manifest_path).expect("read Cargo.toml");
     let value: toml::Value = toml::from_str(&manifest).expect("parse Cargo.toml");
-    let feature = value["features"]["layout-browser"]
+    let feature = value["features"]["browser-corpus"]
         .as_array()
-        .expect("layout-browser feature array")
+        .expect("browser-corpus feature array")
         .iter()
         .map(|entry| entry.as_str().expect("feature string"))
         .collect::<Vec<_>>();
@@ -20,7 +20,12 @@ fn layout_browser_feature_has_the_exact_optional_dependency_edge() {
 
     let dependencies = value["dependencies"].as_table().expect("dependency table");
     for (name, version, features, default_features) in [
-        ("chromiumoxide", "=0.9.1", &["bytes"][..], Some(false)),
+        (
+            "chromiumoxide",
+            "=0.9.1",
+            &["bytes", "fetcher", "rustls", "zip8"][..],
+            Some(false),
+        ),
         ("futures", "=0.3.31", &[][..], None),
         (
             "tokio",
@@ -65,13 +70,13 @@ fn layout_browser_feature_has_the_exact_optional_dependency_edge() {
 }
 
 #[test]
-fn layout_license_policy_is_exact_and_has_no_bypasses() {
+fn browser_license_policy_has_only_the_pinned_tls_certificate_exception() {
     let policy_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("deny.toml");
     let policy = fs::read_to_string(policy_path).expect("read deny.toml");
     let value: toml::Value = toml::from_str(&policy).expect("parse deny.toml");
     assert_eq!(value.as_table().expect("policy table").len(), 1);
     let licenses = value["licenses"].as_table().expect("licenses table");
-    assert_eq!(licenses.len(), 2);
+    assert_eq!(licenses.len(), 3);
     assert_eq!(licenses["confidence-threshold"].as_float(), Some(0.8));
     let actual = licenses["allow"]
         .as_array()
@@ -98,5 +103,24 @@ fn layout_license_policy_is_exact_and_has_no_bypasses() {
             "Unlicense",
             "Zlib",
         ]
+    );
+    let exceptions = licenses["exceptions"]
+        .as_array()
+        .expect("license exceptions");
+    assert_eq!(exceptions.len(), 1);
+    let exception = exceptions[0]
+        .as_table()
+        .expect("certificate data exception");
+    assert_eq!(exception.len(), 3);
+    assert_eq!(exception["name"].as_str(), Some("webpki-root-certs"));
+    assert_eq!(exception["version"].as_str(), Some("=1.0.8"));
+    assert_eq!(
+        exception["allow"]
+            .as_array()
+            .expect("exception license")
+            .iter()
+            .map(|entry| entry.as_str().expect("license string"))
+            .collect::<Vec<_>>(),
+        ["CDLA-Permissive-2.0"]
     );
 }

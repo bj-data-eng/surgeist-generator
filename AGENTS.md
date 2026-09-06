@@ -51,26 +51,26 @@ silently update another document, or widen the task to reconcile them.
 
 ## Crate Boundary
 
-`surgeist-generator` owns the shared generation core and the two completed,
-feature-gated CSS and layout drivers. `css-corpus` exposes the synchronous
-CSSTree/neutral-expectation API and `surgeist-css-generate`; `layout-browser`
-exposes Taffy maintenance, trusted-browser XML/report generation, and
-`surgeist-layout-generate`. The default feature set exposes only shared value and
-read contracts. `Cargo.toml`, `src/lib.rs`, and the public module rustdoc own the
-exact current target and API facts.
+`surgeist-generator` owns shared generation infrastructure, the feature-gated
+CSS driver, and the caller-driven browser corpus engine. `css-corpus` exposes
+the synchronous CSSTree/neutral-expectation API and `surgeist-css-generate`.
+`browser-corpus` exposes explicit acquisition, source import/attestation,
+browser lifecycle, generic provenance/accounting, and atomic publication.
+Callers own their host executable, fixture semantics, measurement protocol, and
+artifact serialization. This crate has no layout-specific API or binary.
 
-Callers supply explicit owner/corpus roots and, for imports/source checks, an
-existing source checkout. Corpus manifests own mutable source pins, counts,
-artifact roots, and browser settings. This repository owns the parser,
-verification, transaction, generation, and focused synthetic/process evidence;
-it does not own or commit production corpora, source checkouts, browsers, XML,
-expectation trees, or sibling adoption changes.
+The default value/read library remains native/wasm portable; mutation support is
+Apple-Silicon macOS. `CorpusLocation` preserves contained roots; browser-specific
+locations separately bind an exact browser owner and corpus. Acquisition uses
+ignored owner-local `tmp/surgeist-sources` and `tmp/surgeist-browser` caches,
+outside Cargo build output and corpus transactions. Existing-only operations
+and corpus checks never acquire software. Manifests/caller declarations own
+source pins, counts, paths, and browser settings. README and rustdoc define
+precise trust, provenance, cache, recovery, and migration contracts.
 
-Mutation support is Apple-Silicon macOS. The default value/read library remains
-native/wasm portable. Source/browser acquisition is not a crate capability:
-imports verify existing checkouts and generation authenticates one existing
-trusted browser executable. README and rustdoc define the operator-facing trust,
-offline-attestation, profile-recovery, and Taffy-adoption boundaries.
+This repository owns infrastructure and focused synthetic/process evidence; it
+does not commit production corpora, acquired software, generated expectations,
+or sibling adoption changes.
 
 The root `surgeist` repository continues to own cross-crate integration, this
 leaf's gitlink, and the root API generator and generated API audit artifacts.
@@ -92,16 +92,16 @@ tooling can run without unauthorized acquisition.
 ```sh
 cargo generate-lockfile --offline
 RUSTFLAGS="-D warnings" cargo check --locked --offline -p surgeist-generator --no-default-features
-RUSTFLAGS="-D warnings" cargo check --locked --offline -p surgeist-generator --features layout-browser
+RUSTFLAGS="-D warnings" cargo check --locked --offline -p surgeist-generator --features browser-corpus
 RUSTFLAGS="-D warnings" cargo check --locked --offline -p surgeist-generator --features css-corpus
 RUSTFLAGS="-D warnings" cargo check --locked --offline -p surgeist-generator --all-features
 cargo test --locked --offline -p surgeist-generator --no-default-features
-cargo test --locked --offline -p surgeist-generator --features layout-browser
+cargo test --locked --offline -p surgeist-generator --features browser-corpus
 cargo test --locked --offline -p surgeist-generator --features css-corpus
 cargo test --locked --offline -p surgeist-generator --all-features
 cargo test --locked --offline -p surgeist-generator --all-features -- --ignored --list
 cargo clippy --locked --offline -p surgeist-generator --no-default-features --all-targets -- -F unsafe-code -D warnings
-cargo clippy --locked --offline -p surgeist-generator --features layout-browser --all-targets -- -F unsafe-code -D warnings
+cargo clippy --locked --offline -p surgeist-generator --features browser-corpus --all-targets -- -F unsafe-code -D warnings
 cargo clippy --locked --offline -p surgeist-generator --features css-corpus --all-targets -- -F unsafe-code -D warnings
 cargo clippy --locked --offline -p surgeist-generator --all-features --all-targets -- -F unsafe-code -D warnings
 RUSTFLAGS="-D warnings" cargo check --locked --offline -p surgeist-generator --target wasm32-unknown-unknown --no-default-features --lib

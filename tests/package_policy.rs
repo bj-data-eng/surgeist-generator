@@ -9,7 +9,7 @@ fn package_metadata_and_driver_feature_boundaries_are_exact() {
 
     let package = value["package"].as_table().expect("package table");
     assert_eq!(package["name"].as_str(), Some("surgeist-generator"));
-    assert_eq!(package["version"].as_str(), Some("0.1.0"));
+    assert_eq!(package["version"].as_str(), Some("0.2.0"));
     assert_eq!(package["edition"].as_str(), Some("2024"));
     assert_eq!(package["rust-version"].as_str(), Some("1.97"));
     assert_eq!(package["license"].as_str(), Some("MIT"));
@@ -19,9 +19,9 @@ fn package_metadata_and_driver_feature_boundaries_are_exact() {
     assert!(features["default"].as_array().is_some_and(Vec::is_empty));
     assert!(features["css-corpus"].as_array().is_some_and(Vec::is_empty));
     assert_eq!(
-        features["layout-browser"]
+        features["browser-corpus"]
             .as_array()
-            .expect("layout feature")
+            .expect("browser feature")
             .iter()
             .map(|entry| entry.as_str().expect("feature entry"))
             .collect::<Vec<_>>(),
@@ -46,15 +46,13 @@ fn package_metadata_and_driver_feature_boundaries_are_exact() {
             )
         })
         .collect::<BTreeMap<_, _>>();
-    assert_eq!(actual_bins.len(), 2);
+    assert_eq!(actual_bins.len(), 1);
     assert_eq!(
         actual_bins["surgeist-css-generate"],
         ("src/bin/surgeist-css-generate.rs", "css-corpus")
     );
-    assert_eq!(
-        actual_bins["surgeist-layout-generate"],
-        ("src/bin/surgeist-layout-generate.rs", "layout-browser")
-    );
+    assert!(!features.contains_key("layout-browser"));
+    assert!(!actual_bins.contains_key("surgeist-layout-generate"));
 
     let dependencies = value["dependencies"]
         .as_table()

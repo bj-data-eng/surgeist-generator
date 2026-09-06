@@ -229,7 +229,7 @@ impl CorpusLocation {
         &self.corpus_root
     }
 
-    #[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+    #[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
     pub(crate) fn coordination_root(&self) -> PathBuf {
         self.corpus_root.join(COORDINATION_COMPONENT)
     }

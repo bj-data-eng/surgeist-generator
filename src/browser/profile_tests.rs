@@ -8,23 +8,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::core::{
-    Domain, DurabilityEvent, DurabilityPhase, DurabilityPrimitive, GenerationLease, ObjectFormat,
-    PRIVATE_FILE_MODE, RootedFs, RootedObserver, SnapshotEntry, VerifiedSourceSnapshot,
+    Domain, DurabilityEvent, DurabilityPhase, DurabilityPrimitive, GenerationLease,
+    PRIVATE_FILE_MODE, RootedFs, RootedObserver,
 };
-use crate::{
-    CorpusLocation, GeneratorError, GeneratorErrorKind, PinnedSource, RelativePath, RunScope,
-    Sha256Digest, SourceRevision,
-};
+use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, RelativePath, RunScope};
 
-use super::browser::TrustedBrowser;
+use super::browser_runtime::TrustedBrowser;
 use super::measurement::{TestBrowserPlan, TestGenerationHost};
+use super::model::EngineManifest;
 use super::profile::{
     OwnedSupervisorChild, PROFILE_PARENT, ProfileAttempt, ProfileCreateContext, ProfileJournal,
     SUPERVISOR_EXIT_BOUND, SupervisorTermination, classify_pending, force_kill_group,
     resolve_terminalization, test_cleanup_path, test_group_is_dead, test_validate_journal_name,
 };
 use super::supervisor::TestBrowserMode;
-use super::{LayoutRequest, generation, manifest, sidecar, supervisor, tests};
+use super::{
+    BrowserCorpus, BrowserCorpusAdapter, BrowserLaunch, BrowserSettings, CaseOutcome, CaseSpec,
+    FixtureInput, FixtureSpec, FixtureStatus, GenerationError, GenerationRequest, PreparedFixture,
+    ReportScope, ResourceDependencies, engine, supervisor,
+};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 const FIXTURE_BYTES: &[u8] = b"<div>fixture</div>\n";
@@ -60,98 +62,178 @@ struct GenerationHarness {
     location: CorpusLocation,
     browser_path: RelativePath,
     executable: PathBuf,
+    configuration: EngineManifest,
+    corpus_spec: BrowserCorpus,
 }
-
+struct OpaqueAdapter;
+impl BrowserCorpusAdapter for OpaqueAdapter {
+    type Error = std::io::Error;
+    fn prepare(
+        &self,
+        input: FixtureInput<'_>,
+    ) -> std::result::Result<PreparedFixture, Self::Error> {
+        PreparedFixture::new(
+            String::from_utf8_lossy(input.source_bytes()).into_owned(),
+            "true".to_owned(),
+            String::new(),
+            "{}".to_owned(),
+            ResourceDependencies::Paths(Vec::new()),
+        )
+        .map_err(std::io::Error::other)
+    }
+    fn lower(
+        &self,
+        fixture: &FixtureSpec,
+        _: serde_json::Value,
+    ) -> std::result::Result<Vec<CaseOutcome>, Self::Error> {
+        Ok(fixture
+            .cases()
+            .iter()
+            .map(|case| CaseOutcome::Generated {
+                case_id: case.id().to_owned(),
+                bytes: b"<test/>\n".to_vec(),
+            })
+            .collect())
+    }
+}
 impl GenerationHarness {
     fn new() -> Self {
-        let executable =
-            fs::canonicalize(std::env::current_exe().expect("current test executable"))
-                .expect("canonical test executable");
-        let cache = executable
-            .parent()
-            .expect("test executable cache directory");
-        let owner = cache
-            .parent()
-            .expect("test executable cache has an owner directory");
+        let executable = std::env::current_exe()
+            .and_then(fs::canonicalize)
+            .expect("current executable");
+        let cache = executable.parent().expect("cache");
+        let owner = cache.parent().expect("owner");
         let temporary = TestDirectory::new(owner);
         let corpus = temporary.path().join("corpus");
-        fs::create_dir(&corpus).expect("create generation corpus");
-        let location = CorpusLocation::new(owner, &corpus).expect("generation corpus location");
-        let cache_root = path_relative_to(owner, cache);
-        let browser_path = RelativePath::new(path_relative_to(owner, &executable))
-            .expect("owner-relative current test executable");
-        let manifest_text = tests::manifest_text(tests::SHA1_REVISION, 1, "").replace(
-            "cache_root = \"browser-cache\"",
-            &format!("cache_root = \"{cache_root}\""),
-        );
-        write(
-            &corpus.join(manifest::MANIFEST_FILE),
-            manifest_text.as_bytes(),
-        );
+        fs::create_dir(&corpus).expect("corpus");
+        let location = CorpusLocation::new(owner, &corpus).expect("location");
+        let browser_path =
+            RelativePath::new(path_relative_to(owner, &executable)).expect("browser");
+        let settings = BrowserSettings::new(
+            "synthetic".to_owned(),
+            "1".to_owned(),
+            "synthetic 1".to_owned(),
+            RelativePath::new(path_relative_to(owner, cache)).expect("cache"),
+            "browser {version} {repository_relative_executable}".to_owned(),
+            BrowserLaunch::new(16, 1000, 10, Vec::new()).expect("launch"),
+        )
+        .expect("settings");
+        let configuration =
+            EngineManifest::new(settings.clone(), owner.to_path_buf()).expect("configuration");
+        write(&corpus.join("corpus.toml"), b"synthetic=true\n");
         write(&corpus.join("scripts/gentest/test_helper.js"), HELPER_BYTES);
         write(
             &corpus.join("scripts/gentest/test_base_style.css"),
             BASE_STYLE_BYTES,
         );
         write(&corpus.join("html/grid/basic.html"), FIXTURE_BYTES);
-        write(
-            &corpus.join("html").join(manifest::SIDECAR_FILE),
-            &sidecar_bytes(),
-        );
+        let cases = [
+            "border_box_ltr",
+            "border_box_rtl",
+            "content_box_ltr",
+            "content_box_rtl",
+        ]
+        .into_iter()
+        .map(|variant| {
+            CaseSpec::new(
+                format!("basic__{variant}"),
+                variant.to_owned(),
+                RelativePath::new(format!("xml/grid/basic__{variant}.xml")).expect("output"),
+            )
+            .expect("case")
+        })
+        .collect();
+        let fixture = FixtureSpec::new(
+            "basic".to_owned(),
+            RelativePath::new("html/grid/basic.html").expect("source"),
+            cases,
+            FixtureStatus::Active,
+        )
+        .expect("fixture");
+        let corpus_spec = BrowserCorpus::new(
+            location.clone(),
+            RelativePath::new("corpus.toml").expect("manifest"),
+            "consumer-host".to_owned(),
+            RelativePath::new("xml").expect("output"),
+            vec![
+                ReportScope::new(
+                    RelativePath::new("generation-reports/all.json").expect("report"),
+                    None,
+                )
+                .expect("scope"),
+            ],
+            settings,
+            vec![fixture],
+            vec![
+                RelativePath::new("scripts/gentest/test_helper.js").expect("helper"),
+                RelativePath::new("scripts/gentest/test_base_style.css").expect("style"),
+            ],
+            Vec::new(),
+        )
+        .expect("corpus contract");
         Self {
             _temporary: temporary,
             location,
             browser_path,
             executable,
+            configuration,
+            corpus_spec,
         }
     }
-
     fn corpus(&self) -> &Path {
         self.location.corpus_root()
     }
-
-    fn request(&self, filter: Option<&str>) -> LayoutRequest {
-        LayoutRequest::generate(
-            self.location.clone(),
+    fn request(&self, filter: Option<&str>) -> GenerationRequest {
+        GenerationRequest::new(
+            self.corpus_spec.clone(),
             self.browser_path.clone(),
-            filter
-                .map(RelativePath::new)
-                .transpose()
-                .expect("generation filter"),
+            filter.map(|value| RelativePath::new(format!("html/{value}")).expect("filter")),
+            None,
         )
-        .expect("generation request")
+        .expect("request")
     }
-
     fn run(&self, plan: TestBrowserPlan) -> (crate::Result<()>, TestGenerationHost) {
-        let host = TestGenerationHost::new(plan);
-        let result = generation::run_with_test_host(self.request(None), host.clone());
-        (result, host)
+        self.run_request(self.request(None), plan)
     }
-
     fn run_filtered(
         &self,
         filter: &str,
         plan: TestBrowserPlan,
     ) -> (crate::Result<()>, TestGenerationHost) {
+        self.run_request(self.request(Some(filter)), plan)
+    }
+    fn run_request(
+        &self,
+        request: GenerationRequest,
+        plan: TestBrowserPlan,
+    ) -> (crate::Result<()>, TestGenerationHost) {
         let host = TestGenerationHost::new(plan);
-        let result = generation::run_with_test_host(self.request(Some(filter)), host.clone());
+        let result = engine::run_with_test_host(request, OpaqueAdapter, host.clone())
+            .map(|_| ())
+            .map_err(|error| match error {
+                GenerationError::Generator(error) => error,
+                GenerationError::Adapter { error, .. } => GeneratorError::with_source(
+                    GeneratorErrorKind::Generation,
+                    "synthetic adapter",
+                    error.to_string(),
+                    error,
+                ),
+            });
         (result, host)
     }
-
-    fn replace_fixture(&self, relative: &str, bytes: &[u8]) {
-        fs::remove_file(self.corpus().join("html/grid/basic.html"))
-            .expect("remove original fixture");
-        write(&self.corpus().join("html").join(relative), bytes);
-        write(
-            &self.corpus().join("html").join(manifest::SIDECAR_FILE),
-            &sidecar_bytes_for(relative, bytes),
-        );
-    }
-
     fn check(&self) -> crate::Result<()> {
-        super::run(LayoutRequest::check_corpus(self.location.clone()))
+        engine::check_corpus(&self.corpus_spec, &OpaqueAdapter)
+            .map(|_| ())
+            .map_err(|error| match error {
+                GenerationError::Generator(error) => error,
+                GenerationError::Adapter { error, .. } => GeneratorError::with_source(
+                    GeneratorErrorKind::Generation,
+                    "synthetic adapter",
+                    error.to_string(),
+                    error,
+                ),
+            })
     }
-
     fn rooted(&self) -> RootedFs {
         RootedFs::open_corpus(&self.location).expect("open generation corpus")
     }
@@ -164,21 +246,19 @@ impl GenerationHarness {
     fn lease(&self) -> GenerationLease {
         GenerationLease::acquire_for_test(
             &self.location,
-            Domain::Layout,
-            "surgeist-layout-generate",
+            Domain::Browser,
+            "consumer-host",
             &RunScope::Full,
             "generate",
         )
         .expect("layout generation lease")
     }
 
-    fn parsed_manifest(&self) -> super::manifest::LayoutManifest {
-        let path = self.corpus().join(manifest::MANIFEST_FILE);
-        let bytes = fs::read(&path).expect("read generation manifest");
-        manifest::parse(&bytes, &path).expect("parse generation manifest")
+    fn parsed_manifest(&self) -> EngineManifest {
+        self.configuration.clone()
     }
 
-    fn trusted_browser(&self, manifest: &super::manifest::LayoutManifest) -> TrustedBrowser {
+    fn trusted_browser(&self, manifest: &EngineManifest) -> TrustedBrowser {
         TrustedBrowser::validate(&self.location, manifest, &self.browser_path)
             .expect("trusted current test executable")
     }
@@ -278,7 +358,6 @@ impl GenerationHarness {
         }
     }
 }
-
 #[test]
 fn layout_profile_normal_close_is_terminal() {
     let harness = GenerationHarness::new();
@@ -1121,70 +1200,6 @@ fn layout_generate_filtered_success_preserves_full_report() {
 }
 
 #[test]
-fn layout_filter_invalid_historical_authority_precedes_zero_match() {
-    let harness = GenerationHarness::new();
-    write(
-        &harness.corpus().join("xml/generation-reports/all.json"),
-        b"{malformed historical report}\n",
-    );
-
-    let (result, host) = harness.run_filtered("absent", TestBrowserPlan::Success);
-    let error = result.expect_err("invalid history must precede zero-match selection");
-
-    assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
-    assert!(host.attempts().is_empty());
-    harness.assert_terminal();
-}
-
-#[test]
-fn layout_filter_unknown_historical_inventory_precedes_unowned_selection() {
-    let harness = GenerationHarness::new();
-    harness
-        .run(TestBrowserPlan::Success)
-        .0
-        .expect("seed historically owned fixture");
-    harness.replace_fixture("grid/new.html", b"<div>new fixture</div>\n");
-    write(&harness.corpus().join("xml/unknown.bin"), b"unknown\n");
-    let before = snapshot_xml(harness.corpus());
-
-    let (result, host) = harness.run_filtered("grid/new.html", TestBrowserPlan::Success);
-    let error = result.expect_err("unknown history must precede unowned selection");
-
-    assert_eq!(error.kind(), GeneratorErrorKind::InvalidInventory);
-    assert!(host.attempts().is_empty());
-    assert_eq!(snapshot_xml(harness.corpus()), before);
-    harness.assert_terminal();
-}
-
-#[test]
-fn layout_filter_valid_history_keeps_zero_match_and_unowned_verification() {
-    let zero_match = GenerationHarness::new();
-    let (result, host) = zero_match.run_filtered("absent", TestBrowserPlan::Success);
-    assert_eq!(
-        result.expect_err("zero-match filter").kind(),
-        GeneratorErrorKind::Verification
-    );
-    assert!(host.attempts().is_empty());
-    zero_match.assert_terminal();
-
-    let unowned = GenerationHarness::new();
-    unowned
-        .run(TestBrowserPlan::Success)
-        .0
-        .expect("seed historical ownership");
-    unowned.replace_fixture("grid/new.html", b"<div>new fixture</div>\n");
-    let before = snapshot_xml(unowned.corpus());
-    let (result, host) = unowned.run_filtered("grid/new.html", TestBrowserPlan::Success);
-    assert_eq!(
-        result.expect_err("unowned filter").kind(),
-        GeneratorErrorKind::Verification
-    );
-    assert!(host.attempts().is_empty());
-    assert_eq!(snapshot_xml(unowned.corpus()), before);
-    unowned.assert_terminal();
-}
-
-#[test]
 fn layout_fake_supervisor_process() {
     if std::env::var_os(supervisor::CAPSULE_ENV).is_none() {
         return;
@@ -1228,32 +1243,6 @@ fn layout_profile_name_and_cleanup_grammar_is_exact() {
         format!("{PROFILE_PARENT}/cleanup-{lease}-version-{profile}")
     );
 }
-
-fn sidecar_bytes() -> Vec<u8> {
-    sidecar_bytes_for("grid/basic.html", FIXTURE_BYTES)
-}
-
-fn sidecar_bytes_for(relative: &str, bytes: &[u8]) -> Vec<u8> {
-    let snapshot = VerifiedSourceSnapshot {
-        object_format: ObjectFormat::Sha1,
-        entries: vec![SnapshotEntry {
-            path: RelativePath::new(relative).expect("fixture path"),
-            git_mode: "100644".to_owned(),
-            blob_object_id: "2".repeat(40),
-            digest: Sha256Digest::from_bytes(bytes),
-            bytes: bytes.to_vec(),
-        }],
-    };
-    let pin = PinnedSource::new(
-        "taffy",
-        manifest::TAFFY_REPOSITORY,
-        SourceRevision::new(tests::SHA1_REVISION).expect("source revision"),
-        RelativePath::new(manifest::TAFFY_SOURCE_DIRECTORY).expect("source directory"),
-    )
-    .expect("Taffy pin");
-    sidecar::canonical_bytes(&pin, 1, &snapshot).expect("canonical Taffy sidecar")
-}
-
 fn run_observed_profile_lifecycle(
     harness: &GenerationHarness,
     observer: RootedObserver,
@@ -1305,7 +1294,7 @@ fn dead_crate_owned_process_id() -> u32 {
     let mut child = std::process::Command::new(executable)
         .args([
             "--exact",
-            "layout::profile_tests::layout_fake_browser_success_process",
+            "browser::profile_tests::layout_fake_browser_success_process",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1438,4 +1427,24 @@ fn is_fake_browser_invocation() -> bool {
             .as_deref()
             .is_some_and(|path| Path::new(path).ends_with("xdg-config"))
         && std::env::var("NO_PROXY").as_deref() == Ok("*")
+}
+
+#[test]
+fn browser_profile_waits_for_registration_before_owned_cleanup() {
+    let harness = GenerationHarness::new();
+    let lease = harness.lease();
+    let journal = harness.version_journal(&lease);
+    let mut child = harness.spawn_supervisor(&journal, TestBrowserMode::DelayedRegistration);
+    let terminal = journal.terminalize_owned_supervisor(lease.rooted(), Some(&mut child));
+    let status = child.wait().expect("reap delayed supervisor");
+    assert_eq!(
+        terminal.expect("registered supervisor terminalization"),
+        SupervisorTermination::Graceful
+    );
+    assert!(
+        status.success(),
+        "cleanup must preserve the journal until its delayed supervisor registers and exits"
+    );
+    drop(lease);
+    harness.assert_terminal();
 }

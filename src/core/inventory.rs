@@ -77,7 +77,7 @@ impl InventoryEntry {
         &self.identity
     }
 
-    #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+    #[cfg(any(feature = "css-corpus", feature = "browser-corpus"))]
     pub(crate) const fn digest(&self) -> Option<&Sha256Digest> {
         self.digest.as_ref()
     }
@@ -244,7 +244,7 @@ impl Inventory {
         &self.entries
     }
 
-    #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+    #[cfg(any(feature = "css-corpus", feature = "browser-corpus"))]
     pub(crate) fn find(&self, path: &RelativePath) -> Option<&InventoryEntry> {
         self.entries
             .binary_search_by(|entry| entry.path.cmp(path))

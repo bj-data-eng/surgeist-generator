@@ -28,6 +28,7 @@ const OWNER_TRANSACTIONS: &str = "owner-transactions";
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Domain {
     Layout,
+    Browser,
     Css,
 }
 
@@ -35,6 +36,7 @@ impl Domain {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Layout => "layout",
+            Self::Browser => "browser",
             Self::Css => "css",
         }
     }
@@ -1064,7 +1066,8 @@ fn validate_bootstrap_state(
         })?;
         let final_allowed = intent.final_path == ACQUISITION_LOCK
             || intent.final_path == mutex_path(Domain::Layout)
-            || intent.final_path == mutex_path(Domain::Css);
+            || intent.final_path == mutex_path(Domain::Css)
+            || intent.final_path == mutex_path(Domain::Browser);
         if intent.schema_version != 1
             || intent.creator_pid != parsed.origin_pid
             || intent.token != parsed.origin_token
@@ -1519,10 +1522,17 @@ fn validate_coordination_tree_inner(rooted: &RootedFs, domain: Domain) -> Result
         }
     }
     if rooted.exists(".surgeist-generator/profiles")? {
-        validate_exact_children(rooted, ".surgeist-generator/profiles", &["layout"])?;
+        validate_exact_children(
+            rooted,
+            ".surgeist-generator/profiles",
+            &["layout", "browser"],
+        )?;
     }
     if rooted.exists(".surgeist-generator/profiles/layout")? {
         validate_private_directory(rooted, ".surgeist-generator/profiles/layout")?;
+    }
+    if rooted.exists(".surgeist-generator/profiles/browser")? {
+        validate_private_directory(rooted, ".surgeist-generator/profiles/browser")?;
     }
     let lease = format!(".surgeist-generator/leases/{}", domain.as_str());
     if rooted.exists(&lease)? {
@@ -5227,30 +5237,30 @@ pub(crate) fn corpus_authority_key(rooted: &RootedFs, domain: Domain) -> String 
     .to_string()
 }
 
-#[cfg(feature = "layout-browser")]
-pub(crate) fn authenticate_layout_supervisor_owner(
+#[cfg(feature = "browser-corpus")]
+pub(crate) fn authenticate_browser_supervisor_owner(
     rooted: &RootedFs,
     location: &CorpusLocation,
     parent_pid: u32,
 ) -> Result<()> {
-    let path = owner_path(Domain::Layout);
+    let path = owner_path(Domain::Browser);
     let bytes = rooted.read_file(&path, PRIVATE_FILE_MODE)?;
     validate_owner_record_bytes(
         rooted,
         &bytes,
-        "authenticate layout supervisor owner",
+        "authenticate browser supervisor owner",
         "visible owner record",
     )?;
     let owner: OwnerRecord = serde_json::from_slice(&bytes).map_err(|source| {
         GeneratorError::with_source(
             GeneratorErrorKind::ArtifactTransaction,
-            "authenticate layout supervisor owner",
+            "authenticate browser supervisor owner",
             "visible owner record cannot be decoded",
             source,
         )
     })?;
     if owner.schema_version != 1
-        || owner.generator != "surgeist-layout-generate"
+        || !super::validate_identifier(&owner.generator)
         || owner.command != "generate"
         || owner.pid != parent_pid
         || owner.owner_root != location.owner_root().display().to_string()
@@ -5258,7 +5268,7 @@ pub(crate) fn authenticate_layout_supervisor_owner(
         || !(owner.scope == "full" || owner.scope.starts_with("filtered:"))
     {
         return Err(transaction_error(
-            "authenticate layout supervisor owner",
+            "authenticate browser supervisor owner",
             "visible owner record does not identify the capsule parent generation",
         ));
     }

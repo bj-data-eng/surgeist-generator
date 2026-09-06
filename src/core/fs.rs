@@ -4,30 +4,30 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 use crate::CorpusLocation;
 use crate::{GeneratorError, GeneratorErrorKind, Result};
 
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 pub(crate) const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 pub(crate) const PRIVATE_FILE_MODE: u32 = 0o600;
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 pub(crate) const CORPUS_DIRECTORY_MODE: u32 = 0o755;
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 pub(crate) const CORPUS_FILE_MODE: u32 = 0o644;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum DurabilityPhase {
     Rooted,
-    #[cfg(feature = "layout-browser")]
+    #[cfg(feature = "browser-corpus")]
     ProfileCreate,
-    #[cfg(feature = "layout-browser")]
+    #[cfg(feature = "browser-corpus")]
     ProfileRunningPublication,
-    #[cfg(feature = "layout-browser")]
+    #[cfg(feature = "browser-corpus")]
     ProfileTerminalization,
-    #[cfg(feature = "layout-browser")]
+    #[cfg(feature = "browser-corpus")]
     ProfileRecovery,
     FilePublication,
     TransactionInstall,
@@ -291,32 +291,32 @@ impl HeldIdentity {
         self.kind
     }
 
-    #[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+    #[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
     pub(crate) const fn device(&self) -> i64 {
         self.device
     }
 
-    #[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+    #[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
     pub(crate) const fn inode(&self) -> u64 {
         self.inode
     }
 
-    #[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+    #[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
     pub(crate) const fn fsid(&self) -> &FilesystemId {
         &self.fsid
     }
 
-    #[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+    #[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
     pub(crate) const fn mode(&self) -> u32 {
         self.mode
     }
 
-    #[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+    #[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
     pub(crate) const fn owner(&self) -> u32 {
         self.owner
     }
 
-    #[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+    #[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
     pub(crate) const fn link_count(&self) -> Option<u64> {
         self.link_count
     }
@@ -324,7 +324,7 @@ impl HeldIdentity {
     #[cfg(any(
         test,
         feature = "css-corpus",
-        feature = "layout-browser",
+        feature = "browser-corpus",
         all(target_os = "macos", target_arch = "aarch64")
     ))]
     pub(crate) fn same_object(&self, other: &Self) -> bool {
@@ -337,7 +337,7 @@ impl HeldIdentity {
     #[cfg(any(
         test,
         feature = "css-corpus",
-        feature = "layout-browser",
+        feature = "browser-corpus",
         all(target_os = "macos", target_arch = "aarch64")
     ))]
     pub(crate) fn matches_recovery(&self, other: &Self) -> bool {
@@ -401,14 +401,14 @@ pub(crate) struct BoundPath {
 }
 
 /// One descriptor-relative snapshot of an opaque directory tree.
-#[cfg(feature = "layout-browser")]
+#[cfg(feature = "browser-corpus")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OpaqueTreeSnapshot {
     root: HeldIdentity,
     entries: Vec<OpaqueTreeEntry>,
 }
 
-#[cfg(feature = "layout-browser")]
+#[cfg(feature = "browser-corpus")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct OpaqueTreeEntry {
     relative: PathBuf,
@@ -452,12 +452,12 @@ impl BoundPath {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+    #[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
     pub(crate) fn canonical_path(&self) -> &Path {
         &self.canonical_path
     }
 
-    #[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+    #[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
     pub(crate) fn existing_identity(&self) -> &HeldIdentity {
         &self
             .components
@@ -500,7 +500,7 @@ impl BoundPath {
     }
 
     /// Duplicates the exact held regular-file descriptor without resolving its path again.
-    #[cfg(feature = "layout-browser")]
+    #[cfg(feature = "browser-corpus")]
     pub(crate) fn held_regular_file(&self) -> Result<std::fs::File> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -543,7 +543,7 @@ impl BoundPath {
         }
     }
 
-    #[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+    #[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
     pub(crate) fn overlaps(&self, other: &Self) -> Result<bool> {
         if self.canonical_path == other.canonical_path
             || self.canonical_path.starts_with(&other.canonical_path)
@@ -556,7 +556,7 @@ impl BoundPath {
 
     /// Returns whether this existing binding is a real strict descendant of
     /// another existing binding in both canonical and descriptor ancestry.
-    #[cfg(feature = "layout-browser")]
+    #[cfg(feature = "browser-corpus")]
     pub(crate) fn is_strict_descendant_of(&self, ancestor: &Self) -> bool {
         if !self.remaining.is_empty()
             || !ancestor.remaining.is_empty()
@@ -583,7 +583,7 @@ impl BoundPath {
             && self.components == other.components
     }
 
-    #[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+    #[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
     fn descriptor_ancestor_of(&self, other: &Self) -> Result<bool> {
         let existing = self.existing_identity();
         if self.remaining.is_empty()
@@ -622,7 +622,7 @@ impl BoundPath {
     }
 }
 
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 fn component_prefix(prefix: &[String], value: &[&str]) -> Result<bool> {
     for (left, right) in prefix.iter().map(String::as_str).zip(value.iter().copied()) {
         if left == right {
@@ -844,7 +844,7 @@ where
     )
 }
 
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 pub(crate) struct RootedFs {
     canonical_root: PathBuf,
     identity: HeldIdentity,
@@ -854,7 +854,7 @@ pub(crate) struct RootedFs {
     observer: Option<RootedObserver>,
 }
 
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 impl std::fmt::Debug for RootedFs {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -865,7 +865,7 @@ impl std::fmt::Debug for RootedFs {
     }
 }
 
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 impl RootedFs {
     pub(crate) fn open_corpus(location: &CorpusLocation) -> Result<Self> {
         MutationTarget::current().require_supported("open rooted corpus authority")?;
@@ -1920,7 +1920,7 @@ impl RootedFs {
     }
 
     /// Erases one browser-owned opaque directory without resolving a child through a path.
-    #[cfg(feature = "layout-browser")]
+    #[cfg(feature = "browser-corpus")]
     pub(crate) fn erase_opaque_directory(
         &self,
         relative: &str,
@@ -1956,7 +1956,7 @@ impl RootedFs {
     }
 
     /// Snapshots one opaque directory through retained no-follow descriptors.
-    #[cfg(feature = "layout-browser")]
+    #[cfg(feature = "browser-corpus")]
     pub(crate) fn snapshot_opaque_directory(
         &self,
         relative: &str,
@@ -2155,7 +2155,7 @@ impl RootedFs {
 }
 
 #[cfg(all(
-    feature = "layout-browser",
+    feature = "browser-corpus",
     target_os = "macos",
     target_arch = "aarch64"
 ))]
@@ -2304,7 +2304,7 @@ fn erase_opaque_children(
 }
 
 #[cfg(all(
-    feature = "layout-browser",
+    feature = "browser-corpus",
     target_os = "macos",
     target_arch = "aarch64"
 ))]
@@ -2448,7 +2448,7 @@ fn snapshot_opaque_children(
 }
 
 #[cfg(all(
-    feature = "layout-browser",
+    feature = "browser-corpus",
     target_os = "macos",
     target_arch = "aarch64"
 ))]
@@ -2467,13 +2467,13 @@ fn opaque_observation_name(bytes: &[u8]) -> String {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 enum RenameMode {
     Exclusive,
     Swap,
 }
 
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 fn checked_components(relative: &str) -> Result<Vec<&str>> {
     if relative.is_empty() || relative.starts_with('/') || relative.ends_with('/') {
         return Err(invalid_path("validate rooted relative path", relative));
@@ -2492,7 +2492,7 @@ fn checked_components(relative: &str) -> Result<Vec<&str>> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 fn checked_components_allow_root(relative: &str) -> Result<Vec<&str>> {
     if relative.is_empty() {
         Ok(Vec::new())
@@ -2501,7 +2501,7 @@ fn checked_components_allow_root(relative: &str) -> Result<Vec<&str>> {
     }
 }
 
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 fn checked_name(name: &str) -> Result<()> {
     let components = checked_components(name)?;
     if components.len() != 1 {
@@ -2510,7 +2510,7 @@ fn checked_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 fn joined(parent: &str, name: &str) -> String {
     if parent.is_empty() {
         name.to_owned()
@@ -2537,7 +2537,7 @@ fn strict_observation_path(relative: &str) -> bool {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 fn checked_mode(mode: u32) -> Result<rustix::fs::Mode> {
     let raw = u16::try_from(mode).map_err(|_| {
         transaction_error(
@@ -2549,7 +2549,7 @@ fn checked_mode(mode: u32) -> Result<rustix::fs::Mode> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 fn open_directory_at(
     parent: &rustix::fd::OwnedFd,
     name: &str,
@@ -2567,7 +2567,7 @@ fn open_directory_at(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 fn open_existing_component(
     parent: &rustix::fd::OwnedFd,
     name: &str,
@@ -2626,7 +2626,7 @@ fn open_existing_component(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 fn require_existing_component_policy(
     root: &HeldIdentity,
     identity: &HeldIdentity,
@@ -2662,7 +2662,7 @@ fn require_existing_component_policy(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 fn identity_at_held_parent(
     parent: &rustix::fd::OwnedFd,
     name: &str,
@@ -2796,7 +2796,7 @@ fn identity_from_stat(stat: &rustix::fs::Stat, fsid: FilesystemId) -> Result<Hel
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 fn require_same_mount(root: &HeldIdentity, child: &HeldIdentity, operation: &str) -> Result<()> {
     if root.device != child.device || root.fsid != child.fsid {
         return Err(invalid_path(
@@ -2808,7 +2808,7 @@ fn require_same_mount(root: &HeldIdentity, child: &HeldIdentity, operation: &str
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 fn require_directory_policy(
     identity: &HeldIdentity,
     expected_mode: Option<u32>,
@@ -2835,7 +2835,7 @@ fn require_directory_policy(
     Ok(())
 }
 
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 fn require_regular_policy(
     identity: &HeldIdentity,
     expected_mode: u32,
@@ -2874,7 +2874,7 @@ fn invalid_path(operation: &str, detail: impl std::fmt::Display) -> GeneratorErr
 #[cfg(any(
     test,
     feature = "css-corpus",
-    feature = "layout-browser",
+    feature = "browser-corpus",
     all(target_os = "macos", target_arch = "aarch64")
 ))]
 fn transaction_error(operation: &str, detail: impl std::fmt::Display) -> GeneratorError {

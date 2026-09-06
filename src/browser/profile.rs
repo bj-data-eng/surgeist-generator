@@ -19,10 +19,10 @@ use crate::{
     CorpusLocation, GeneratorError, GeneratorErrorKind, RelativePath, Result, Sha256Digest,
 };
 
-use super::browser::TrustedBrowser;
-use super::manifest::LayoutManifest;
+use super::browser_runtime::TrustedBrowser;
+use super::model::EngineManifest;
 
-pub(super) const PROFILE_PARENT: &str = ".surgeist-generator/profiles/layout";
+pub(super) const PROFILE_PARENT: &str = ".surgeist-generator/profiles/browser";
 pub(super) const SUPERVISOR_EXIT_BOUND: Duration = Duration::from_secs(5);
 const LOCK_HEADER: &[u8] = b"surgeist-generator-lock-v1\n";
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -42,7 +42,7 @@ pub(super) struct ProfileCreateContext<'a> {
     pub(super) location: &'a CorpusLocation,
     pub(super) lease: &'a GenerationLease,
     pub(super) browser: &'a TrustedBrowser,
-    pub(super) manifest: &'a LayoutManifest,
+    pub(super) manifest: &'a EngineManifest,
 }
 
 pub(super) enum ProfileAttempt {
@@ -108,6 +108,7 @@ pub(super) struct IntentRecord {
     pub(super) browser_identity: HeldIdentity,
     pub(super) browser_sha256: Sha256Digest,
     pub(super) launch_profile_sha256: Sha256Digest,
+    pub(super) configuration: EngineManifest,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -189,19 +190,20 @@ impl LaunchCapsule {
         let capsule: Self = serde_json::from_str(value).map_err(|source| {
             GeneratorError::with_source(
                 GeneratorErrorKind::Cli,
-                "parse private layout launch capsule",
+                "parse private browser launch capsule",
                 "capsule is not canonical schema-1 JSON",
                 source,
             )
         })?;
-        let canonical = serde_json::to_string(&capsule)
-            .map_err(|source| artifact_source("serialize private layout launch capsule", source))?;
+        let canonical = serde_json::to_string(&capsule).map_err(|source| {
+            artifact_source("serialize private browser launch capsule", source)
+        })?;
         if canonical != value
             || capsule.schema_version != 1
             || capsule.parent_pid == 0
             || !valid_token(&capsule.profile_token)
         {
-            return Err(cli_error("private layout launch capsule is noncanonical"));
+            return Err(cli_error("private browser launch capsule is noncanonical"));
         }
         Ok(capsule)
     }
@@ -250,8 +252,8 @@ impl ProfileJournal {
         rooted.ensure_dir(PROFILE_PARENT, PRIVATE_DIRECTORY_MODE)?;
         if !rooted.list_dir(PROFILE_PARENT)?.is_empty() {
             return Err(artifact_error(
-                "create layout browser profile",
-                "another layout profile journal already exists",
+                "create browser profile",
+                "another browser profile journal already exists",
             ));
         }
 
@@ -284,8 +286,9 @@ impl ProfileJournal {
             browser_identity: context.browser.identity().clone(),
             browser_sha256: context.browser.digest().clone(),
             launch_profile_sha256: context.manifest.launch_digest.clone(),
+            configuration: context.manifest.clone(),
         };
-        let intent_bytes = canonical_json_line(&intent, "serialize layout profile intent")?;
+        let intent_bytes = canonical_json_line(&intent, "serialize browser profile intent")?;
         rooted.publish_file_exclusive(
             &path,
             "intent.json",
@@ -315,7 +318,7 @@ impl ProfileJournal {
             profile_path: RelativePath::new("profile")?,
             identity: profile_identity,
         };
-        let profile_bytes = canonical_json_line(&profile, "serialize layout profile record")?;
+        let profile_bytes = canonical_json_line(&profile, "serialize browser profile record")?;
         rooted.publish_file_exclusive(
             &path,
             "profile.json",
@@ -361,7 +364,7 @@ impl ProfileJournal {
 
     pub(super) fn capsule_json(&self) -> Result<String> {
         serde_json::to_string(&self.capsule)
-            .map_err(|source| artifact_source("serialize layout launch capsule", source))
+            .map_err(|source| artifact_source("serialize browser launch capsule", source))
     }
 
     pub(super) fn profile_path(&self) -> &Path {
@@ -383,7 +386,7 @@ impl ProfileJournal {
             && probe_group(running.process_group_id)? != GroupState::Dead
         {
             return Err(process_error(
-                "terminalize layout browser profile",
+                "terminalize browser profile",
                 "recorded browser process group remains live or inconclusive",
             ));
         }
@@ -397,7 +400,7 @@ impl ProfileJournal {
         rooted.sync_dir(PROFILE_PARENT)?;
         if snapshot_tree(rooted, &cleanup, &self.identity)? != snapshot.with_root_name(&cleanup) {
             return Err(artifact_error(
-                "terminalize layout browser profile",
+                "terminalize browser profile",
                 "profile journal changed before cleanup",
             ));
         }
@@ -408,11 +411,19 @@ impl ProfileJournal {
     pub(super) fn terminalize_owned_supervisor(
         self,
         rooted: &RootedFs,
-        owned_supervisor: Option<&mut dyn OwnedSupervisorChild>,
+        mut owned_supervisor: Option<&mut dyn OwnedSupervisorChild>,
     ) -> Result<SupervisorTermination> {
         #[cfg(test)]
         let _observation = rooted.begin_observation_phase(DurabilityPhase::ProfileTerminalization);
-        let verified_snapshot = snapshot_tree(rooted, &self.path, &self.identity)?;
+        if rooted.identity_at(&self.path)?.as_ref() != Some(&self.identity) {
+            return Err(artifact_error(
+                "terminalize browser profile",
+                "profile journal root identity changed",
+            ));
+        }
+        if let Some(child) = owned_supervisor.as_deref_mut() {
+            wait_for_registration_or_exit(rooted, &self.path, child)?;
+        }
         let mut termination = SupervisorTermination::Graceful;
         if let Some(running) =
             read_optional_record::<RunningRecord>(rooted, &self.path, "running.json")?
@@ -420,7 +431,7 @@ impl ProfileJournal {
             validate_running(&running)?;
             let child = owned_supervisor.ok_or_else(|| {
                 process_error(
-                    "terminalize layout browser profile",
+                    "terminalize browser profile",
                     "recorded browser process group has no retained owned supervisor child; no signal was sent",
                 )
             })?;
@@ -429,6 +440,9 @@ impl ProfileJournal {
                 termination = SupervisorTermination::Forced;
             }
         }
+        // The browser may write opaque profile data until its owned process is
+        // reaped. Capture cleanup authority only after that process is terminal.
+        let verified_snapshot = snapshot_tree(rooted, &self.path, &self.identity)?;
         self.finish_terminalization(rooted, verified_snapshot)?;
         Ok(termination)
     }
@@ -440,7 +454,7 @@ impl ProfileJournal {
                 != self.profile_bytes
         {
             return Err(artifact_error(
-                "validate layout profile prefix",
+                "validate browser profile prefix",
                 "immutable profile records changed",
             ));
         }
@@ -477,7 +491,7 @@ impl PendingRecovery {
         let _observation = rooted.begin_observation_phase(DurabilityPhase::ProfileRecovery);
         if snapshot_tree(rooted, &self.path, &self.identity)? != self.snapshot {
             return Err(artifact_error(
-                "recover layout browser profile",
+                "recover browser profile",
                 "profile identity or bytes changed after classification",
             ));
         }
@@ -509,14 +523,14 @@ pub(super) fn classify_pending(rooted: &RootedFs) -> Result<Option<PendingRecove
     }
     if names.len() != 1 {
         return Err(artifact_error(
-            "classify layout browser profiles",
+            "classify browser profiles",
             "more than one profile journal exists",
         ));
     }
     let name = &names[0];
     if !name.starts_with("active-") && !name.starts_with("cleanup-") {
         return Err(artifact_error(
-            "classify layout browser profiles",
+            "classify browser profiles",
             format!("unknown profile journal: {name}"),
         ));
     }
@@ -524,7 +538,7 @@ pub(super) fn classify_pending(rooted: &RootedFs) -> Result<Option<PendingRecove
     let path = format!("{PROFILE_PARENT}/{name}");
     let identity = rooted
         .identity_at(&path)?
-        .ok_or_else(|| artifact_error("classify layout browser profiles", "journal disappeared"))?;
+        .ok_or_else(|| artifact_error("classify browser profiles", "journal disappeared"))?;
     require_private_directory(rooted, &identity, &path)?;
     validate_journal_prefix(rooted, &path)?;
     let transition = if rooted.exists(&format!("{path}/transition.lock"))? {
@@ -539,7 +553,7 @@ pub(super) fn classify_pending(rooted: &RootedFs) -> Result<Option<PendingRecove
             GroupState::Live | GroupState::Inconclusive => {
                 return Err(GeneratorError::new(
                     GeneratorErrorKind::LeaseActive,
-                    "classify layout browser profiles",
+                    "classify browser profiles",
                     "recorded browser process group may still be live; terminate it and retry",
                 ));
             }
@@ -564,7 +578,7 @@ pub(super) fn publish_running(
     let _observation = rooted.begin_observation_phase(DurabilityPhase::ProfileRunningPublication);
     if supervisor_pid == 0 {
         return Err(process_error(
-            "register layout browser supervisor",
+            "register browser supervisor",
             "supervisor PID is zero",
         ));
     }
@@ -592,13 +606,13 @@ pub(super) fn validate_capsule_records(
     let journal = capsule.journal_path.as_str();
     if !journal.starts_with(&format!("{PROFILE_PARENT}/active-")) {
         return Err(cli_error(
-            "capsule journal is outside the active layout profile root",
+            "capsule journal is outside the active browser profile root",
         ));
     }
     validate_journal_prefix(rooted, journal).map_err(|source| {
         GeneratorError::with_source(
             GeneratorErrorKind::Cli,
-            "authenticate layout supervisor capsule",
+            "authenticate browser supervisor capsule",
             source.to_string(),
             source,
         )
@@ -612,8 +626,8 @@ pub(super) fn validate_capsule_records(
             "capsule record digest does not match its journal",
         ));
     }
-    let intent: IntentRecord = parse_canonical_line(&intent_bytes, "layout profile intent")?;
-    let profile: ProfileRecord = parse_canonical_line(&profile_bytes, "layout profile record")?;
+    let intent: IntentRecord = parse_canonical_line(&intent_bytes, "browser profile intent")?;
+    let profile: ProfileRecord = parse_canonical_line(&profile_bytes, "browser profile record")?;
     if intent.schema_version != 1
         || profile.schema_version != 1
         || intent.profile_token != capsule.profile_token
@@ -704,7 +718,7 @@ fn validate_journal_prefix(rooted: &RootedFs, path: &str) -> Result<()> {
         active_prefix.contains(&names) || cleanup_prefix.contains(&names)
     }) {
         return Err(artifact_error(
-            "validate layout profile journal",
+            "validate browser profile journal",
             "journal contains an unknown or out-of-order member",
         ));
     }
@@ -733,7 +747,7 @@ fn validate_journal_prefix(rooted: &RootedFs, path: &str) -> Result<()> {
                 .is_none_or(|intent| intent.profile_token != record.profile_token)
         {
             return Err(artifact_error(
-                "validate layout profile journal",
+                "validate browser profile journal",
                 "profile record fields are noncanonical",
             ));
         }
@@ -741,12 +755,12 @@ fn validate_journal_prefix(rooted: &RootedFs, path: &str) -> Result<()> {
             let actual = rooted
                 .identity_at(&format!("{path}/profile"))?
                 .ok_or_else(|| {
-                    artifact_error("validate layout profile journal", "profile disappeared")
+                    artifact_error("validate browser profile journal", "profile disappeared")
                 })?;
             require_private_directory(rooted, &actual, &format!("{path}/profile"))?;
             if !record.identity.matches_recovery(&actual) {
                 return Err(artifact_error(
-                    "validate layout profile journal",
+                    "validate browser profile journal",
                     "profile directory identity differs from profile.json",
                 ));
             }
@@ -756,7 +770,7 @@ fn validate_journal_prefix(rooted: &RootedFs, path: &str) -> Result<()> {
         && rooted.read_file(&format!("{path}/transition.lock"), PRIVATE_FILE_MODE)? != LOCK_HEADER
     {
         return Err(artifact_error(
-            "validate layout profile journal",
+            "validate browser profile journal",
             "transition lock header is invalid",
         ));
     }
@@ -767,7 +781,7 @@ fn validate_journal_prefix(rooted: &RootedFs, path: &str) -> Result<()> {
             running.profile_token != intent.profile_token || running.parent_pid != intent.parent_pid
         }) {
             return Err(artifact_error(
-                "validate layout profile journal",
+                "validate browser profile journal",
                 "running record differs from immutable intent",
             ));
         }
@@ -781,23 +795,26 @@ fn validate_intent(rooted: &RootedFs, path: &str, intent: &IntentRecord) -> Resu
         || intent.parent_pid == 0
         || !valid_token(&intent.lease_token)
         || !valid_token(&intent.profile_token)
-        || intent.authority_key != corpus_authority_key(rooted, Domain::Layout)
+        || intent.authority_key != corpus_authority_key(rooted, Domain::Browser)
         || intent.browser_identity.kind() != NodeKind::Regular
         || intent.browser_identity.link_count() != Some(1)
         || intent.browser_identity.mode() & 0o111 == 0
     {
         return Err(artifact_error(
-            "validate layout profile intent",
+            "validate browser profile intent",
             "intent fields are noncanonical or unauthenticated",
         ));
     }
     let name = path.rsplit('/').next().ok_or_else(|| {
-        artifact_error("validate layout profile intent", "journal path has no name")
+        artifact_error(
+            "validate browser profile intent",
+            "journal path has no name",
+        )
     })?;
     let suffix = name
         .strip_prefix("active-")
         .or_else(|| name.strip_prefix("cleanup-"))
-        .ok_or_else(|| artifact_error("validate layout profile intent", "unknown journal name"))?;
+        .ok_or_else(|| artifact_error("validate browser profile intent", "unknown journal name"))?;
     let expected = match intent.purpose {
         ProfilePurpose::Version => {
             format!("{}-version-{}", intent.lease_token, intent.profile_token)
@@ -812,7 +829,7 @@ fn validate_intent(rooted: &RootedFs, path: &str, intent: &IntentRecord) -> Resu
     };
     if suffix != expected {
         return Err(artifact_error(
-            "validate layout profile intent",
+            "validate browser profile intent",
             "journal name differs from intent purpose, ordinals, or tokens",
         ));
     }
@@ -825,7 +842,7 @@ fn erase_validated_journal(rooted: &RootedFs, path: &str) -> Result<()> {
         let profile = rooted
             .identity_at(&format!("{path}/profile"))?
             .ok_or_else(|| {
-                artifact_error("erase layout profile", "profile directory disappeared")
+                artifact_error("erase browser profile", "profile directory disappeared")
             })?;
         erase_opaque(rooted, &format!("{path}/profile"), &profile)?;
     }
@@ -846,7 +863,7 @@ fn erase_validated_journal(rooted: &RootedFs, path: &str) -> Result<()> {
     }
     let identity = rooted
         .identity_at(path)?
-        .ok_or_else(|| artifact_error("erase layout profile", "profile journal disappeared"))?;
+        .ok_or_else(|| artifact_error("erase browser profile", "profile journal disappeared"))?;
     rooted.remove_dir_exact(path, &identity)
 }
 
@@ -891,14 +908,14 @@ pub(super) fn lock_transition(
     let file = rooted.open_file_handle(&path, PRIVATE_FILE_MODE, false)?;
     let mut copy = file.try_clone().map_err(|source| {
         artifact_io(
-            "clone layout profile transition lock",
+            "clone browser profile transition lock",
             Path::new(&path),
             source,
         )
     })?;
     copy.seek(SeekFrom::Start(0)).map_err(|source| {
         artifact_io(
-            "seek layout profile transition lock",
+            "seek browser profile transition lock",
             Path::new(&path),
             source,
         )
@@ -906,14 +923,14 @@ pub(super) fn lock_transition(
     let mut bytes = Vec::new();
     copy.read_to_end(&mut bytes).map_err(|source| {
         artifact_io(
-            "read layout profile transition lock",
+            "read browser profile transition lock",
             Path::new(&path),
             source,
         )
     })?;
     if bytes != LOCK_HEADER {
         return Err(artifact_error(
-            "lock layout profile transition",
+            "lock browser profile transition",
             "transition lock header is invalid",
         ));
     }
@@ -921,18 +938,39 @@ pub(super) fn lock_transition(
         Ok(()) => Ok(file),
         Err(TryLockError::WouldBlock) if recovery => Err(GeneratorError::new(
             GeneratorErrorKind::LeaseActive,
-            "classify layout browser profiles",
+            "classify browser profiles",
             "profile transition lock is held",
         )),
         Err(TryLockError::WouldBlock) => Err(process_error(
-            "terminalize layout browser profile",
+            "terminalize browser profile",
             "profile transition is still active",
         )),
         Err(TryLockError::Error(source)) => Err(artifact_io(
-            "lock layout profile transition",
+            "lock browser profile transition",
             Path::new(&path),
             source,
         )),
+    }
+}
+
+fn wait_for_registration_or_exit(
+    rooted: &RootedFs,
+    journal: &str,
+    child: &mut dyn OwnedSupervisorChild,
+) -> Result<()> {
+    // Before registration the retained child is our own supervisor authenticating
+    // its executable and input files. A graceful browser-exit deadline does not
+    // apply yet, and returning would allow that child to race profile cleanup.
+    loop {
+        if read_optional_record::<RunningRecord>(rooted, journal, "running.json")?.is_some() {
+            return Ok(());
+        }
+        if child.try_wait().map_err(|source|GeneratorError::with_source(
+            GeneratorErrorKind::Process,"await browser supervisor registration",
+            "cannot establish supervisor exit before registration; profile evidence retained",source))?.is_some() {
+            return Ok(());
+        }
+        std::thread::sleep(SUPERVISOR_POLL_INTERVAL);
     }
 }
 
@@ -971,7 +1009,7 @@ fn verify_owned_supervisor(
         .map_err(|source| {
             GeneratorError::with_source(
                 GeneratorErrorKind::Process,
-                "verify owned layout browser supervisor",
+                "verify owned browser supervisor",
                 "cannot prove the retained supervisor child is still live; no signal was sent",
                 source,
             )
@@ -980,18 +1018,18 @@ fn verify_owned_supervisor(
     {
         return Ok(OwnedSupervisorState::Reaped);
     }
-    let pid = process_pid(owned_pid, "verify owned layout browser supervisor")?;
+    let pid = process_pid(owned_pid, "verify owned browser supervisor")?;
     let actual_group = rustix::process::getpgid(Some(pid)).map_err(|source| {
         GeneratorError::with_source(
             GeneratorErrorKind::Process,
-            "verify owned layout browser supervisor",
+            "verify owned browser supervisor",
             "cannot prove the retained supervisor child still leads the recorded process group; no signal was sent",
             source,
         )
     })?;
     if actual_group != pid {
         return Err(process_error(
-            "verify owned layout browser supervisor",
+            "verify owned browser supervisor",
             "retained supervisor child no longer leads the recorded process group; no signal was sent",
         ));
     }
@@ -1015,7 +1053,7 @@ fn wait_for_graceful_supervisor_exit(
         let reaped = child.try_wait().map_err(|source| {
             GeneratorError::with_source(
                 GeneratorErrorKind::Process,
-                "reap owned layout browser supervisor",
+                "reap owned browser supervisor",
                 "failed to observe the retained supervisor child during its graceful exit bound; no signal was sent",
                 source,
             )
@@ -1024,32 +1062,32 @@ fn wait_for_graceful_supervisor_exit(
             (true, GroupState::Dead) => return Ok(GracefulExit::ReapedAndAbsent),
             (true, GroupState::Inconclusive) if Instant::now() >= deadline => {
                 return Err(process_error(
-                    "terminalize layout browser profile",
+                    "terminalize browser profile",
                     "the supervisor was reaped but recorded group absence is inconclusive; no signal was sent",
                 ));
             }
             (true, GroupState::Live) if Instant::now() >= deadline => {
                 return Err(process_error(
-                    "terminalize layout browser profile",
+                    "terminalize browser profile",
                     "the supervisor was reaped but its recorded process group remained live; no signal was sent",
                 ));
             }
             (false, GroupState::Dead) => {
                 return Err(process_error(
-                    "terminalize layout browser profile",
+                    "terminalize browser profile",
                     "the recorded process group is absent but the retained supervisor child was not reaped; no signal was sent",
                 ));
             }
             (false, GroupState::Inconclusive) if Instant::now() >= deadline => {
                 return Err(process_error(
-                    "terminalize layout browser profile",
+                    "terminalize browser profile",
                     "recorded browser process group ownership is inconclusive; no signal was sent",
                 ));
             }
             (false, GroupState::Live) if Instant::now() >= deadline => {
                 if group_was_inconclusive {
                     return Err(process_error(
-                        "terminalize layout browser profile",
+                        "terminalize browser profile",
                         "recorded browser process group ownership was inconclusive during the graceful bound; no signal was sent",
                     ));
                 }
@@ -1082,7 +1120,7 @@ fn require_group_absent_after_reap(group: u32) -> Result<()> {
         Ok(())
     } else {
         Err(process_error(
-            "terminalize layout browser profile",
+            "terminalize browser profile",
             "the retained supervisor child was reaped but recorded group absence is not proven; no signal was sent",
         ))
     }
@@ -1097,7 +1135,7 @@ fn wait_for_owned_group_exit(group: u32, child: &mut dyn OwnedSupervisorChild) -
             .map_err(|source| {
                 GeneratorError::with_source(
                     GeneratorErrorKind::Process,
-                    "reap owned layout browser supervisor",
+                    "reap owned browser supervisor",
                     "failed to reap the retained supervisor child after SIGKILL",
                     source,
                 )
@@ -1112,7 +1150,7 @@ fn wait_for_owned_group_exit(group: u32, child: &mut dyn OwnedSupervisorChild) -
             } else {
                 "retained supervisor child was not reaped after SIGKILL"
             };
-            return Err(process_error("terminalize layout browser profile", detail));
+            return Err(process_error("terminalize browser profile", detail));
         }
         std::thread::sleep(SUPERVISOR_POLL_INTERVAL);
     }
@@ -1121,13 +1159,13 @@ fn wait_for_owned_group_exit(group: u32, child: &mut dyn OwnedSupervisorChild) -
 fn verify_owned_pid(running: &RunningRecord, child: &dyn OwnedSupervisorChild) -> Result<u32> {
     let owned_pid = child.id().ok_or_else(|| {
         process_error(
-            "verify owned layout browser supervisor",
+            "verify owned browser supervisor",
             "owned supervisor child has no live process identity; no signal was sent",
         )
     })?;
     if owned_pid != running.supervisor_pid || owned_pid != running.process_group_id {
         return Err(process_error(
-            "verify owned layout browser supervisor",
+            "verify owned browser supervisor",
             "running record differs from the retained owned supervisor child; no signal was sent",
         ));
     }
@@ -1185,7 +1223,7 @@ fn validate_ordinals(
         Ok(())
     } else {
         Err(artifact_error(
-            "construct layout profile journal",
+            "construct browser profile journal",
             "purpose and batch/retry ordinals do not match",
         ))
     }
@@ -1195,7 +1233,9 @@ fn validate_journal_name(name: &str) -> Result<()> {
     let suffix = name
         .strip_prefix("active-")
         .or_else(|| name.strip_prefix("cleanup-"))
-        .ok_or_else(|| artifact_error("validate layout profile journal", "unknown journal name"))?;
+        .ok_or_else(|| {
+            artifact_error("validate browser profile journal", "unknown journal name")
+        })?;
     let tokens = suffix.split('-').collect::<Vec<_>>();
     let valid = (tokens.len() == 3
         && valid_token(tokens[0])
@@ -1212,7 +1252,7 @@ fn validate_journal_name(name: &str) -> Result<()> {
         Ok(())
     } else {
         Err(artifact_error(
-            "validate layout profile journal",
+            "validate browser profile journal",
             "journal name does not match its purpose/token grammar",
         ))
     }
@@ -1236,7 +1276,7 @@ fn require_private_directory(rooted: &RootedFs, identity: &HeldIdentity, path: &
         || identity.fsid() != rooted.identity().fsid()
     {
         return Err(artifact_error(
-            "validate layout profile journal",
+            "validate browser profile journal",
             format!("wrong journal type, mode, owner, or mount: {path}"),
         ));
     }
@@ -1270,14 +1310,14 @@ fn parse_canonical_line<T: DeserializeOwned + Serialize>(bytes: &[u8], label: &s
     let value: T = serde_json::from_slice(bytes).map_err(|source| {
         GeneratorError::with_source(
             GeneratorErrorKind::ArtifactTransaction,
-            "parse layout profile metadata",
+            "parse browser profile metadata",
             format!("invalid {label}"),
             source,
         )
     })?;
-    if canonical_json_line(&value, "reserialize layout profile metadata")? != bytes {
+    if canonical_json_line(&value, "reserialize browser profile metadata")? != bytes {
         return Err(artifact_error(
-            "parse layout profile metadata",
+            "parse browser profile metadata",
             format!("{label} is not compact canonical JSON plus LF"),
         ));
     }
@@ -1370,7 +1410,7 @@ pub(super) fn resolve_terminalization<T>(primary: Result<T>, cleanup: Result<()>
         (Ok(_), Err(cleanup)) => Err(cleanup),
         (Err(primary), Err(cleanup)) => Err(GeneratorError::with_source(
             cleanup.kind(),
-            "terminalize layout browser attempt",
+            "terminalize browser attempt",
             format!("primary failure: {primary}; cleanup failure: {cleanup}"),
             cleanup,
         )),
@@ -1380,7 +1420,7 @@ pub(super) fn resolve_terminalization<T>(primary: Result<T>, cleanup: Result<()>
 fn cli_error(detail: impl Into<String>) -> GeneratorError {
     GeneratorError::new(
         GeneratorErrorKind::Cli,
-        "validate private layout launch capsule",
+        "validate private browser launch capsule",
         detail,
     )
 }

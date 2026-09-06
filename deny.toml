@@ -17,3 +17,9 @@ allow = [
   "Unlicense",
   "Zlib",
 ]
+
+# Certificate data used by the optional browser downloader's TLS verifier.
+[[licenses.exceptions]]
+name = "webpki-root-certs"
+version = "=1.0.8"
+allow = ["CDLA-Permissive-2.0"]

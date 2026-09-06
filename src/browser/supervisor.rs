@@ -3,19 +3,18 @@ use std::fs::TryLockError;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::process::{Command, Stdio};
 
-use crate::core::{PRIVATE_FILE_MODE, RootedFs, authenticate_layout_supervisor_owner};
+use crate::core::{PRIVATE_FILE_MODE, RootedFs, authenticate_browser_supervisor_owner};
 use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, Result};
 
-use super::browser::{TrustedBrowser, fixed_environment, validate_received_switches};
-use super::manifest;
+use super::browser_runtime::{TrustedBrowser, fixed_environment, validate_received_switches};
 use super::profile::{
     LaunchCapsule, ProfilePurpose, lock_transition, publish_running, validate_capsule_records,
 };
 
-pub(super) const CAPSULE_ENV: &str = "SURGEIST_LAYOUT_LAUNCH_CAPSULE";
+pub(super) const CAPSULE_ENV: &str = "SURGEIST_BROWSER_LAUNCH_CAPSULE";
 #[cfg(test)]
-const TEST_MODE_ENV: &str = "SURGEIST_LAYOUT_TEST_SUPERVISOR_MODE";
-const MUTEX: &str = ".surgeist-generator/leases/layout/mutex.lock";
+const TEST_MODE_ENV: &str = "SURGEIST_BROWSER_TEST_SUPERVISOR_MODE";
+const MUTEX: &str = ".surgeist-generator/leases/browser/mutex.lock";
 
 #[derive(Clone, Copy)]
 enum SupervisorMode {
@@ -29,6 +28,7 @@ enum SupervisorMode {
 pub(super) enum TestBrowserMode {
     Success,
     DelayedSupervisorExit,
+    DelayedRegistration,
     Failure,
     Hang,
     HoldTransition,
@@ -40,6 +40,7 @@ impl TestBrowserMode {
         match self {
             Self::Success => "success",
             Self::DelayedSupervisorExit => "delayed-supervisor-exit",
+            Self::DelayedRegistration => "delayed-registration",
             Self::Failure => "failure",
             Self::Hang => "hang",
             Self::HoldTransition => "hold-transition",
@@ -50,6 +51,7 @@ impl TestBrowserMode {
         match value {
             "success" => Ok(Self::Success),
             "delayed-supervisor-exit" => Ok(Self::DelayedSupervisorExit),
+            "delayed-registration" => Ok(Self::DelayedRegistration),
             "failure" => Ok(Self::Failure),
             "hang" => Ok(Self::Hang),
             "hold-transition" => Ok(Self::HoldTransition),
@@ -59,10 +61,12 @@ impl TestBrowserMode {
 
     const fn browser_test(self) -> Option<&'static str> {
         match self {
-            Self::Success => Some("layout::profile_tests::layout_fake_browser_success_process"),
+            Self::Success | Self::DelayedRegistration => {
+                Some("browser::profile_tests::layout_fake_browser_success_process")
+            }
             Self::DelayedSupervisorExit => None,
-            Self::Failure => Some("layout::profile_tests::layout_fake_browser_failure_process"),
-            Self::Hang => Some("layout::profile_tests::layout_fake_browser_hang_process"),
+            Self::Failure => Some("browser::profile_tests::layout_fake_browser_failure_process"),
+            Self::Hang => Some("browser::profile_tests::layout_fake_browser_hang_process"),
             Self::HoldTransition => None,
         }
     }
@@ -80,6 +84,13 @@ pub(super) fn run_from_env_if_present() -> Option<Result<()>> {
 }
 
 fn run(capsule: LaunchCapsule, mode: SupervisorMode) -> Result<()> {
+    #[cfg(test)]
+    if matches!(
+        mode,
+        SupervisorMode::Test(TestBrowserMode::DelayedRegistration)
+    ) {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
     let owner = capsule.owner_root()?;
     let corpus = capsule.corpus_root()?;
     let location = CorpusLocation::new(&owner, &corpus)?;
@@ -98,22 +109,22 @@ fn run(capsule: LaunchCapsule, mode: SupervisorMode) -> Result<()> {
     match mutex.try_lock() {
         Ok(()) => {
             let _ = mutex.unlock();
-            return Err(cli_error("layout mutex is not held by the capsule parent"));
+            return Err(cli_error("browser mutex is not held by the capsule parent"));
         }
         Err(TryLockError::WouldBlock) => {}
         Err(TryLockError::Error(source)) => {
             return Err(GeneratorError::with_source(
                 GeneratorErrorKind::Cli,
-                "authenticate layout supervisor capsule",
-                "cannot prove the layout mutex is held",
+                "authenticate browser supervisor capsule",
+                "cannot prove the browser mutex is held",
                 source,
             ));
         }
     }
-    authenticate_layout_supervisor_owner(&rooted, &location, actual_parent).map_err(|source| {
+    authenticate_browser_supervisor_owner(&rooted, &location, actual_parent).map_err(|source| {
         GeneratorError::with_source(
             GeneratorErrorKind::Cli,
-            "authenticate layout supervisor capsule",
+            "authenticate browser supervisor capsule",
             source.to_string(),
             source,
         )
@@ -127,11 +138,9 @@ fn run(capsule: LaunchCapsule, mode: SupervisorMode) -> Result<()> {
         return Err(cli_error("capsule and authenticated intent differ"));
     }
 
-    let manifest_path = location.corpus_root().join(manifest::MANIFEST_FILE);
-    let manifest_bytes = manifest::read_file(&manifest_path)?;
-    let manifest = manifest::parse(&manifest_bytes, &manifest_path)?;
-    manifest::revalidate(&rooted, &manifest_bytes)?;
-    let browser = TrustedBrowser::validate(&location, &manifest, &capsule.browser_path)?;
+    let manifest = &intent.configuration;
+    manifest.validate()?;
+    let browser = TrustedBrowser::validate(&location, manifest, &capsule.browser_path)?;
     if browser.identity() != &intent.browser_identity
         || browser.digest() != &intent.browser_sha256
         || manifest.launch_digest != intent.launch_profile_sha256
@@ -147,12 +156,40 @@ fn run(capsule: LaunchCapsule, mode: SupervisorMode) -> Result<()> {
     rustix::process::setsid().map_err(|source| {
         GeneratorError::with_source(
             GeneratorErrorKind::Process,
-            "create layout browser process group",
+            "create browser process group",
             "internal supervisor could not become a session leader",
             source,
         )
     })?;
     let supervisor_pid = std::process::id();
+    // Finish potentially expensive capability hashing before admitting the
+    // running group, whose remaining lifetime has a bounded graceful exit.
+    browser.closing_revalidate()?;
+    if rustix::process::getppid().map(|pid| pid.as_raw_nonzero().get() as u32)
+        != Some(actual_parent)
+    {
+        return Err(cli_error(
+            "supervisor parent exited during capability authentication",
+        ));
+    }
+    authenticate_browser_supervisor_owner(&rooted, &location, actual_parent)?;
+    match mutex.try_lock() {
+        Err(TryLockError::WouldBlock) => {}
+        Ok(()) => {
+            let _ = mutex.unlock();
+            return Err(cli_error(
+                "parent released its generation mutex during capability authentication",
+            ));
+        }
+        Err(TryLockError::Error(source)) => {
+            return Err(GeneratorError::with_source(
+                GeneratorErrorKind::Cli,
+                "reauthenticate supervisor parent",
+                "cannot prove the generation mutex is held",
+                source,
+            ));
+        }
+    }
     publish_running(
         &rooted,
         journal,
@@ -172,12 +209,14 @@ fn run(capsule: LaunchCapsule, mode: SupervisorMode) -> Result<()> {
     #[cfg(test)]
     if matches!(
         mode,
-        SupervisorMode::Test(TestBrowserMode::DelayedSupervisorExit)
+        SupervisorMode::Test(
+            TestBrowserMode::DelayedSupervisorExit | TestBrowserMode::DelayedRegistration
+        )
     ) {
         transition.unlock().map_err(|source| {
             GeneratorError::with_source(
                 GeneratorErrorKind::ArtifactTransaction,
-                "release layout profile transition lock",
+                "release browser profile transition lock",
                 journal.to_owned(),
                 source,
             )
@@ -225,13 +264,13 @@ fn run(capsule: LaunchCapsule, mode: SupervisorMode) -> Result<()> {
                     .map(OsString::from)
                     .collect::<Vec<_>>(),
             };
-            let switches = validate_received_switches(&manifest, &received)?;
+            let switches = validate_received_switches(manifest, &received)?;
             let capsule_arguments = capsule
                 .launch_strings
                 .iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>();
-            let capsule_switches = validate_received_switches(&manifest, &capsule_arguments)?;
+            let capsule_switches = validate_received_switches(manifest, &capsule_arguments)?;
             if capsule_switches.get("user-data-dir") != Some(&Some(OsString::from("profile")))
                 || capsule_switches
                     .keys()
@@ -266,11 +305,10 @@ fn run(capsule: LaunchCapsule, mode: SupervisorMode) -> Result<()> {
             command.stdout(Stdio::null()).stderr(Stdio::inherit());
         }
     }
-    browser.closing_revalidate()?;
     let mut child = command.spawn().map_err(|source| {
         GeneratorError::with_source(
             GeneratorErrorKind::Process,
-            "spawn trusted layout browser",
+            "spawn trusted browser",
             browser.absolute_path().display().to_string(),
             source,
         )
@@ -278,7 +316,7 @@ fn run(capsule: LaunchCapsule, mode: SupervisorMode) -> Result<()> {
     transition.unlock().map_err(|source| {
         GeneratorError::with_source(
             GeneratorErrorKind::ArtifactTransaction,
-            "release layout profile transition lock",
+            "release browser profile transition lock",
             journal.to_owned(),
             source,
         )
@@ -287,7 +325,7 @@ fn run(capsule: LaunchCapsule, mode: SupervisorMode) -> Result<()> {
     let status = child.wait().map_err(|source| {
         GeneratorError::with_source(
             GeneratorErrorKind::Process,
-            "wait for trusted layout browser",
+            "wait for trusted browser",
             browser.absolute_path().display().to_string(),
             source,
         )
@@ -323,7 +361,7 @@ pub(super) fn test_process_command(
     command
         .args([
             "--exact",
-            "layout::profile_tests::layout_fake_supervisor_process",
+            "browser::profile_tests::layout_fake_supervisor_process",
             "--nocapture",
         ])
         .env_clear()
@@ -354,15 +392,11 @@ fn switch_key(argument: &OsStr) -> Option<&str> {
 fn cli_error(detail: impl Into<String>) -> GeneratorError {
     GeneratorError::new(
         GeneratorErrorKind::Cli,
-        "authenticate layout supervisor capsule",
+        "authenticate browser supervisor capsule",
         detail,
     )
 }
 
 fn process_error(detail: impl Into<String>) -> GeneratorError {
-    GeneratorError::new(
-        GeneratorErrorKind::Process,
-        "run trusted layout browser",
-        detail,
-    )
+    GeneratorError::new(GeneratorErrorKind::Process, "run trusted browser", detail)
 }

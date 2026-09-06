@@ -97,7 +97,7 @@ impl<'source> ProtectedSourceDisjointness<'source> {
 
     /// Proves the one complete-root publication exception whose exact retained
     /// files are protected inside that writable root.
-    #[cfg(feature = "layout-browser")]
+    #[cfg(feature = "browser-corpus")]
     pub(crate) fn for_partitioned_mutation(
         location: &CorpusLocation,
         partition_root: (&str, &Path),

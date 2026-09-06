@@ -79,7 +79,7 @@ impl GenerationLease {
     }
 
     /// Returns the exact acquisition token authenticated by private journals.
-    #[cfg(feature = "layout-browser")]
+    #[cfg(feature = "browser-corpus")]
     pub(crate) fn token(&self) -> &str {
         self.guard
             .state()
@@ -88,13 +88,13 @@ impl GenerationLease {
     }
 
     /// Returns the corpus/domain authority digest authenticated by private journals.
-    #[cfg(feature = "layout-browser")]
+    #[cfg(feature = "browser-corpus")]
     pub(crate) fn authority_key(&self) -> &str {
         self.guard.state().authority_key()
     }
 
     /// Returns the held rooted corpus authority for private lifecycle records.
-    #[cfg(feature = "layout-browser")]
+    #[cfg(feature = "browser-corpus")]
     pub(crate) fn rooted(&self) -> &RootedFs {
         self.guard.state().rooted()
     }

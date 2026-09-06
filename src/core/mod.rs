@@ -1,21 +1,21 @@
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 mod artifact;
 mod case;
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 mod coordination;
 mod corpus;
 mod fs;
 mod hash;
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 mod inventory;
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 mod lease;
 mod manifest;
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 mod protection;
 mod report;
 mod source;
-#[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
 mod transaction;
 
 pub use case::{CaseDisposition, CaseDispositionRecord, validate_disposition_records};
@@ -25,43 +25,42 @@ pub use manifest::{ManifestVersion, parse_manifest};
 pub use report::{ArtifactProvenance, GenerationCounts, GenerationReport, ReportArtifact};
 pub use source::{PinnedSource, SourceRevision, VerifiedSource, verify_git_source};
 
-#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(feature = "css-corpus", feature = "browser-corpus"))]
 pub(crate) use artifact::{
     ArtifactPlan, ArtifactReservation, PublicationInventory, PublicationPolicy,
 };
 #[cfg(feature = "css-corpus")]
 pub(crate) use case::validate_disposition_reason;
-#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(feature = "css-corpus", feature = "browser-corpus"))]
 pub(crate) use coordination::Domain;
-#[cfg(feature = "layout-browser")]
-pub(crate) use coordination::{
-    authenticate_layout_supervisor_owner, corpus_authority_key, new_token,
-};
-#[cfg(feature = "layout-browser")]
-pub(crate) use fs::{
-    BoundPath, HeldIdentity, OpaqueTreeSnapshot, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE,
-};
-#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(feature = "browser-corpus")]
+pub(crate) use coordination::{corpus_authority_key, new_token};
+#[cfg(feature = "browser-corpus")]
+pub(crate) use fs::BoundPath;
+#[cfg(any(feature = "css-corpus", feature = "browser-corpus"))]
 pub(crate) use fs::{CORPUS_FILE_MODE, NodeKind, RootedFs};
-#[cfg(all(test, feature = "layout-browser"))]
+#[cfg(all(test, feature = "browser-corpus"))]
 pub(crate) use fs::{DurabilityEvent, DurabilityPhase, DurabilityPrimitive, RootedObserver};
-#[cfg(feature = "layout-browser")]
-pub(crate) use inventory::InventoryEntry;
-#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(feature = "browser-corpus")]
+pub(crate) use fs::{HeldIdentity, OpaqueTreeSnapshot, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE};
+#[cfg(any(feature = "css-corpus", feature = "browser-corpus"))]
 pub(crate) use inventory::{Inventory, InventoryPolicy};
-#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(feature = "css-corpus", feature = "browser-corpus"))]
 pub(crate) use lease::GenerationCheck;
-#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(feature = "css-corpus", feature = "browser-corpus"))]
 pub(crate) use lease::GenerationLease;
-#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(feature = "css-corpus", feature = "browser-corpus"))]
 pub(crate) use protection::NamespaceDisjointness;
-#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(feature = "css-corpus", feature = "browser-corpus"))]
 pub(crate) use protection::ProtectedSourceDisjointness;
-#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(feature = "css-corpus", feature = "browser-corpus"))]
 pub(crate) use source::{
-    ObjectFormat, ProtectedSource, ProtectedSourceInventory, ProtectedTreeEntryKind, SnapshotEntry,
+    ProtectedSource, ProtectedSourceInventory, ProtectedTreeEntryKind, SnapshotEntry,
     VerifiedSourceSnapshot, verify_protected_git_source_inventory,
 };
+
+#[cfg(feature = "css-corpus")]
+pub(crate) use source::ObjectFormat;
 
 pub(crate) fn validate_identifier(value: &str) -> bool {
     let bytes = value.as_bytes();
@@ -109,3 +108,6 @@ pub(crate) fn validate_generated_extension(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
 }
+
+#[cfg(feature = "browser-corpus")]
+pub(crate) use coordination::authenticate_browser_supervisor_owner;

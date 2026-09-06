@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as _;
 
-#[cfg(any(test, feature = "layout-browser"))]
+#[cfg(test)]
 use crate::Sha256Digest;
 use crate::{CorpusLocation, GeneratorError, GeneratorErrorKind, RelativePath, Result};
 
@@ -9,7 +9,7 @@ use super::coordination::{Domain, new_token};
 use super::fs::{CORPUS_FILE_MODE, NodeKind};
 use super::inventory::{Inventory, InventoryPolicy};
 use super::lease::{GenerationLease, LeaseBinding};
-#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(feature = "css-corpus", feature = "browser-corpus"))]
 use super::transaction::external_stage_name;
 use super::transaction::{StagedTree, TransactionEngine, TransactionRequest};
 
@@ -17,7 +17,7 @@ use super::transaction::{StagedTree, TransactionEngine, TransactionRequest};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PublicationPolicy {
     CleanFull,
-    #[cfg(any(test, feature = "layout-browser"))]
+    #[cfg(any(test, feature = "browser-corpus"))]
     DiagnosticFull,
     Filtered,
 }
@@ -67,7 +67,7 @@ impl PublicationInventory {
 #[derive(Clone, Debug)]
 struct PlannedArtifact {
     bytes: Vec<u8>,
-    #[cfg(any(test, feature = "layout-browser"))]
+    #[cfg(test)]
     digest: Sha256Digest,
 }
 
@@ -81,12 +81,12 @@ pub(crate) struct ArtifactPlan {
     policy: PublicationPolicy,
     inventory: PublicationInventory,
     artifacts: BTreeMap<RelativePath, PlannedArtifact>,
-    #[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+    #[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
     transaction_token: Option<String>,
 }
 
 /// In-memory proof of the exact external stage namespace chosen before lease.
-#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(feature = "css-corpus", feature = "browser-corpus"))]
 #[derive(Debug)]
 pub(crate) struct ArtifactReservation {
     domain: Domain,
@@ -94,7 +94,7 @@ pub(crate) struct ArtifactReservation {
     external_stage: RelativePath,
 }
 
-#[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+#[cfg(any(feature = "css-corpus", feature = "browser-corpus"))]
 impl ArtifactReservation {
     pub(crate) fn new(domain: Domain) -> Result<Self> {
         let token = new_token()?;
@@ -146,7 +146,7 @@ impl ArtifactPlan {
                 return Err(plan_error("filtered publication cannot write a report"));
             }
             let artifact = PlannedArtifact {
-                #[cfg(any(test, feature = "layout-browser"))]
+                #[cfg(test)]
                 digest: Sha256Digest::from_bytes(&bytes),
                 bytes,
             };
@@ -174,12 +174,12 @@ impl ArtifactPlan {
             policy,
             inventory,
             artifacts: planned,
-            #[cfg(any(test, feature = "css-corpus", feature = "layout-browser"))]
+            #[cfg(any(test, feature = "css-corpus", feature = "browser-corpus"))]
             transaction_token: None,
         })
     }
 
-    #[cfg(any(feature = "css-corpus", feature = "layout-browser"))]
+    #[cfg(any(feature = "css-corpus", feature = "browser-corpus"))]
     pub(crate) fn with_reservation(mut self, reservation: ArtifactReservation) -> Result<Self> {
         if reservation.domain != self.domain {
             return Err(plan_error(
@@ -196,7 +196,7 @@ impl ArtifactPlan {
     }
 
     /// Revalidates domain-owned read authorities at the last pre-intent boundary.
-    #[cfg(all(any(feature = "css-corpus", feature = "layout-browser"), not(test)))]
+    #[cfg(all(any(feature = "css-corpus", feature = "browser-corpus"), not(test)))]
     pub(crate) fn install_with_revalidation(
         self,
         pre_intent_revalidation: impl FnOnce(&super::fs::RootedFs) -> Result<()>,
@@ -308,7 +308,7 @@ impl ArtifactPlan {
         })
     }
 
-    #[cfg(any(test, feature = "layout-browser"))]
+    #[cfg(test)]
     pub(crate) fn artifact_digest(&self, path: &RelativePath) -> Option<&Sha256Digest> {
         self.artifacts.get(path).map(|artifact| &artifact.digest)
     }
