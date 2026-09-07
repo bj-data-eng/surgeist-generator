@@ -1,26 +1,20 @@
 # surgeist-generator Repository Guide
 
-Use the installed `surgeist-agent` plugin for every task in this repository.
-Select the task-appropriate focused skill.
+Use `$pisct:coordination` for standalone delivery and the smallest focused
+`$pisct:<skill>` for focused work. Preserve an explicit workflow selected by the
+user or higher-priority instructions. Use `$pisct:plane-coordination` only when
+plane coordination is explicitly selected; existing planning files do not select it.
+This guide supplies repository facts, not mutation, installation, commit,
+publication, or cross-repository authority.
 
 ## Authority Split
 
-This file is the leaf repository's committed discovery entry point. It owns the
-mapping from mutable leaf facts to authoritative sources, the intended crate and
-architecture boundary, and the configured local command inventory. The sources
-named below own their current values.
-
-The installed `surgeist-agent` plugin is the sole Surgeist workflow authority.
-Its selected skill owns scope control, planning, debugging and TDD,
-worker/reviewer gates, external-software permission,
-the absolute unsafe prohibition, Git landing and publication, and cross-repository
-handoffs. This file does not redefine those workflows or grant authority to
-mutate, install, commit, or publish.
-
-Resolve an apparent conflict by domain: use this file and the sources below for
-mutable repository facts; use the selected plugin skill for workflow.
-Higher-priority user and system instructions still apply. Do not import another
-workflow.
+This file is the repository's committed discovery entry point. It owns the
+mapping from mutable repository facts to authoritative sources, the product
+boundary, configured command inventory, and the PISCT workflow selection.
+PISCT skills supply reusable coordination and engineering guidance; they do not
+own this crate's mutable facts. Higher-priority user and system instructions
+still apply.
 
 ## Repository Identity And Ownership
 
@@ -41,15 +35,19 @@ Read these sources instead of relying on cached descriptions.
 | --- | --- |
 | Package identity, edition, MSRV, dependencies, features, and targets | `Cargo.toml` |
 | Public front door | `src/lib.rs` and its reexports |
-| Current behavior and crate boundary | `README.md` and `src/` |
+| Adoption and documentation navigation | `README.md` |
+| Current behavior and crate boundary | `src/`, `docs/reference.md`, and `docs/explanation.md` |
+| Setup and operating procedures | `docs/getting-started.md` and `docs/how-to.md` |
 | Focused verification | tracked `#[cfg(test)]` modules in `src/` and integration tests in `tests/` |
-| Additional configured commands | Cargo targets and features in `Cargo.toml`, `README.md`, and tracked task-runner or CI configuration when present |
+| Verification commands and dependency policy | This command inventory, Cargo targets/features in `Cargo.toml`, and `deny.toml` |
+| Project license | `LICENSE` and `Cargo.toml` |
+| Third-party attribution and coverage | `NOTICE.md`, `licenses/`, and exact upstream release material; `Cargo.toml` and `Cargo.lock` own dependency identity |
 | Integration MSRV, authoritative URL, and compatible pin when root integration is in scope | root `Cargo.toml`, root `.gitmodules`, and the root committed gitlink |
 
 When these sources disagree, report the exact paths and revisions. Do not guess,
 silently update another document, or widen the task to reconcile them.
 
-## Crate Boundary
+## Product Boundary
 
 `surgeist-generator` owns shared generation infrastructure, the feature-gated
 CSS driver, and the caller-driven browser corpus engine. `css-corpus` exposes
@@ -65,29 +63,31 @@ locations separately bind an exact browser owner and corpus. Acquisition uses
 ignored owner-local `tmp/surgeist-sources` and `tmp/surgeist-browser` caches,
 outside Cargo build output and corpus transactions. Existing-only operations
 and corpus checks never acquire software. Manifests/caller declarations own
-source pins, counts, paths, and browser settings. README and rustdoc define
-precise trust, provenance, cache, recovery, and migration contracts.
+source pins, counts, paths, and browser settings. The documentation guides and
+rustdoc define precise trust, provenance, cache, recovery, and migration contracts.
 
 This repository owns infrastructure and focused synthetic/process evidence; it
 does not commit production corpora, acquired software, generated expectations,
 or sibling adoption changes.
 
-The root `surgeist` repository continues to own cross-crate integration, this
-leaf's gitlink, and the root API generator and generated API audit artifacts.
 Surgeist-to-Surgeist lowering and adapters belong to root, and sibling internals
-are not this repository's surface.
+are not this repository's surface. For work involving another repository, resolve
+its ownership from current committed policy and source. Inspection does not grant
+write authority there.
 
-## API Artifacts
+## Generated Artifacts
 
 Source in this repository is authoritative. The root `surgeist` repository owns
 the only API generator and all generated API audit artifacts; this leaf carries
-no copies.
+no copies. Refresh and check them through their owning repository; never hand-edit
+generated artifacts.
 
 ## Command Inventory
 
-These commands describe local verification capability. The selected plugin skill
-determines the exact gate, order, feature matrix, and whether already-present
-tooling can run without unauthorized acquisition.
+These commands describe local verification capability. The assigned scope and
+PISCT guidance select the applicable checks. Run noninteractive checks through
+`$pisct:process` with caller-authorized, already-present tooling. Mutation tests
+require Apple-Silicon macOS; the no-feature wasm check covers the portable library.
 
 ```sh
 cargo generate-lockfile --offline
@@ -112,9 +112,8 @@ cargo audit --no-fetch --stale
 ```
 
 The ignored invocation is list-only inventory evidence; never remove `--list`
-without the separate explicit authorization required by the selected plugin
-skill and the active cycle contract. Offline/no-fetch flags prove use of
-already-present artifacts; they do not authorize installing or downloading
+without separate explicit authorization to execute ignored diagnostics.
+Offline/no-fetch flags prove use of already-present artifacts; they do not authorize installing or downloading
 missing software.
 
 Discovery is complete when the owning repository, public front door, dependency
